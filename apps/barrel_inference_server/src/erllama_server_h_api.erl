@@ -40,7 +40,9 @@ init(Req0, #{op := copy} = Opts) ->
 init(Req0, #{op := create} = Opts) ->
     expect(<<"POST">>, Req0, Opts, fun handle_create/2);
 init(Req0, #{op := pull} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_pull/2).
+    expect(<<"POST">>, Req0, Opts, fun handle_pull/2);
+init(Req0, #{op := search} = Opts) ->
+    expect(<<"POST">>, Req0, Opts, fun handle_search/2).
 
 info({erllama_fetch_progress, Ref, Bytes, Total}, Req, #pull{job_ref = Ref} = St) ->
     Now = erlang:monotonic_time(millisecond),
@@ -256,6 +258,22 @@ classify_modelfile_line(Line) ->
 
 strip_ws(B) ->
     string:trim(B).
+
+%% =============================================================================
+%% POST /api/search
+%% =============================================================================
+
+handle_search(Req0, Opts) ->
+    case read_json(Req0) of
+        {ok, #{<<"query">> := Query} = Body, Req1} ->
+            Limit = maps:get(<<"limit">>, Body, 20),
+            {ok, Hits} = erllama_server_search:search(Query, #{limit => Limit}),
+            reply(Req1, Opts, 200, #{<<"hits">> => Hits});
+        {ok, _, Req1} ->
+            reply(Req1, Opts, 400, error_body(<<"missing query">>));
+        {error, Req1, Status} ->
+            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
+    end.
 
 %% =============================================================================
 %% POST /api/pull (NDJSON streaming)

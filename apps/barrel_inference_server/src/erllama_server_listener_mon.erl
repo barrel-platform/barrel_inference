@@ -123,7 +123,8 @@ routes() ->
             {"/api/show", erllama_server_h_api, #{op => show}},
             {"/api/delete", erllama_server_h_api, #{op => delete}},
             {"/api/copy", erllama_server_h_api, #{op => copy}},
-            {"/api/create", erllama_server_h_api, #{op => create}}
+            {"/api/create", erllama_server_h_api, #{op => create}},
+            {"/api/search", erllama_server_h_api, #{op => search}}
         ]}
     ].
 
