@@ -1,0 +1,19 @@
+{application, erllama_server, [
+    {description, "OpenAI/Anthropic-compatible HTTP server for erllama"},
+    {vsn, "0.1.0"},
+    {registered, [erllama_server_sup, erllama_server_config]},
+    {mod, {erllama_server_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        sasl,
+        crypto,
+        cowboy,
+        instrument,
+        erllama
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{"GitHub", "https://github.com/benoitc/erllama_server"}]}
+]}.

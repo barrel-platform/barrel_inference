@@ -1,0 +1,51 @@
+-module(erllama_server_sup).
+-behaviour(supervisor).
+
+-export([start_link/0, init/1]).
+
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+init([]) ->
+    SupFlags = #{
+        strategy => rest_for_one,
+        intensity => 5,
+        period => 30
+    },
+    Children = [
+        #{
+            id => erllama_server_registry,
+            start => {erllama_server_registry, start_link, []},
+            type => worker,
+            shutdown => 5000
+        },
+
+        #{
+            id => erllama_server_config,
+            start => {erllama_server_config, start_link, []},
+            type => worker,
+            shutdown => 5000
+        },
+
+        #{
+            id => erllama_server_loaders_sup,
+            start => {erllama_server_loaders_sup, start_link, []},
+            type => supervisor,
+            shutdown => infinity
+        },
+
+        #{
+            id => erllama_server_queues_sup,
+            start => {erllama_server_queues_sup, start_link, []},
+            type => supervisor,
+            shutdown => infinity
+        },
+
+        #{
+            id => erllama_server_listener_mon,
+            start => {erllama_server_listener_mon, start_link, []},
+            type => worker,
+            shutdown => 5000
+        }
+    ],
+    {ok, {SupFlags, Children}}.

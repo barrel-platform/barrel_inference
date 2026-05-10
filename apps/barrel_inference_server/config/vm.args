@@ -1,0 +1,8 @@
+-name erllama_server@127.0.0.1
+-setcookie erllama_server_cookie
+
++K true
++A 64
++sbwt none
++sbwtdcpu none
++sbwtdio none

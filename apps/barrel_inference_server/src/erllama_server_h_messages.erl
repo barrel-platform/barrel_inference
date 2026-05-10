@@ -1,0 +1,614 @@
+%%% Anthropic /v1/messages handler.
+%%%
+%%% Mirrors erllama_server_h_chat for pipeline + admission + token
+%%% handling, but emits Anthropic-shaped responses:
+%%%
+%%%   - Streaming: named SSE events (message_start, content_block_*,
+%%%     message_delta, message_stop). No [DONE] sentinel.
+%%%   - Non-streaming: `{"type":"message", "content":[{type:"text",...}]}`.
+%%%
+%%% Tool-call mode (grammar set, first-byte `{`) buffers the JSON and
+%%% emits one `content_block_start` of `type:"tool_use"`, one
+%%% `content_block_delta` carrying the full `partial_json`, and one
+%%% `content_block_stop`.
+
+-module(erllama_server_h_messages).
+-behaviour(cowboy_handler).
+
+-export([init/2, info/3, terminate/3]).
+
+%% See the matching pragma in erllama_server_h_chat.
+-dialyzer({nowarn_function, info/3}).
+
+-include("erllama_server.hrl").
+
+-record(st, {
+    req_id :: binary(),
+    model :: binary(),
+    requested :: binary(),
+    stream :: boolean(),
+    phase ::
+        waiting_load
+        | waiting_template
+        | waiting_queue
+        | waiting_admit
+        | running,
+    worker :: pid() | undefined,
+    worker_mon :: reference() | undefined,
+    ref :: reference() | undefined,
+    slot :: erllama_server_queue:slot() | undefined,
+    started_mono :: integer(),
+    first_token_at :: integer() | undefined,
+    prefill_tref :: reference() | undefined,
+    idle_tref :: reference() | undefined,
+    out_tokens :: non_neg_integer(),
+    buf_text :: iodata(),
+    buf_reason :: iodata(),
+    mode :: text | tool_buffer,
+    grammar_set :: boolean(),
+    %% Anthropic-specific stream state.
+    total_tref :: reference() | undefined,
+    text_block_started :: boolean(),
+    thinking_block_started :: boolean(),
+    message_started :: boolean()
+}).
+
+%%====================================================================
+%% init
+%%====================================================================
+
+init(Req0, Opts) ->
+    case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            handle_post(Req0, Opts);
+        _ ->
+            Req1 = cowboy_req:reply(405, #{}, <<>>, Req0),
+            {ok, Req1, Opts}
+    end.
+
+handle_post(Req0, _Opts) ->
+    MaxBody = erllama_server_config:max_request_body_bytes(),
+    case cowboy_req:read_body(Req0, #{length => MaxBody}) of
+        {ok, Body, Req1} -> fast_phase(Body, Req1);
+        {more, _, Req1} -> reply_json_error(413, request_too_large, Req1)
+    end.
+
+fast_phase(Body, Req0) ->
+    case decode(Body) of
+        {ok, Map} -> translate(Map, Req0);
+        error -> reply_json_error(400, invalid_json, Req0)
+    end.
+
+translate(Map, Req0) ->
+    case erllama_server_translate:anthropic_messages_to_internal(Map) of
+        {ok, R} -> start_pipeline(R, Req0);
+        {error, Reason} -> reply_json_error(400, Reason, Req0)
+    end.
+
+start_pipeline(R0, Req0) ->
+    Requested = R0#erllama_request.model_id,
+    Real = erllama_server_config:resolve_model(Requested),
+    R1 = R0#erllama_request{model_id = Real},
+    {Worker, Mon} = erllama_server_pipeline:start_link(self(), R1),
+    State0 = init_state(R1, Requested, Worker, Mon),
+    State = arm_total_timer(State0),
+    {cowboy_loop, Req0, State, hibernate}.
+
+arm_total_timer(S = #st{total_tref = undefined}) ->
+    Ms =
+        case erllama_server_config:total_ms() of
+            N when is_integer(N), N > 0 -> N;
+            _ -> 1800000
+        end,
+    TRef = erlang:send_after(Ms, self(), total_request_timeout),
+    S#st{total_tref = TRef}.
+
+init_state(R, Requested, Worker, Mon) ->
+    erllama_server_metrics:inc_active_streams(R#erllama_request.model_id),
+    #st{
+        req_id = R#erllama_request.request_id,
+        model = R#erllama_request.model_id,
+        requested = Requested,
+        stream = R#erllama_request.stream,
+        phase = waiting_load,
+        worker = Worker,
+        worker_mon = Mon,
+        ref = undefined,
+        slot = undefined,
+        started_mono = mono_ms(),
+        first_token_at = undefined,
+        prefill_tref = undefined,
+        idle_tref = undefined,
+        total_tref = undefined,
+        out_tokens = 0,
+        buf_text = [],
+        buf_reason = [],
+        mode = text,
+        grammar_set = grammar_active(R),
+        text_block_started = false,
+        thinking_block_started = false,
+        message_started = false
+    }.
+
+%% Anthropic translator does not emit `tool_choice = none`, only auto,
+%% required, and {named, _}. So the empty/undefined tools branches
+%% are the only false cases.
+grammar_active(#erllama_request{tools = undefined}) -> false;
+grammar_active(#erllama_request{tools = []}) -> false;
+grammar_active(_) -> true.
+
+%%====================================================================
+%% info/3
+%%====================================================================
+
+info({pipeline, loaded}, Req, S) ->
+    {ok, Req, S#st{phase = waiting_template}, hibernate};
+info({pipeline, templated, _}, Req, S) ->
+    {ok, Req, S#st{phase = waiting_queue}, hibernate};
+info({pipeline, queued}, Req, S) ->
+    {ok, Req, S#st{phase = waiting_admit}, hibernate};
+info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
+    %% Tokens may have arrived first via learn_ref/3. If so, just
+    %% attach the slot.
+    S1 =
+        case S0#st.ref of
+            undefined -> arm_prefill(S0#st{phase = running, ref = Ref});
+            _ -> S0
+        end,
+    S2 = S1#st{slot = Slot},
+    case {S2#st.stream, S0#st.ref} of
+        {true, undefined} ->
+            Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
+            S3 = emit_message_start(Req1, S2),
+            {ok, Req1, S3, hibernate};
+        _ ->
+            {ok, Req0, S2, hibernate}
+    end;
+info({pipeline, error, Status, Reason}, Req0, S) ->
+    record_metrics(S, Status),
+    Req1 = json_error(Status, Reason, Req0),
+    {stop, Req1, S};
+info(
+    {'DOWN', Mon, process, Worker, _Reason},
+    Req0,
+    S = #st{worker = Worker, worker_mon = Mon}
+) ->
+    case S#st.phase of
+        running ->
+            {ok, Req0, S#st{worker = undefined, worker_mon = undefined}, hibernate};
+        _ ->
+            Req1 = json_error(500, pipeline_crashed, Req0),
+            {stop, Req1, S}
+    end;
+%% Token messages may arrive before {pipeline, admitted, ...} (see
+%% the matching comment in erllama_server_h_chat).
+info({erllama_token, Ref, Tok}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    handle_token(Tok, Req, S);
+info({erllama_reasoning_token, Ref, Tok}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    handle_reasoning(Tok, Req, S);
+info({erllama_done, Ref, Stats}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    finish_ok(Req, S, Stats);
+info({erllama_error, Ref, Reason}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    finish_err(Req, S, Reason);
+info({prefill_timeout, Ref}, Req, S = #st{ref = Ref}) ->
+    erllama:cancel(Ref),
+    finish_err(Req, S, prefill_timeout);
+info({idle_timeout, Ref}, Req, S = #st{ref = Ref}) ->
+    erllama:cancel(Ref),
+    finish_err(Req, S, generation_idle_timeout);
+info(total_request_timeout, Req, S = #st{phase = running, ref = Ref}) when is_reference(Ref) ->
+    erllama:cancel(Ref),
+    finish_err(Req, S, total_timeout);
+info(total_request_timeout, Req0, S) ->
+    Req1 = json_error(504, total_timeout, Req0),
+    record_metrics(S, 504),
+    {stop, Req1, S};
+info(_Msg, Req, S) ->
+    {ok, Req, S, hibernate}.
+
+%%====================================================================
+%% terminate
+%%====================================================================
+
+terminate(_Reason, _Req, S = #st{}) ->
+    cleanup(S),
+    ok;
+terminate(_Reason, _Req, _) ->
+    ok.
+
+cleanup(S) ->
+    cancel_timer(S#st.prefill_tref),
+    cancel_timer(S#st.idle_tref),
+    cancel_timer(S#st.total_tref),
+    case is_pid(S#st.worker) of
+        true -> erllama_server_pipeline:abort(S#st.worker);
+        false -> ok
+    end,
+    case S#st.ref of
+        Ref when is_reference(Ref) -> erllama:cancel(Ref);
+        _ -> ok
+    end,
+    case S#st.slot of
+        undefined -> ok;
+        Slot -> erllama_server_queue:release(S#st.model, Slot)
+    end,
+    erllama_server_metrics:dec_active_streams(S#st.model).
+
+%%====================================================================
+%% Token handling
+%%====================================================================
+
+handle_token(Tok, Req, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
+    case is_tool_first_byte(Tok) of
+        true ->
+            S1 = first_token(S),
+            {ok, Req,
+                rearm_idle(S1#st{
+                    mode = tool_buffer,
+                    buf_text = [Tok],
+                    out_tokens = 1
+                }), hibernate};
+        false ->
+            emit_text(Tok, Req, first_token(S))
+    end;
+handle_token(Tok, Req, S = #st{mode = tool_buffer}) ->
+    {ok, Req,
+        rearm_idle(S#st{
+            buf_text = [S#st.buf_text | Tok],
+            out_tokens = S#st.out_tokens + 1
+        }), hibernate};
+handle_token(Tok, Req, S = #st{mode = text, out_tokens = 0}) ->
+    emit_text(Tok, Req, first_token(S));
+handle_token(Tok, Req, S = #st{mode = text}) ->
+    emit_text(Tok, Req, S).
+
+emit_text(Tok, Req, S = #st{stream = true}) ->
+    S1 = ensure_text_block_started(Req, S),
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {text_delta, Tok}, #{}, S#st.req_id, S#st.requested
+    ),
+    cowboy_req:stream_body(Iolist, nofin, Req),
+    {ok, Req, rearm_idle(S1#st{out_tokens = S1#st.out_tokens + 1}), hibernate};
+emit_text(Tok, Req, S = #st{stream = false}) ->
+    {ok, Req,
+        rearm_idle(S#st{
+            buf_text = [S#st.buf_text | Tok],
+            out_tokens = S#st.out_tokens + 1
+        }), hibernate}.
+
+handle_reasoning(Tok, Req, S = #st{stream = true}) ->
+    S1 = ensure_thinking_block_started(Req, S),
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {thinking_delta, Tok}, #{}, S#st.req_id, S#st.requested
+    ),
+    cowboy_req:stream_body(Iolist, nofin, Req),
+    {ok, Req, rearm_idle(S1), hibernate};
+handle_reasoning(Tok, Req, S = #st{stream = false}) ->
+    {ok, Req, rearm_idle(S#st{buf_reason = [S#st.buf_reason | Tok]}), hibernate}.
+
+%%====================================================================
+%% Stream block management
+%%====================================================================
+
+emit_message_start(_Req, S = #st{message_started = true}) ->
+    S;
+emit_message_start(Req, S) ->
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        message_start, #{}, S#st.req_id, S#st.requested
+    ),
+    cowboy_req:stream_body(Iolist, nofin, Req),
+    S#st{message_started = true}.
+
+ensure_text_block_started(_Req, S = #st{text_block_started = true}) ->
+    S;
+ensure_text_block_started(Req, S) ->
+    %% Close a thinking block first if one is open.
+    S1 = maybe_close_thinking(Req, S),
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        content_block_start_text, #{}, S1#st.req_id, S1#st.requested
+    ),
+    cowboy_req:stream_body(Iolist, nofin, Req),
+    S1#st{text_block_started = true}.
+
+ensure_thinking_block_started(_Req, S = #st{thinking_block_started = true}) ->
+    S;
+ensure_thinking_block_started(Req, S) ->
+    %% Open a `thinking` content block. We currently send the same
+    %% content_block_start payload as for text but with a thinking
+    %% type; the Anthropic SDK accepts either. Since the translate
+    %% module's content_block_start_text emits text-shaped, we render
+    %% the thinking-shaped one inline here.
+    Payload = #{
+        <<"type">> => <<"content_block_start">>,
+        <<"index">> => 0,
+        <<"content_block">> =>
+            #{<<"type">> => <<"thinking">>, <<"thinking">> => <<>>}
+    },
+    cowboy_req:stream_body(
+        [
+            <<"event: content_block_start\ndata: ">>,
+            json:encode(Payload),
+            <<"\n\n">>
+        ],
+        nofin,
+        Req
+    ),
+    S#st{thinking_block_started = true}.
+
+maybe_close_thinking(_Req, S = #st{thinking_block_started = false}) ->
+    S;
+maybe_close_thinking(Req, S) ->
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        content_block_stop, #{}, S#st.req_id, S#st.requested
+    ),
+    cowboy_req:stream_body(Iolist, nofin, Req),
+    S#st{thinking_block_started = false}.
+
+%%====================================================================
+%% Finish
+%%====================================================================
+
+finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
+    %% Close any open content blocks, then message_delta + message_stop.
+    Req1 =
+        case S#st.thinking_block_started orelse S#st.text_block_started of
+            true ->
+                StopBlock = erllama_server_translate:internal_to_anthropic_event(
+                    content_block_stop, #{}, S#st.req_id, S#st.requested
+                ),
+                cowboy_req:stream_body(StopBlock, nofin, Req0),
+                Req0;
+            false ->
+                Req0
+        end,
+    Delta = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, Stats}, #{}, S#st.req_id, S#st.requested
+    ),
+    Stop = erllama_server_translate:internal_to_anthropic_event(
+        message_stop, #{}, S#st.req_id, S#st.requested
+    ),
+    cowboy_req:stream_body([Delta, Stop], fin, Req1),
+    record_success(S, Stats),
+    {stop, Req1, S};
+finish_ok(Req0, S = #st{stream = true, mode = tool_buffer}, Stats) ->
+    Json = iolist_to_binary(S#st.buf_text),
+    {Name, Input} = parse_tool_call(Json),
+    ToolId = make_tool_id(),
+    Start = #{
+        <<"type">> => <<"content_block_start">>,
+        <<"index">> => 0,
+        <<"content_block">> => #{
+            <<"type">> => <<"tool_use">>,
+            <<"id">> => ToolId,
+            <<"name">> => Name,
+            <<"input">> => #{}
+        }
+    },
+    DeltaInput = #{
+        <<"type">> => <<"content_block_delta">>,
+        <<"index">> => 0,
+        <<"delta">> => #{
+            <<"type">> => <<"input_json_delta">>,
+            <<"partial_json">> => json:encode(Input)
+        }
+    },
+    Stop = erllama_server_translate:internal_to_anthropic_event(
+        content_block_stop, #{}, S#st.req_id, S#st.requested
+    ),
+    StatsToolCall = maps:put(finish_reason, tool_call, Stats),
+    MsgDelta = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, StatsToolCall}, #{}, S#st.req_id, S#st.requested
+    ),
+    MsgStop = erllama_server_translate:internal_to_anthropic_event(
+        message_stop, #{}, S#st.req_id, S#st.requested
+    ),
+    Frames = [
+        [<<"event: content_block_start\ndata: ">>, json:encode(Start), <<"\n\n">>],
+        [<<"event: content_block_delta\ndata: ">>, json:encode(DeltaInput), <<"\n\n">>],
+        Stop,
+        MsgDelta,
+        MsgStop
+    ],
+    cowboy_req:stream_body(Frames, fin, Req0),
+    record_success(S, Stats),
+    {stop, Req0, S};
+finish_ok(Req0, S = #st{stream = false}, Stats) ->
+    Text = iolist_to_binary(S#st.buf_text),
+    Body = erllama_server_translate:internal_to_anthropic_messages_response(
+        Text, Stats, S#st.requested
+    ),
+    Req1 = cowboy_req:reply(
+        200,
+        #{<<"content-type">> => <<"application/json">>},
+        json:encode(Body),
+        Req0
+    ),
+    record_success(S, Stats),
+    {stop, Req1, S}.
+
+finish_err(Req0, S = #st{stream = true}, Reason) ->
+    Err = #{
+        <<"type">> => <<"error">>,
+        <<"error">> => #{
+            <<"type">> => <<"server_error">>,
+            <<"message">> => to_bin(Reason)
+        }
+    },
+    cowboy_req:stream_body(
+        [<<"event: error\ndata: ">>, json:encode(Err), <<"\n\n">>],
+        fin,
+        Req0
+    ),
+    record_error(S, Reason),
+    {stop, Req0, S};
+finish_err(Req0, S = #st{stream = false}, Reason) ->
+    Status = http_status(Reason),
+    Req1 = json_error(Status, Reason, Req0),
+    record_error(S, Reason),
+    {stop, Req1, S}.
+
+%%====================================================================
+%% Timers / metrics / shared
+%%====================================================================
+
+first_token(S = #st{first_token_at = undefined}) ->
+    Now = mono_ms(),
+    PrefillSec = (Now - S#st.started_mono) / 1000.0,
+    erllama_server_metrics:observe_prefill(S#st.model, PrefillSec),
+    cancel_timer(S#st.prefill_tref),
+    rearm_idle(S#st{first_token_at = Now, prefill_tref = undefined});
+first_token(S) ->
+    rearm_idle(S).
+
+%% See learn_ref/3 in erllama_server_h_chat. For streaming requests
+%% also call stream_reply + emit message_start so the body can be
+%% sent immediately.
+learn_ref(S = #st{ref = undefined, stream = true}, Req0, Ref) ->
+    Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
+    S1 = arm_prefill(S#st{phase = running, ref = Ref}),
+    S2 = emit_message_start(Req1, S1),
+    {S2, Req1};
+learn_ref(S = #st{ref = undefined}, Req0, Ref) ->
+    {arm_prefill(S#st{phase = running, ref = Ref}), Req0};
+learn_ref(S, Req, _Ref) ->
+    {S, Req}.
+
+arm_prefill(S) ->
+    Ms = erllama_server_config:prefill_ms(),
+    case S#st.ref of
+        undefined ->
+            S;
+        Ref ->
+            S#st{
+                prefill_tref = erlang:send_after(
+                    Ms,
+                    self(),
+                    {prefill_timeout, Ref}
+                )
+            }
+    end.
+
+rearm_idle(S) ->
+    cancel_timer(S#st.idle_tref),
+    Ms = erllama_server_config:generation_idle_ms(),
+    case S#st.ref of
+        undefined ->
+            S;
+        Ref ->
+            S#st{
+                idle_tref = erlang:send_after(
+                    Ms,
+                    self(),
+                    {idle_timeout, Ref}
+                )
+            }
+    end.
+
+cancel_timer(undefined) ->
+    ok;
+cancel_timer(Ref) ->
+    _ = erlang:cancel_timer(Ref),
+    ok.
+
+record_success(S, Stats) ->
+    record_metrics(S, 200),
+    erllama_server_metrics:inc_prompt_tokens(
+        S#st.model,
+        maps:get(prompt_tokens, Stats, 0)
+    ),
+    erllama_server_metrics:inc_completion_tokens(
+        S#st.model,
+        maps:get(completion_tokens, Stats, 0)
+    ).
+
+record_error(S, _Reason) -> record_metrics(S, 500).
+
+record_metrics(S, Status) ->
+    Now = mono_ms(),
+    Duration = (Now - S#st.started_mono) / 1000.0,
+    erllama_server_metrics:record_request(
+        <<"/v1/messages">>,
+        S#st.requested,
+        integer_to_binary(Status),
+        Duration
+    ).
+
+reply_json_error(Status, Reason, Req0) ->
+    Req1 = json_error(Status, Reason, Req0),
+    {ok, Req1, undefined}.
+
+json_error(Status, Reason, Req0) ->
+    %% Anthropic error envelope: {"type":"error","error":{...}}.
+    Body = #{
+        <<"type">> => <<"error">>,
+        <<"error">> => #{
+            <<"type">> => anthropic_error_type(Status),
+            <<"message">> => to_bin(Reason)
+        }
+    },
+    cowboy_req:reply(
+        Status,
+        #{<<"content-type">> => <<"application/json">>},
+        json:encode(Body),
+        Req0
+    ).
+
+anthropic_error_type(400) -> <<"invalid_request_error">>;
+anthropic_error_type(404) -> <<"not_found_error">>;
+anthropic_error_type(429) -> <<"rate_limit_error">>;
+anthropic_error_type(503) -> <<"overloaded_error">>;
+anthropic_error_type(_) -> <<"api_error">>.
+
+http_status(prefill_timeout) -> 504;
+http_status(generation_idle_timeout) -> 504;
+http_status(_) -> 500.
+
+sse_headers() ->
+    #{
+        <<"content-type">> => <<"text/event-stream">>,
+        <<"cache-control">> => <<"no-cache">>,
+        <<"x-accel-buffering">> => <<"no">>
+    }.
+
+decode(Body) ->
+    try
+        case json:decode(Body) of
+            Map when is_map(Map) -> {ok, Map};
+            _ -> error
+        end
+    catch
+        _:_ -> error
+    end.
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(A) when is_atom(A) -> atom_to_binary(A);
+to_bin(T) -> iolist_to_binary(io_lib:format("~p", [T])).
+
+mono_ms() -> erlang:monotonic_time(millisecond).
+
+%%====================================================================
+%% Tool-call buffering
+%%====================================================================
+
+is_tool_first_byte(<<>>) -> false;
+is_tool_first_byte(<<C, _/binary>>) when C =:= $\s; C =:= $\t; C =:= $\r; C =:= $\n -> false;
+is_tool_first_byte(<<${, _/binary>>) -> true;
+is_tool_first_byte(_) -> false.
+
+parse_tool_call(JsonBin) ->
+    try json:decode(JsonBin) of
+        #{<<"name">> := Name, <<"arguments">> := Args} -> {Name, Args};
+        _ -> {<<"unknown">>, JsonBin}
+    catch
+        _:_ -> {<<"unknown">>, JsonBin}
+    end.
+
+make_tool_id() ->
+    iolist_to_binary([
+        <<"toolu_">>,
+        integer_to_binary(erlang:unique_integer([positive]))
+    ]).

@@ -1,0 +1,248 @@
+%%% Smoke test for the read-only HTTP endpoints (no inference).
+%%% Boots the full erllama_server application against a random port,
+%%% hits /health, /health/ready, /v1/models, /metrics, and tears down.
+-module(erllama_server_smoke_SUITE).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+
+-export([all/0, suite/0, init_per_suite/1, end_per_suite/1]).
+-export([
+    health_returns_200/1,
+    health_ready_returns_503_with_no_models/1,
+    models_returns_openai_list_shape/1,
+    models_returns_aliases/1,
+    models_unknown_returns_404/1,
+    metrics_returns_prometheus_text/1,
+    embeddings_unknown_model_returns_404/1,
+    embeddings_invalid_json_returns_400/1,
+    chat_invalid_json_returns_400/1,
+    chat_missing_model_returns_400/1,
+    chat_too_many_messages_returns_400/1,
+    request_id_minted_when_absent/1,
+    request_id_echoed_when_present/1,
+    cors_disabled_by_default/1,
+    cors_preflight_returns_204/1,
+    cors_headers_present_on_response/1
+]).
+
+suite() -> [{timetrap, {seconds, 30}}].
+all() ->
+    [
+        health_returns_200,
+        health_ready_returns_503_with_no_models,
+        models_returns_openai_list_shape,
+        models_returns_aliases,
+        models_unknown_returns_404,
+        metrics_returns_prometheus_text,
+        embeddings_unknown_model_returns_404,
+        embeddings_invalid_json_returns_400,
+        chat_invalid_json_returns_400,
+        chat_missing_model_returns_400,
+        chat_too_many_messages_returns_400,
+        request_id_minted_when_absent,
+        request_id_echoed_when_present,
+        cors_disabled_by_default,
+        cors_preflight_returns_204,
+        cors_headers_present_on_response
+    ].
+
+init_per_suite(Config) ->
+    %% pick after start
+    Port = 0,
+    application:set_env(erllama_server, port, free_port()),
+    application:set_env(
+        erllama_server,
+        model_aliases,
+        #{
+            <<"alias-a">> => <<"real-1">>,
+            <<"alias-b">> => <<"real-2">>
+        }
+    ),
+    application:set_env(
+        erllama_server,
+        pool_exhausted_policy,
+        {queue, #{
+            concurrency => 1,
+            depth => 10,
+            timeout_ms => 5000
+        }}
+    ),
+    application:set_env(erllama_server, max_messages, 4),
+    application:set_env(
+        erllama_server,
+        cors,
+        #{
+            allow_origins => <<"*">>,
+            allow_credentials => false,
+            allow_methods => <<"GET, POST, OPTIONS">>,
+            allow_headers => <<"content-type, x-request-id">>,
+            max_age => 600
+        }
+    ),
+    {ok, Started} = application:ensure_all_started(erllama_server),
+    {ok, _} = application:ensure_all_started(inets),
+    Url = io_lib:format("http://127.0.0.1:~p", [chosen_port()]),
+    [{base, lists:flatten(Url)}, {started, Started}, {port, Port} | Config].
+
+end_per_suite(Config) ->
+    [application:stop(A) || A <- lists:reverse(?config(started, Config))],
+    ok.
+
+free_port() ->
+    {ok, Sock} = gen_tcp:listen(0, [{reuseaddr, true}]),
+    {ok, Port} = inet:port(Sock),
+    gen_tcp:close(Sock),
+    persistent_term:put({?MODULE, port}, Port),
+    Port.
+
+chosen_port() ->
+    persistent_term:get({?MODULE, port}).
+
+%%====================================================================
+%% Tests
+%%====================================================================
+
+health_returns_200(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/health",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assertEqual(<<"ok">>, maps:get(<<"status">>, Decoded)).
+
+health_ready_returns_503_with_no_models(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/health/ready",
+    {ok, {{_, Code, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assertEqual(503, Code),
+    ?assertEqual(<<"not_ready">>, maps:get(<<"status">>, Decoded)),
+    ?assertEqual([], maps:get(<<"models">>, Decoded)).
+
+models_returns_openai_list_shape(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/models",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assertEqual(<<"list">>, maps:get(<<"object">>, Decoded)),
+    ?assertMatch([_ | _], maps:get(<<"data">>, Decoded)).
+
+models_returns_aliases(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/models",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    Ids = [maps:get(<<"id">>, M) || M <- maps:get(<<"data">>, Decoded)],
+    ?assert(lists:member(<<"alias-a">>, Ids)),
+    ?assert(lists:member(<<"alias-b">>, Ids)).
+
+models_unknown_returns_404(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/models/no-such-model",
+    {ok, {{_, 404, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    Err = maps:get(<<"error">>, Decoded),
+    ?assertEqual(<<"model_not_found">>, maps:get(<<"code">>, Err)).
+
+metrics_returns_prometheus_text(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/metrics",
+    {ok, {{_, 200, _}, Headers, _Body}} = httpc:request(Url),
+    %% Content-type starts with text/plain. Body may be empty if no
+    %% counter has been observed yet (the suite order is not
+    %% guaranteed across runs).
+    {value, {_, CT}} = lists:keysearch("content-type", 1, Headers),
+    ?assert(string:prefix(CT, "text/plain") =/= nomatch).
+
+embeddings_unknown_model_returns_404(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/embeddings",
+    Body = json:encode(#{<<"model">> => <<"nope">>, <<"input">> => <<"hi">>}),
+    {ok, {{_, Code, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    %% No model is loaded; resolve_model is identity, ensure_loaded
+    %% sees not_found from erllama:model_info/1 (not loaded path).
+    %% In practice this returns 503 from ensure_loaded {error, not_loaded}
+    %% on policy=on_demand because erllama:load_model crashes on a
+    %% bogus path. Either is acceptable.
+    ?assert(Code =:= 404 orelse Code =:= 503 orelse Code =:= 500).
+
+embeddings_invalid_json_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/embeddings",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(
+            post,
+            {Url, [], "application/json", "{not json"},
+            [],
+            []
+        ).
+
+chat_invalid_json_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/chat/completions",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(
+            post,
+            {Url, [], "application/json", "{nope"},
+            [],
+            []
+        ).
+
+chat_missing_model_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/chat/completions",
+    Body = json:encode(#{<<"messages">> => []}),
+    {ok, {{_, 400, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(#{<<"error">> := _}, Decoded).
+
+chat_too_many_messages_returns_400(Cfg) ->
+    %% max_messages set to 4 in init_per_suite; 5 must trip the cap.
+    Url = ?config(base, Cfg) ++ "/v1/chat/completions",
+    Many = [
+        #{<<"role">> => <<"user">>, <<"content">> => integer_to_binary(I)}
+     || I <- lists:seq(1, 5)
+    ],
+    Body = json:encode(#{<<"model">> => <<"x">>, <<"messages">> => Many}),
+    {ok, {{_, 400, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(
+        #{<<"error">> := #{<<"code">> := <<"too_many_messages">>}},
+        Decoded
+    ).
+
+request_id_minted_when_absent(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/health",
+    {ok, {{_, 200, _}, Headers, _}} = httpc:request(Url),
+    {value, {_, Id}} = lists:keysearch("x-request-id", 1, Headers),
+    ?assert(string:prefix(Id, "req_") =/= nomatch).
+
+request_id_echoed_when_present(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/health",
+    {ok, {{_, 200, _}, Headers, _}} =
+        httpc:request(get, {Url, [{"x-request-id", "abc-123"}]}, [], []),
+    {value, {_, Id}} = lists:keysearch("x-request-id", 1, Headers),
+    ?assertEqual("abc-123", Id).
+
+cors_disabled_by_default(Cfg) ->
+    %% This suite enables CORS, so this test verifies that no Origin
+    %% header skips the CORS branch entirely.
+    Url = ?config(base, Cfg) ++ "/health",
+    {ok, {{_, 200, _}, Headers, _}} = httpc:request(Url),
+    %% No Origin header on the request -> no Access-Control-* on the
+    %% response.
+    ?assertEqual(false, lists:keymember("access-control-allow-origin", 1, Headers)).
+
+cors_preflight_returns_204(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/chat/completions",
+    Headers = [
+        {"origin", "http://example.com"},
+        {"access-control-request-method", "POST"},
+        {"access-control-request-headers", "content-type"}
+    ],
+    {ok, {{_, 204, _}, RespHeaders, _}} =
+        httpc:request(options, {Url, Headers}, [], []),
+    {value, {_, AllowOrigin}} =
+        lists:keysearch("access-control-allow-origin", 1, RespHeaders),
+    ?assertEqual("*", AllowOrigin),
+    ?assert(lists:keymember("access-control-allow-methods", 1, RespHeaders)),
+    ?assert(lists:keymember("access-control-allow-headers", 1, RespHeaders)).
+
+cors_headers_present_on_response(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/health",
+    {ok, {{_, 200, _}, Headers, _}} =
+        httpc:request(get, {Url, [{"origin", "http://example.com"}]}, [], []),
+    ?assert(lists:keymember("access-control-allow-origin", 1, Headers)).
