@@ -1,0 +1,304 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
+-module(erllama_server_models).
+-moduledoc """
+Ollama-style model registry.
+
+Layered over `erllama_server_fetch` (download + content-addressed
+blob cache) and `erllama_server_gguf` (metadata sniffing). Persists
+one JSON manifest per `name:tag` under
+`<cache_root>/manifests/<name>/<tag>.json`. The blob itself stays
+in `<cache_root>/blobs/sha256-<hex>.gguf` and may be referenced by
+multiple manifests (`copy/2`).
+
+Public surface:
+
+```
+list/0                  -> [manifest()]
+get/1, show/1           -> {ok, manifest()} | {error, not_found}
+pull/1, pull/2          -> {ok, manifest()} | {error, term()}
+delete/1                -> ok | {error, not_found}
+copy/2                  -> ok | {error, term()}
+resolve_spec/1          -> {Spec, Name, Tag} (used by CLI / API too)
+```
+
+`pull/1,2` accepts either a fetch spec (`hf://`, `ollama://`,
+`https://`, `file://`) or a short Ollama-style name (`llama3`,
+`llama3:8b`); the latter is rewritten to `ollama://library/<name>`.
+Manifest fields are sniffed from the GGUF file once the blob is on
+disk: `architecture`, `family`, `parameter_size`, `quantization`,
+`context_size`, `embedding_length`, `chat_template` (raw).
+""".
+
+-export([
+    list/0,
+    get/1,
+    show/1,
+    pull/1,
+    pull/2,
+    delete/1,
+    copy/2,
+    resolve_spec/1,
+    cache_root/0
+]).
+
+-export_type([manifest/0, name_or_tag/0, pull_opts/0]).
+
+-type manifest() :: erllama_server_models_store:manifest().
+-type name_or_tag() :: binary() | string().
+-type pull_opts() :: #{
+    name => binary() | string(),
+    tag => binary() | string(),
+    progress => pid(),
+    sha256 => binary(),
+    timeout => pos_integer(),
+    force => boolean()
+}.
+
+%% =============================================================================
+%% Public API
+%% =============================================================================
+
+-spec list() -> [manifest()].
+list() ->
+    {ok, Root} = cache_root(),
+    erllama_server_models_store:list(Root).
+
+-spec get(name_or_tag()) -> {ok, manifest()} | {error, not_found | term()}.
+get(NameOrTag) ->
+    {Name, Tag} = split_name_tag(NameOrTag),
+    {ok, Root} = cache_root(),
+    erllama_server_models_store:read(Root, Name, Tag).
+
+-spec show(name_or_tag()) -> {ok, manifest()} | {error, not_found | term()}.
+show(NameOrTag) ->
+    ?MODULE:get(NameOrTag).
+
+-spec pull(name_or_tag()) -> {ok, manifest()} | {error, term()}.
+pull(SpecOrName) ->
+    pull(SpecOrName, #{}).
+
+-spec pull(name_or_tag(), pull_opts()) -> {ok, manifest()} | {error, term()}.
+pull(SpecOrName, Opts) when is_map(Opts) ->
+    case resolve_spec(SpecOrName) of
+        {ok, Spec, DefName, DefTag} ->
+            Name = to_bin(maps:get(name, Opts, DefName)),
+            Tag = to_bin(maps:get(tag, Opts, DefTag)),
+            FetchOpts = maps:without([name, tag], Opts),
+            do_pull(Spec, Name, Tag, FetchOpts);
+        {error, _} = E ->
+            E
+    end.
+
+-spec delete(name_or_tag()) -> ok | {error, not_found | term()}.
+delete(NameOrTag) ->
+    {Name, Tag} = split_name_tag(NameOrTag),
+    {ok, Root} = cache_root(),
+    erllama_server_models_store:delete(Root, Name, Tag).
+
+-spec copy(name_or_tag(), name_or_tag()) -> ok | {error, term()}.
+copy(Src, Dst) ->
+    {SrcName, SrcTag} = split_name_tag(Src),
+    {DstName, DstTag} = split_name_tag(Dst),
+    {ok, Root} = cache_root(),
+    erllama_server_models_store:copy(Root, SrcName, SrcTag, DstName, DstTag).
+
+%% Resolves a user-supplied spec or short name into:
+%%   {ok, FetchSpec, DefaultName, DefaultTag}
+%% A bare name like "llama3" or "llama3:8b" is rewritten to
+%% `ollama://library/<name>:<tag>`.
+-spec resolve_spec(name_or_tag()) ->
+    {ok, binary(), binary(), binary()} | {error, term()}.
+resolve_spec(SpecOrName) ->
+    Bin = to_bin(SpecOrName),
+    case erllama_server_fetch_resolvers:parse(Bin) of
+        {ok, Parsed} ->
+            {DefName, DefTag} = derive_name_tag(Parsed),
+            {ok, Bin, DefName, DefTag};
+        {error, _} ->
+            wrap_short_ollama(Bin)
+    end.
+
+-spec cache_root() -> {ok, file:filename_all()}.
+cache_root() ->
+    erllama_server_fetch:cache_root().
+
+%% =============================================================================
+%% Internal: name/tag derivation
+%% =============================================================================
+
+derive_name_tag({ollama, <<"library">>, Name, Tag}) ->
+    {Name, Tag};
+derive_name_tag({ollama, Library, Name, Tag}) ->
+    {<<Library/binary, "/", Name/binary>>, Tag};
+derive_name_tag({hf, Org, Repo, _Path, Rev}) ->
+    {<<Org/binary, "/", Repo/binary>>, Rev};
+derive_name_tag({http, URL}) ->
+    {url_basename(URL), <<"latest">>};
+derive_name_tag({file, Abs}) ->
+    {strip_ext(to_bin(filename:basename(Abs))), <<"latest">>}.
+
+wrap_short_ollama(Bin) ->
+    {Name, Tag} = split_name_tag(Bin),
+    case is_valid_short(Name) of
+        true ->
+            Spec = <<"ollama://library/", Name/binary, ":", Tag/binary>>,
+            {ok, Spec, Name, Tag};
+        false ->
+            {error, {unsupported_spec, Bin}}
+    end.
+
+is_valid_short(<<>>) -> false;
+is_valid_short(Name) -> not has_scheme(Name).
+
+has_scheme(Bin) ->
+    binary:match(Bin, <<"://">>) =/= nomatch.
+
+split_name_tag(NameOrTag) ->
+    Bin = to_bin(NameOrTag),
+    case binary:split(Bin, <<":">>) of
+        [Name] -> {Name, <<"latest">>};
+        [Name, <<>>] -> {Name, <<"latest">>};
+        [Name, Tag] -> {Name, Tag}
+    end.
+
+url_basename(URL) ->
+    Path =
+        case uri_string:parse(URL) of
+            #{path := P} when is_binary(P), P =/= <<>> -> P;
+            _ -> <<"download">>
+        end,
+    strip_ext(to_bin(filename:basename(Path))).
+
+strip_ext(Bin) when is_binary(Bin) ->
+    case filename:rootname(Bin) of
+        <<>> -> Bin;
+        Stripped -> Stripped
+    end.
+
+%% =============================================================================
+%% Internal: pull pipeline
+%% =============================================================================
+
+do_pull(Spec, Name, Tag, FetchOpts) ->
+    case erllama_server_fetch:fetch(Spec, FetchOpts) of
+        {ok, BlobPath} -> persist_manifest(Spec, Name, Tag, BlobPath);
+        {error, _} = E -> E
+    end.
+
+persist_manifest(Spec, Name, Tag, BlobPath) ->
+    BlobPathBin = to_bin(BlobPath),
+    Metadata = read_metadata_safe(BlobPath),
+    Manifest = build_manifest(Spec, Name, Tag, BlobPathBin, Metadata),
+    {ok, Root} = cache_root(),
+    case erllama_server_models_store:write(Root, Manifest) of
+        ok -> {ok, Manifest};
+        {error, _} = E -> E
+    end.
+
+read_metadata_safe(BlobPath) ->
+    case erllama_server_gguf:read_metadata(BlobPath) of
+        {ok, M} -> M;
+        {error, _} -> #{}
+    end.
+
+build_manifest(Spec, Name, Tag, BlobPath, Metadata) ->
+    Quant = erllama_server_gguf:quantization(Metadata),
+    Ctx = erllama_server_gguf:context_length(Metadata),
+    #{
+        <<"name">> => Name,
+        <<"tag">> => Tag,
+        <<"spec">> => Spec,
+        <<"digest">> => extract_digest(BlobPath),
+        <<"blob_path">> => BlobPath,
+        <<"size_bytes">> => filelib:file_size(BlobPath),
+        <<"format">> => <<"gguf">>,
+        <<"architecture">> => or_null(erllama_server_gguf:architecture(Metadata)),
+        <<"family">> => or_null(erllama_server_gguf:family(Metadata)),
+        <<"parameter_size">> => or_null(erllama_server_gguf:parameter_size_label(Metadata)),
+        <<"quantization">> => or_null(Quant),
+        <<"context_size">> => or_null(Ctx),
+        <<"embedding_length">> => or_null(erllama_server_gguf:embedding_length(Metadata)),
+        <<"chat_template">> => or_null(erllama_server_gguf:chat_template(Metadata)),
+        <<"loader">> => loader_opts(Quant, Ctx),
+        <<"modified_at">> => iso8601_now()
+    }.
+
+loader_opts(Quant, Ctx) ->
+    #{
+        <<"n_gpu_layers">> => 0,
+        <<"n_ctx">> => default_int(Ctx, 4096),
+        <<"n_batch">> => 512,
+        <<"quant_type">> => or_null(Quant),
+        <<"quant_bits">> => or_null(quant_bits(Quant))
+    }.
+
+quant_bits(undefined) -> undefined;
+quant_bits(<<"f32">>) -> 32;
+quant_bits(<<"f16">>) -> 16;
+quant_bits(<<"bf16">>) -> 16;
+quant_bits(<<"q2_", _/binary>>) -> 2;
+quant_bits(<<"q3_", _/binary>>) -> 3;
+quant_bits(<<"q4_", _/binary>>) -> 4;
+quant_bits(<<"q5_", _/binary>>) -> 5;
+quant_bits(<<"q6_", _/binary>>) -> 6;
+quant_bits(<<"q8_", _/binary>>) -> 8;
+quant_bits(<<"iq1_", _/binary>>) -> 1;
+quant_bits(<<"iq2_", _/binary>>) -> 2;
+quant_bits(<<"iq3_", _/binary>>) -> 3;
+quant_bits(<<"iq4_", _/binary>>) -> 4;
+quant_bits(_) -> undefined.
+
+%% Recover the sha256 digest from the blob filename when it follows
+%% the cache convention; otherwise fall back to digesting the file.
+extract_digest(BlobPath) ->
+    Base = filename:basename(BlobPath),
+    case to_bin(Base) of
+        <<"sha256-", Rest/binary>> ->
+            case binary:split(Rest, <<".">>) of
+                [Hex, _Ext] -> <<"sha256:", Hex/binary>>;
+                _ -> compute_digest(BlobPath)
+            end;
+        _ ->
+            compute_digest(BlobPath)
+    end.
+
+compute_digest(Path) ->
+    case file:open(Path, [read, binary, raw]) of
+        {ok, IO} ->
+            try
+                Hex = bin_to_hex(crypto:hash_final(seed_loop(IO, crypto:hash_init(sha256)))),
+                <<"sha256:", Hex/binary>>
+            after
+                _ = file:close(IO)
+            end;
+        {error, _} ->
+            null
+    end.
+
+seed_loop(IO, Ctx) ->
+    case file:read(IO, 1024 * 1024) of
+        {ok, Data} -> seed_loop(IO, crypto:hash_update(Ctx, Data));
+        eof -> Ctx
+    end.
+
+bin_to_hex(Bin) ->
+    list_to_binary(lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B>> <= Bin])).
+
+or_null(undefined) -> null;
+or_null(V) -> V.
+
+default_int(undefined, Default) -> Default;
+default_int(N, _Default) when is_integer(N) -> N.
+
+iso8601_now() ->
+    Now = erlang:system_time(second),
+    {{Y, Mo, D}, {H, M, S}} = calendar:system_time_to_universal_time(Now, second),
+    list_to_binary(
+        io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ", [Y, Mo, D, H, M, S])
+    ).
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(L) when is_list(L) -> unicode:characters_to_binary(L);
+to_bin(A) when is_atom(A) -> atom_to_binary(A, utf8).
