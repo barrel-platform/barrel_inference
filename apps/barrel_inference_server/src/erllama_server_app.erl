@@ -5,7 +5,41 @@
 
 start(_StartType, _StartArgs) ->
     ok = erllama_server_metrics:init(),
+    ok = ensure_model_default_opts(),
     erllama_server_sup:start_link().
+
+%% Bake the default `erllama:load_model/2` options the loader will
+%% layer manifest-derived fields on top of. Operators can override
+%% the whole map via `application:set_env(erllama_server,
+%% model_default_opts, ...)` in `sys.config`.
+ensure_model_default_opts() ->
+    Existing = application:get_env(erllama_server, model_default_opts, undefined),
+    Defaults = #{
+        backend => erllama_model_llama,
+        tier_srv => erllama_server_disk_cache,
+        tier => disk,
+        fingerprint_mode => safe,
+        ctx_params_hash => binary:copy(<<0>>, 32),
+        policy => default_cache_policy()
+    },
+    Merged =
+        case Existing of
+            undefined -> Defaults;
+            M when is_map(M) -> maps:merge(Defaults, M)
+        end,
+    application:set_env(erllama_server, model_default_opts, Merged),
+    ok.
+
+default_cache_policy() ->
+    #{
+        min_tokens => 64,
+        cold_min_tokens => 128,
+        cold_max_tokens => 8192,
+        continued_interval => 2048,
+        boundary_trim_tokens => 0,
+        boundary_align_tokens => 16,
+        session_resume_wait_ms => 500
+    }.
 
 %% Application is asked to stop. Refuse new connections, then wait
 %% (bounded) for in-flight streams to drain, then stop the listener.
