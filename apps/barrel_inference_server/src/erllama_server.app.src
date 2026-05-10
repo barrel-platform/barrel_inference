@@ -8,8 +8,11 @@
         stdlib,
         sasl,
         crypto,
+        ssl,
+        inets,
         cowboy,
         instrument,
+        hackney,
         erllama
     ]},
     {env, []},

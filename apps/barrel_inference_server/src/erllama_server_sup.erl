@@ -42,6 +42,20 @@ init([]) ->
         },
 
         #{
+            id => erllama_server_fetch_sup,
+            start => {erllama_server_fetch_sup, start_link, []},
+            type => supervisor,
+            shutdown => infinity
+        },
+
+        #{
+            id => erllama_server_fetch_srv,
+            start => {erllama_server_fetch_srv, start_link, []},
+            type => worker,
+            shutdown => 5000
+        },
+
+        #{
             id => erllama_server_listener_mon,
             start => {erllama_server_listener_mon, start_link, []},
             type => worker,
