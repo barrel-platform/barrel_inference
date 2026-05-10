@@ -80,7 +80,9 @@ start_listener(S) ->
             cowboy_router,
             cowboy_handler
         ],
-        stream_handlers => [erllama_server_access_log, cowboy_stream_h]
+        stream_handlers => [erllama_server_access_log, cowboy_stream_h],
+        %% Cowboy's default 60 s closes long fetches mid-resolve.
+        idle_timeout => app_env(idle_timeout_ms, 1800000)
     },
     {ok, Pid} =
         case app_env(tls, undefined) of
