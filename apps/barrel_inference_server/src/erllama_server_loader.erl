@@ -13,9 +13,11 @@
 -module(erllama_server_loader).
 -behaviour(gen_server).
 
--export([start_link/1, await/3]).
+-export([start_link/1, await/3, default_opts/1, manifest_to_config/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+-define(APP, erllama_server).
 
 -record(state, {
     model_id :: binary(),
@@ -75,11 +77,9 @@ handle_cast(_, S) ->
 
 handle_info(start_load, S = #state{model_id = ModelId}) ->
     Result =
-        try erllama:load_model(ModelId, default_opts(ModelId)) of
-            {ok, _ModelRef} -> ok;
-            {error, Reason} -> {error, Reason}
-        catch
-            Class:Why:_Stack -> {error, {Class, Why}}
+        case default_opts(ModelId) of
+            {ok, Opts} -> load_with_opts(ModelId, Opts);
+            {error, _} = E -> E
         end,
     NextState =
         case Result of
@@ -127,7 +127,85 @@ terminate(_, _) -> ok.
 %% Internal
 %%====================================================================
 
-default_opts(_ModelId) ->
-    %% Hook for per-model load options; for v0.1 we hand off the empty
-    %% map and let erllama use its defaults.
-    #{}.
+load_with_opts(ModelId, Opts) ->
+    try erllama:load_model(ModelId, Opts) of
+        {ok, _ModelRef} -> ok;
+        {error, Reason} -> {error, Reason}
+    catch
+        Class:Why:_Stack -> {error, {Class, Why}}
+    end.
+
+%% Resolve a model id into the erllama:load_model/2 config map by
+%% looking up its manifest in the registry. With `auto_pull` enabled,
+%% an unknown model is fetched on the fly. Otherwise the loader
+%% reports `{error, not_found}`, which pipeline.erl maps to 404.
+-spec default_opts(binary()) -> {ok, map()} | {error, term()}.
+default_opts(ModelId) ->
+    case erllama_server_models:get(ModelId) of
+        {ok, Manifest} ->
+            {ok, manifest_to_config(Manifest)};
+        {error, not_found} ->
+            handle_missing(ModelId);
+        {error, _} = E ->
+            E
+    end.
+
+handle_missing(ModelId) ->
+    case erllama_server_config:auto_pull() of
+        true ->
+            case erllama_server_models:pull(ModelId) of
+                {ok, Manifest} -> {ok, manifest_to_config(Manifest)};
+                {error, _} -> {error, not_found}
+            end;
+        false ->
+            {error, not_found}
+    end.
+
+%% Map a manifest into the option set erllama:load_model/2 expects.
+%% Fields not present in the manifest fall through to app-env defaults
+%% (`tier_srv`, `tier`, `policy`, `ctx_params_hash`); operators wire
+%% those once at boot.
+-spec manifest_to_config(map()) -> map().
+manifest_to_config(Manifest) ->
+    Loader = maps:get(<<"loader">>, Manifest, #{}),
+    BaseOpts = base_opts(),
+    BaseOpts#{
+        backend => application:get_env(?APP, model_backend, erllama_model_llama),
+        model_path => path_string(maps:get(<<"blob_path">>, Manifest)),
+        fingerprint => fingerprint_from_digest(maps:get(<<"digest">>, Manifest, null)),
+        fingerprint_mode => application:get_env(?APP, fingerprint_mode, safe),
+        quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
+        quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
+        context_size => default_int(maps:get(<<"context_size">>, Manifest, undefined), 4096)
+    }.
+
+base_opts() ->
+    application:get_env(?APP, model_default_opts, #{}).
+
+path_string(B) when is_binary(B) -> unicode:characters_to_list(B);
+path_string(L) when is_list(L) -> L.
+
+fingerprint_from_digest(<<"sha256:", Hex/binary>>) ->
+    case hex_to_bin(Hex) of
+        Bin when byte_size(Bin) =:= 32 -> Bin;
+        _ -> binary:copy(<<0>>, 32)
+    end;
+fingerprint_from_digest(_) ->
+    binary:copy(<<0>>, 32).
+
+hex_to_bin(Hex) ->
+    try
+        <<<<(list_to_integer([A, B], 16))>> || <<A, B>> <= Hex>>
+    catch
+        _:_ -> <<>>
+    end.
+
+quant_atom(undefined) -> f16;
+quant_atom(null) -> f16;
+quant_atom(Bin) when is_binary(Bin) -> binary_to_atom(Bin, utf8);
+quant_atom(_) -> f16.
+
+default_int(undefined, Default) -> Default;
+default_int(null, Default) -> Default;
+default_int(N, _) when is_integer(N), N > 0 -> N;
+default_int(_, Default) -> Default.

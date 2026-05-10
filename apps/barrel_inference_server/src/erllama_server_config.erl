@@ -23,7 +23,8 @@
     pool_policy_for/1,
     tracing_config/0,
     cors/0,
-    request_id_header/0
+    request_id_header/0,
+    auto_pull/0
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -118,6 +119,10 @@ cors() ->
 request_id_header() ->
     persistent_term:get({?MODULE, request_id_header}, <<"x-request-id">>).
 
+-spec auto_pull() -> boolean().
+auto_pull() ->
+    persistent_term:get({?MODULE, auto_pull}, false).
+
 %% Synchronous on a successful in-cache check; otherwise the call is
 %% un-replied and the loader process replies later. Caller's deadline
 %% is honoured by the loader.
@@ -171,6 +176,7 @@ init([]) ->
         {?MODULE, request_id_header},
         app_env(request_id_header, <<"x-request-id">>)
     ),
+    persistent_term:put({?MODULE, auto_pull}, app_env(auto_pull, false)),
     {ok, #state{
         aliases = Aliases,
         load_policy = LoadPolicy,
