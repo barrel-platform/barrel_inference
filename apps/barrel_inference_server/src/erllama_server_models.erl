@@ -40,6 +40,7 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
     delete/1,
     copy/2,
     resolve_spec/1,
+    persist_manifest/4,
     cache_root/0
 ]).
 

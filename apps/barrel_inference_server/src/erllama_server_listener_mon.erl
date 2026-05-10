@@ -117,7 +117,13 @@ routes() ->
             {"/v1/models/:model_id", erllama_server_h_models, #{}},
             {"/health", erllama_server_h_health, #{kind => liveness}},
             {"/health/ready", erllama_server_h_health, #{kind => readiness}},
-            {"/metrics", erllama_server_h_metrics, #{}}
+            {"/metrics", erllama_server_h_metrics, #{}},
+            {"/api/tags", erllama_server_h_api, #{op => tags}},
+            {"/api/pull", erllama_server_h_api, #{op => pull}},
+            {"/api/show", erllama_server_h_api, #{op => show}},
+            {"/api/delete", erllama_server_h_api, #{op => delete}},
+            {"/api/copy", erllama_server_h_api, #{op => copy}},
+            {"/api/create", erllama_server_h_api, #{op => create}}
         ]}
     ].
 
