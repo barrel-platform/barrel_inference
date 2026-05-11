@@ -149,7 +149,7 @@ Claude Code as a local backend:
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
 ANTHROPIC_AUTH_TOKEN=not-used \
-  claude-code
+  claude
 ```
 
 ## Structured output

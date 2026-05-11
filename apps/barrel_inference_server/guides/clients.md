@@ -296,7 +296,7 @@ print(litellm.completion(
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
 ANTHROPIC_AUTH_TOKEN=not-used \
-  claude-code
+  claude
 ```
 
 Set an alias in `sys.config` if you want a specific model id
