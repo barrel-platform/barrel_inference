@@ -10,7 +10,7 @@
   1},
  {<<"erllama">>,
   {git,"https://github.com/erllama/erllama.git",
-       {ref,"619a11aa944fd4baed39fe64a1517e9f13765602"}},
+       {ref,"d1eed3dfbd0bde1c95ba023365e8bee6c018e213"}},
   0},
  {<<"h2">>,{pkg,<<"h2">>,<<"0.4.0">>},1},
  {<<"hackney">>,{pkg,<<"hackney">>,<<"4.0.0">>},0},
