@@ -24,7 +24,8 @@
     tracing_config/0,
     cors/0,
     request_id_header/0,
-    auto_pull/0
+    auto_pull/0,
+    ensure_loaded_async/3
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -131,6 +132,21 @@ ensure_loaded(ModelId) when is_binary(ModelId) ->
     Deadline = erlang:monotonic_time(millisecond) + prefill_ms(),
     gen_server:call(?MODULE, {ensure_loaded, ModelId, Deadline}, prefill_ms() + 1000).
 
+%% Asynchronous variant used by the pipeline so it can stream
+%% `{erllama_load_progress, ModelId}` lines to the client. Returns
+%% `ok` synchronously after subscribing `Caller`; the caller then
+%% receives:
+%%
+%%   {erllama_load_progress, ModelId}              every 2 s while loading
+%%   {erllama_load_done, ModelId, ok | {error, _}} exactly once
+%%
+%% A `ready` fast-check shortcut delivers the `done` message
+%% immediately; the caller's receive loop sees the same shape either
+%% way.
+-spec ensure_loaded_async(binary(), pid(), integer()) -> ok | {error, atom()}.
+ensure_loaded_async(ModelId, Caller, _Deadline) when is_binary(ModelId), is_pid(Caller) ->
+    gen_server:call(?MODULE, {ensure_loaded_async, ModelId, Caller}).
+
 %%====================================================================
 %% gen_server
 %%====================================================================
@@ -196,6 +212,19 @@ handle_call({ensure_loaded, ModelId, Deadline}, From, S = #state{load_policy = P
             S1 = await_loader(ModelId, From, Deadline, S),
             {noreply, S1}
     end;
+handle_call({ensure_loaded_async, ModelId, Caller}, _From, S = #state{load_policy = Policy}) ->
+    case fast_check(ModelId) of
+        ready ->
+            Caller ! {erllama_load_done, ModelId, ok},
+            {reply, ok, S};
+        not_ready when Policy =:= preloaded ->
+            {reply, {error, not_preloaded}, S};
+        not_ready when Policy =:= reject ->
+            {reply, {error, not_loaded}, S};
+        not_ready when Policy =:= on_demand ->
+            S1 = subscribe_loader(ModelId, Caller, S),
+            {reply, ok, S1}
+    end;
 handle_call(_, _, S) ->
     {reply, {error, unknown_call}, S}.
 
@@ -244,5 +273,17 @@ await_loader(ModelId, From, Deadline, S = #state{loaders = L}) ->
             {ok, Pid} = erllama_server_loaders_sup:start_loader(ModelId),
             Mon = monitor(process, Pid),
             erllama_server_loader:await(Pid, From, Deadline),
+            S#state{loaders = L#{ModelId => {Pid, Mon}}}
+    end.
+
+subscribe_loader(ModelId, Caller, S = #state{loaders = L}) ->
+    case maps:find(ModelId, L) of
+        {ok, {Pid, _Mon}} ->
+            erllama_server_loader:subscribe(Pid, Caller),
+            S;
+        error ->
+            {ok, Pid} = erllama_server_loaders_sup:start_loader(ModelId),
+            Mon = monitor(process, Pid),
+            erllama_server_loader:subscribe(Pid, Caller),
             S#state{loaders = L#{ModelId => {Pid, Mon}}}
     end.

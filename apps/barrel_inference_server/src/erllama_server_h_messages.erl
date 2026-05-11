@@ -50,7 +50,12 @@
     total_tref :: reference() | undefined,
     text_block_started :: boolean(),
     thinking_block_started :: boolean(),
-    message_started :: boolean()
+    message_started :: boolean(),
+    %% true once stream_reply/3 has fired (separate from
+    %% message_started, which guards the Anthropic message_start
+    %% event). Loading-phase pings can open the stream before the
+    %% canonical message_start frame.
+    stream_started = false :: boolean()
 }).
 
 %%====================================================================
@@ -141,6 +146,14 @@ grammar_active(_) -> true.
 %% info/3
 %%====================================================================
 
+info({pipeline, loading, _ModelId}, Req0, S0 = #st{stream = true}) ->
+    %% Long load: emit an Anthropic `event: ping` every tick. The
+    %% Anthropic SDK recognises this and resets its idle timer.
+    {Req1, S1} = ensure_stream(Req0, S0),
+    ok = anthropic_ping(Req1),
+    {ok, Req1, S1, hibernate};
+info({pipeline, loading, _ModelId}, Req, S) ->
+    {ok, Req, S, hibernate};
 info({pipeline, loaded}, Req, S) ->
     {ok, Req, S#st{phase = waiting_template}, hibernate};
 info({pipeline, templated, _}, Req, S) ->
@@ -156,14 +169,30 @@ info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
             _ -> S0
         end,
     S2 = S1#st{slot = Slot},
-    case {S2#st.stream, S0#st.ref} of
-        {true, undefined} ->
-            Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
-            S3 = emit_message_start(Req1, S2),
-            {ok, Req1, S3, hibernate};
-        _ ->
+    case S2#st.stream of
+        true ->
+            {Req1, S3} = ensure_stream(Req0, S2),
+            S4 = emit_message_start(Req1, S3),
+            {ok, Req1, S4, hibernate};
+        false ->
             {ok, Req0, S2, hibernate}
     end;
+info({pipeline, error, Status, Reason}, Req0, S = #st{stream_started = true}) ->
+    %% Post-stream: emit an Anthropic error event, close the body.
+    record_metrics(S, Status),
+    anthropic_event(
+        Req0,
+        <<"error">>,
+        #{
+            <<"type">> => <<"error">>,
+            <<"error">> => #{
+                <<"type">> => <<"api_error">>,
+                <<"message">> => to_bin(Reason)
+            }
+        }
+    ),
+    cowboy_req:stream_body(<<>>, fin, Req0),
+    {stop, Req0, S};
 info({pipeline, error, Status, Reason}, Req0, S) ->
     record_metrics(S, Status),
     Req1 = json_error(Status, Reason, Req0),
@@ -468,14 +497,36 @@ first_token(S) ->
 %% also call stream_reply + emit message_start so the body can be
 %% sent immediately.
 learn_ref(S = #st{ref = undefined, stream = true}, Req0, Ref) ->
-    Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
-    S1 = arm_prefill(S#st{phase = running, ref = Ref}),
-    S2 = emit_message_start(Req1, S1),
-    {S2, Req1};
+    {Req1, S1} = ensure_stream(Req0, S),
+    S2 = arm_prefill(S1#st{phase = running, ref = Ref}),
+    S3 = emit_message_start(Req1, S2),
+    {S3, Req1};
 learn_ref(S = #st{ref = undefined}, Req0, Ref) ->
     {arm_prefill(S#st{phase = running, ref = Ref}), Req0};
 learn_ref(S, Req, _Ref) ->
     {S, Req}.
+
+%% Open the SSE stream exactly once.
+ensure_stream(Req, S = #st{stream_started = true}) ->
+    {Req, S};
+ensure_stream(Req0, S) ->
+    Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
+    {Req1, S#st{stream_started = true}}.
+
+anthropic_ping(Req) ->
+    anthropic_event(Req, <<"ping">>, #{<<"type">> => <<"ping">>}).
+
+anthropic_event(Req, EventName, JsonMap) ->
+    Frame = [
+        <<"event: ">>,
+        EventName,
+        <<"\n">>,
+        <<"data: ">>,
+        json:encode(JsonMap),
+        <<"\n\n">>
+    ],
+    cowboy_req:stream_body(Frame, nofin, Req),
+    ok.
 
 arm_prefill(S) ->
     Ms = erllama_server_config:prefill_ms(),

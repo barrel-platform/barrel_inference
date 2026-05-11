@@ -121,23 +121,47 @@ release_and_fail(W = #work{slot = Slot}, Status, Reason) when is_reference(Slot)
 %%====================================================================
 
 step_load(W) ->
-    case erllama_server_config:ensure_loaded(model_id(W)) of
+    ModelId = model_id(W),
+    case erllama_server_config:ensure_loaded_async(ModelId, self(), load_deadline()) of
         ok ->
-            W#work.handler ! {pipeline, loaded},
-            {ok, W};
-        {error, not_found} ->
-            {error, 404, model_not_found};
-        {error, not_preloaded} ->
-            {error, 503, model_not_preloaded};
-        {error, not_loaded} ->
-            {error, 503, model_not_loaded};
-        {error, load_failed} ->
-            {error, 503, model_load_failed};
-        {error, load_timeout} ->
-            {error, 504, model_load_timeout};
+            wait_for_load(W, ModelId, load_deadline());
         {error, Reason} ->
-            {error, 500, Reason}
+            {error, code_for(Reason), Reason}
     end.
+
+%% Loop on {erllama_load_progress, _} ticks (forwarded to the handler
+%% as {pipeline, loading, _}) until either the done message arrives
+%% or the request deadline fires. Reusing the per-request deadline
+%% keeps the existing load_timeout semantics.
+wait_for_load(W, ModelId, Deadline) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Deadline =< Now of
+        true ->
+            {error, 504, model_load_timeout};
+        false ->
+            receive
+                {erllama_load_progress, ModelId} ->
+                    W#work.handler ! {pipeline, loading, ModelId},
+                    wait_for_load(W, ModelId, Deadline);
+                {erllama_load_done, ModelId, ok} ->
+                    W#work.handler ! {pipeline, loaded},
+                    {ok, W};
+                {erllama_load_done, ModelId, {error, Reason}} ->
+                    {error, code_for(Reason), Reason}
+            after max(0, Deadline - Now) ->
+                {error, 504, model_load_timeout}
+            end
+    end.
+
+code_for(not_found) -> 404;
+code_for(not_preloaded) -> 503;
+code_for(not_loaded) -> 503;
+code_for(load_failed) -> 503;
+code_for(load_timeout) -> 504;
+code_for(_) -> 500.
+
+load_deadline() ->
+    erlang:monotonic_time(millisecond) + erllama_server_config:prefill_ms().
 
 step_template(W) ->
     R = W#work.request,
