@@ -403,12 +403,20 @@ print_sse_events(Buf) ->
             print_sse_events(Rest)
     end.
 
+strip_cr(<<>>) ->
+    <<>>;
 strip_cr(B) ->
     case binary:last(B) =:= $\r of
         true -> binary:part(B, 0, byte_size(B) - 1);
         false -> B
     end.
 
+handle_sse_line(<<>>) ->
+    ok;
+handle_sse_line(<<": ", _Comment/binary>>) ->
+    %% SSE comment (used as a server-side keepalive during model
+    %% loading). Ignore in the CLI; the user only cares about content.
+    ok;
 handle_sse_line(<<"data: [DONE]">>) ->
     ok;
 handle_sse_line(<<"data: ", Json/binary>>) ->
