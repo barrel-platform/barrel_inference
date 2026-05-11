@@ -54,7 +54,14 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
     progress => pid(),
     sha256 => binary(),
     timeout => pos_integer(),
-    force => boolean()
+    force => boolean(),
+    modelfile_overrides => modelfile_overrides()
+}.
+
+-type modelfile_overrides() :: #{
+    system => binary(),
+    template => binary(),
+    parameters => map()
 }.
 
 %% =============================================================================
@@ -86,8 +93,9 @@ pull(SpecOrName, Opts) when is_map(Opts) ->
         {ok, Spec, DefName, DefTag} ->
             Name = to_bin(maps:get(name, Opts, DefName)),
             Tag = to_bin(maps:get(tag, Opts, DefTag)),
-            FetchOpts = maps:without([name, tag], Opts),
-            do_pull(Spec, Name, Tag, FetchOpts);
+            Overrides = maps:get(modelfile_overrides, Opts, #{}),
+            FetchOpts = maps:without([name, tag, modelfile_overrides], Opts),
+            do_pull(Spec, Name, Tag, FetchOpts, Overrides);
         {error, _} = E ->
             E
     end.
@@ -182,11 +190,53 @@ strip_ext(Bin) when is_binary(Bin) ->
 %% Internal: pull pipeline
 %% =============================================================================
 
-do_pull(Spec, Name, Tag, FetchOpts) ->
+do_pull(Spec, Name, Tag, FetchOpts, Overrides) ->
     case erllama_server_fetch:fetch(Spec, FetchOpts) of
-        {ok, BlobPath} -> persist_manifest(Spec, Name, Tag, BlobPath);
+        {ok, BlobPath} -> persist_manifest_overrides(Spec, Name, Tag, BlobPath, Overrides);
         {error, _} = E -> E
     end.
+
+persist_manifest_overrides(Spec, Name, Tag, BlobPath, Overrides) ->
+    case persist_manifest(Spec, Name, Tag, BlobPath) of
+        {ok, Manifest} when map_size(Overrides) > 0 ->
+            Merged = apply_overrides(Manifest, Overrides),
+            {ok, Root} = cache_root(),
+            case erllama_server_models_store:write(Root, Merged) of
+                ok -> {ok, Merged};
+                {error, _} = E -> E
+            end;
+        Other ->
+            Other
+    end.
+
+apply_overrides(Manifest, Overrides) ->
+    M1 =
+        case maps:find(system, Overrides) of
+            {ok, S} -> Manifest#{<<"system">> => S};
+            error -> Manifest
+        end,
+    M2 =
+        case maps:find(template, Overrides) of
+            {ok, T} -> M1#{<<"chat_template">> => T};
+            error -> M1
+        end,
+    case maps:find(parameters, Overrides) of
+        {ok, Params} when map_size(Params) > 0 ->
+            ExistingParams = maps:get(<<"parameters">>, M2, #{}),
+            M2#{<<"parameters">> => maps:merge(ExistingParams, atom_keys_to_bin(Params))};
+        _ ->
+            M2
+    end.
+
+atom_keys_to_bin(M) ->
+    maps:fold(
+        fun
+            (K, V, Acc) when is_binary(K) -> Acc#{K => V};
+            (K, V, Acc) when is_atom(K) -> Acc#{atom_to_binary(K, utf8) => V}
+        end,
+        #{},
+        M
+    ).
 
 persist_manifest(Spec, Name, Tag, BlobPath) ->
     BlobPathBin = to_bin(BlobPath),

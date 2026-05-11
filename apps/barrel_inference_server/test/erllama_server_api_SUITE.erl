@@ -22,7 +22,11 @@
     chat_empty_messages_preloads/1,
     generate_keep_alive_zero_unloads/1,
     version_returns_app_vsn/1,
-    ps_empty_when_no_loaded_models/1
+    ps_empty_when_no_loaded_models/1,
+    create_with_parameter_directive/1,
+    create_with_system_directive/1,
+    create_with_template_directive/1,
+    create_unsupported_adapter_returns_400/1
 ]).
 
 %% GGUF tags.
@@ -45,7 +49,11 @@ all() ->
         chat_empty_messages_preloads,
         generate_keep_alive_zero_unloads,
         version_returns_app_vsn,
-        ps_empty_when_no_loaded_models
+        ps_empty_when_no_loaded_models,
+        create_with_parameter_directive,
+        create_with_system_directive,
+        create_with_template_directive,
+        create_unsupported_adapter_returns_400
     ].
 
 %% =============================================================================
@@ -256,6 +264,75 @@ ps_empty_when_no_loaded_models(Cfg) ->
     %% returns []. Response shape must still match Ollama: a top-level
     %% `models` array (possibly empty).
     ?assert(is_list(maps:get(<<"models">>, Decoded))).
+
+create_with_parameter_directive(Cfg) ->
+    Spec = file_spec(Cfg),
+    Modelfile = iolist_to_binary([
+        "FROM ",
+        Spec,
+        "\n",
+        "PARAMETER num_ctx 8192\n",
+        "PARAMETER temperature 0.5\n"
+    ]),
+    Body = json:encode(#{
+        <<"name">> => <<"with-params:v1">>,
+        <<"modelfile">> => Modelfile
+    }),
+    {ok, {{_, 200, _}, _, _}} = post_json(Cfg, "/api/create", Body),
+    {ok, M} = erllama_server_models:get(<<"with-params:v1">>),
+    Params = maps:get(<<"parameters">>, M),
+    ?assertEqual(8192, maps:get(<<"num_ctx">>, Params)),
+    ?assert(abs(maps:get(<<"temperature">>, Params) - 0.5) < 1.0e-6).
+
+create_with_system_directive(Cfg) ->
+    Spec = file_spec(Cfg),
+    Modelfile = iolist_to_binary([
+        "FROM ",
+        Spec,
+        "\n",
+        "SYSTEM \"You are a pirate.\"\n"
+    ]),
+    Body = json:encode(#{
+        <<"name">> => <<"with-system:v1">>,
+        <<"modelfile">> => Modelfile
+    }),
+    {ok, {{_, 200, _}, _, _}} = post_json(Cfg, "/api/create", Body),
+    {ok, M} = erllama_server_models:get(<<"with-system:v1">>),
+    ?assertEqual(<<"You are a pirate.">>, maps:get(<<"system">>, M)).
+
+create_with_template_directive(Cfg) ->
+    Spec = file_spec(Cfg),
+    Modelfile = iolist_to_binary([
+        "FROM ",
+        Spec,
+        "\n",
+        "TEMPLATE \"{{ .System }}\\n{{ .Prompt }}\"\n"
+    ]),
+    Body = json:encode(#{
+        <<"name">> => <<"with-template:v1">>,
+        <<"modelfile">> => Modelfile
+    }),
+    {ok, {{_, 200, _}, _, _}} = post_json(Cfg, "/api/create", Body),
+    {ok, M} = erllama_server_models:get(<<"with-template:v1">>),
+    Tmpl = maps:get(<<"chat_template">>, M),
+    ?assert(is_binary(Tmpl)),
+    ?assert(binary:match(Tmpl, <<".Prompt">>) =/= nomatch).
+
+create_unsupported_adapter_returns_400(Cfg) ->
+    Spec = file_spec(Cfg),
+    Modelfile = iolist_to_binary([
+        "FROM ",
+        Spec,
+        "\n",
+        "ADAPTER /some/path.bin\n"
+    ]),
+    Body = json:encode(#{
+        <<"name">> => <<"bad-adapter">>,
+        <<"modelfile">> => Modelfile
+    }),
+    {ok, {{_, 400, _}, _, Resp}} = post_json(Cfg, "/api/create", Body),
+    Decoded = json:decode(list_to_binary(Resp)),
+    ?assert(binary:match(maps:get(<<"error">>, Decoded), <<"ADAPTER">>) =/= nomatch).
 
 %% =============================================================================
 %% Helpers
