@@ -80,7 +80,9 @@ start_listener(S) ->
             cowboy_router,
             cowboy_handler
         ],
-        stream_handlers => [erllama_server_access_log, cowboy_stream_h]
+        stream_handlers => [erllama_server_access_log, cowboy_stream_h],
+        %% Cowboy's default 60 s closes long fetches mid-resolve.
+        idle_timeout => app_env(idle_timeout_ms, 1800000)
     },
     {ok, Pid} =
         case app_env(tls, undefined) of
@@ -117,7 +119,16 @@ routes() ->
             {"/v1/models/:model_id", erllama_server_h_models, #{}},
             {"/health", erllama_server_h_health, #{kind => liveness}},
             {"/health/ready", erllama_server_h_health, #{kind => readiness}},
-            {"/metrics", erllama_server_h_metrics, #{}}
+            {"/metrics", erllama_server_h_metrics, #{}},
+            {"/api/tags", erllama_server_h_api, #{op => tags}},
+            {"/api/pull", erllama_server_h_api, #{op => pull}},
+            {"/api/show", erllama_server_h_api, #{op => show}},
+            {"/api/delete", erllama_server_h_api, #{op => delete}},
+            {"/api/copy", erllama_server_h_api, #{op => copy}},
+            {"/api/create", erllama_server_h_api, #{op => create}},
+            {"/api/search", erllama_server_h_api, #{op => search}},
+            {"/api/generate", erllama_server_h_ollama, #{op => generate}},
+            {"/api/chat", erllama_server_h_ollama, #{op => chat}}
         ]}
     ].
 

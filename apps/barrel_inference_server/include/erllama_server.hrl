@@ -54,7 +54,15 @@
     stream :: boolean(),
     thinking :: thinking(),
     api :: api(),
-    request_id :: binary()
+    request_id :: binary(),
+    %% Ollama parity: keep_alive parsed into ms (`infinity` means
+    %% never auto-unload, `0` means unload after this request).
+    %% Defaults to `undefined` so handlers fall back to the
+    %% server-wide default via erllama_server_config:keep_alive_default_ms/0.
+    keep_alive_ms :: non_neg_integer() | infinity | undefined,
+    %% true when the request is a load-only / unload-only short
+    %% circuit (Ollama: empty prompt or empty messages).
+    is_preload = false :: boolean()
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

@@ -1,0 +1,471 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
+-module(erllama_cli).
+-moduledoc """
+Command-line front end to a running `erllama_server` over HTTP.
+
+Built as a `rebar3 escriptize` artefact at `_build/default/bin/erllama`.
+All subcommands speak to the server's HTTP surface; nothing here
+loads inference modules.
+
+Subcommands:
+
+```
+erllama pull <name>                pull a model into the registry
+erllama list | ls                  list registered models
+erllama show <name>                print one manifest
+erllama rm <name>                  remove a manifest
+erllama copy <src> <dst>           alias under a new name:tag
+erllama search <query>             search HF / Ollama
+erllama run <name> [prompt...]     stream a single chat completion
+erllama help                       this message
+```
+
+Base URL: `ERLLAMA_HOST` env var, default `http://127.0.0.1:8080`.
+""".
+
+-export([main/1]).
+
+-define(DEFAULT_HOST, "http://127.0.0.1:8080").
+
+%% =============================================================================
+%% Entry
+%% =============================================================================
+
+main([]) ->
+    usage(),
+    halt(1);
+main(["help" | _]) ->
+    usage();
+main(["-h" | _]) ->
+    usage();
+main(["--help" | _]) ->
+    usage();
+main(Args) ->
+    {ok, _} = application:ensure_all_started(inets),
+    {ok, _} = application:ensure_all_started(ssl),
+    Base = base_url(),
+    dispatch(Base, Args).
+
+dispatch(Base, ["pull", Name | _]) ->
+    cmd_pull(Base, Name);
+dispatch(Base, ["list" | _]) ->
+    cmd_list(Base);
+dispatch(Base, ["ls" | _]) ->
+    cmd_list(Base);
+dispatch(Base, ["show", Name | _]) ->
+    cmd_show(Base, Name);
+dispatch(Base, ["rm", Name | _]) ->
+    cmd_rm(Base, Name);
+dispatch(Base, ["delete", Name | _]) ->
+    cmd_rm(Base, Name);
+dispatch(Base, ["copy", Src, Dst | _]) ->
+    cmd_copy(Base, Src, Dst);
+dispatch(Base, ["cp", Src, Dst | _]) ->
+    cmd_copy(Base, Src, Dst);
+dispatch(Base, ["search", Q | _]) ->
+    cmd_search(Base, Q);
+dispatch(Base, ["run", Name | Rest]) ->
+    cmd_run(Base, Name, prompt_from(Rest));
+dispatch(_, _) ->
+    usage(),
+    halt(2).
+
+%% =============================================================================
+%% Subcommands
+%% =============================================================================
+
+cmd_pull(Base, Name) ->
+    Body = json:encode(#{<<"name">> => list_to_binary(Name), <<"stream">> => true}),
+    case stream_post(Base ++ "/api/pull", Body) of
+        ok -> ok;
+        {error, _} = E -> die("pull failed", E)
+    end.
+
+cmd_list(Base) ->
+    case json_get(Base ++ "/api/tags") of
+        {ok, #{<<"models">> := Models}} ->
+            print_table(Models);
+        {error, Reason} ->
+            die("list failed", Reason)
+    end.
+
+cmd_show(Base, Name) ->
+    Body = json:encode(#{<<"name">> => list_to_binary(Name)}),
+    case json_post(Base ++ "/api/show", Body) of
+        {ok, M} ->
+            io:put_chars(
+                io_lib:format("~ts~n", [pretty(M)])
+            );
+        {error, Reason} ->
+            die("show failed", Reason)
+    end.
+
+cmd_rm(Base, Name) ->
+    Body = json:encode(#{<<"name">> => list_to_binary(Name)}),
+    case json_request(delete, Base ++ "/api/delete", Body) of
+        {ok, _Code, _Body} ->
+            io:put_chars(io_lib:format("removed ~s~n", [Name]));
+        {error, Reason} ->
+            die("rm failed", Reason)
+    end.
+
+cmd_copy(Base, Src, Dst) ->
+    Body = json:encode(#{
+        <<"source">> => list_to_binary(Src),
+        <<"destination">> => list_to_binary(Dst)
+    }),
+    case json_request(post, Base ++ "/api/copy", Body) of
+        {ok, _, _} ->
+            io:put_chars(io_lib:format("copied ~s -> ~s~n", [Src, Dst]));
+        {error, Reason} ->
+            die("copy failed", Reason)
+    end.
+
+cmd_search(Base, Query) ->
+    Body = json:encode(#{<<"query">> => list_to_binary(Query)}),
+    case json_post(Base ++ "/api/search", Body) of
+        {ok, #{<<"hits">> := Hits}} ->
+            print_search_hits(Hits);
+        {error, Reason} ->
+            die("search failed", Reason)
+    end.
+
+cmd_run(Base, Name, Prompt) ->
+    Body = json:encode(#{
+        <<"model">> => list_to_binary(Name),
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => Prompt
+            }
+        ],
+        <<"stream">> => true
+    }),
+    case stream_post_sse(Base ++ "/v1/chat/completions", Body) of
+        ok -> ok;
+        {error, Reason} -> die("run failed", Reason)
+    end.
+
+%% =============================================================================
+%% Output helpers
+%% =============================================================================
+
+print_table([]) ->
+    io:put_chars("(no models)\n");
+print_table(Models) ->
+    Rows = [row(M) || M <- Models],
+    Widths = column_widths(Rows),
+    io:put_chars([format_row(Widths, [<<"NAME">>, <<"SIZE">>, <<"QUANT">>, <<"FAMILY">>])]),
+    [io:put_chars([format_row(Widths, R)]) || R <- Rows],
+    ok.
+
+row(M) ->
+    Details = maps:get(<<"details">>, M, #{}),
+    [
+        maps:get(<<"name">>, M, <<>>),
+        human_size(maps:get(<<"size">>, M, 0)),
+        nullable(maps:get(<<"quantization_level">>, Details, null)),
+        nullable(maps:get(<<"family">>, Details, null))
+    ].
+
+format_row(Widths, Cols) ->
+    [
+        [pad(Col, W), <<"  ">>]
+     || {Col, W} <- lists:zip(Cols, Widths)
+    ] ++ [<<"\n">>].
+
+column_widths(Rows) ->
+    Header = [<<"NAME">>, <<"SIZE">>, <<"QUANT">>, <<"FAMILY">>],
+    All = [Header | Rows],
+    [lists:max([byte_size(to_bin(C)) || C <- column(N, All)]) || N <- lists:seq(1, 4)].
+
+column(N, Rows) ->
+    [lists:nth(N, R) || R <- Rows].
+
+pad(Col, W) ->
+    Bin = to_bin(Col),
+    Need = W - byte_size(Bin),
+    case Need > 0 of
+        true -> <<Bin/binary, (binary:copy(<<" ">>, Need))/binary>>;
+        false -> Bin
+    end.
+
+human_size(N) when is_integer(N), N >= 1024 * 1024 * 1024 ->
+    iolist_to_binary(io_lib:format("~.2f GB", [N / 1.0e9]));
+human_size(N) when is_integer(N), N >= 1024 * 1024 ->
+    iolist_to_binary(io_lib:format("~.2f MB", [N / 1.0e6]));
+human_size(N) when is_integer(N), N >= 1024 ->
+    iolist_to_binary(io_lib:format("~.2f KB", [N / 1.0e3]));
+human_size(N) when is_integer(N) ->
+    integer_to_binary(N);
+human_size(_) ->
+    <<"-">>.
+
+nullable(null) -> <<"-">>;
+nullable(undefined) -> <<"-">>;
+nullable(<<>>) -> <<"-">>;
+nullable(B) when is_binary(B) -> B;
+nullable(I) when is_integer(I) -> integer_to_binary(I);
+nullable(_) -> <<"-">>.
+
+print_search_hits([]) ->
+    io:put_chars("(no results)\n");
+print_search_hits(Hits) ->
+    [
+        io:put_chars(
+            io_lib:format("~ts  ~ts~n", [
+                maps:get(<<"id">>, H, <<>>),
+                maps:get(<<"name">>, H, <<>>)
+            ])
+        )
+     || H <- Hits
+    ],
+    ok.
+
+pretty(M) when is_map(M) ->
+    Pairs = [
+        io_lib:format("~ts: ~ts~n", [Key, format_value(V)])
+     || {Key, V} <- maps:to_list(M)
+    ],
+    iolist_to_binary(Pairs).
+
+format_value(V) when is_binary(V) -> V;
+format_value(V) when is_integer(V) -> integer_to_binary(V);
+format_value(V) when is_float(V) -> float_to_binary(V, [{decimals, 4}]);
+format_value(true) ->
+    <<"true">>;
+format_value(false) ->
+    <<"false">>;
+format_value(null) ->
+    <<"null">>;
+format_value(M) when is_map(M) ->
+    iolist_to_binary([
+        <<"{">>,
+        lists:join(<<", ">>, [
+            io_lib:format("~ts: ~ts", [K, format_value(V)])
+         || {K, V} <- maps:to_list(M)
+        ]),
+        <<"}">>
+    ]);
+format_value(L) when is_list(L) ->
+    iolist_to_binary(io_lib:format("~p", [L])).
+
+%% =============================================================================
+%% HTTP helpers
+%% =============================================================================
+
+base_url() ->
+    case os:getenv("ERLLAMA_HOST") of
+        false -> ?DEFAULT_HOST;
+        "" -> ?DEFAULT_HOST;
+        S -> S
+    end.
+
+json_get(URL) ->
+    case httpc:request(get, {URL, []}, [], []) of
+        {ok, {{_, 200, _}, _, Body}} -> {ok, json:decode(list_to_binary(Body))};
+        {ok, {{_, Code, _}, _, Body}} -> {error, {http, Code, Body}};
+        {error, _} = E -> E
+    end.
+
+json_post(URL, Body) ->
+    json_request(post, URL, Body).
+
+json_request(Method, URL, Body) ->
+    case do_request(Method, URL, Body) of
+        {ok, {{_, Code, _}, _, RawBody}} when Code >= 200, Code < 300 ->
+            case RawBody of
+                "" -> {ok, Code, #{}};
+                _ -> {ok, json:decode(list_to_binary(RawBody))}
+            end;
+        {ok, {{_, Code, _}, _, RawBody}} ->
+            {error, {http, Code, RawBody}};
+        {error, _} = E ->
+            E
+    end.
+
+do_request(Method, URL, Body) ->
+    httpc:request(Method, {URL, [], "application/json", Body}, [], []).
+
+%% Streaming POST that prints each NDJSON status line as it arrives.
+stream_post(URL, Body) ->
+    Req = {URL, [], "application/json", Body},
+    case
+        httpc:request(
+            post, Req, [], [{sync, false}, {stream, self}, {body_format, binary}]
+        )
+    of
+        {ok, RequestId} ->
+            stream_recv_ndjson(RequestId);
+        {error, _} = E ->
+            E
+    end.
+
+stream_recv_ndjson(RequestId) ->
+    receive
+        {http, {RequestId, stream_start, _Headers}} ->
+            stream_recv_ndjson(RequestId, <<>>);
+        {http, {RequestId, {error, Reason}}} ->
+            {error, Reason};
+        {http, {RequestId, {{_, Code, _}, _, Body}}} when Code >= 400 ->
+            {error, {http, Code, Body}};
+        {http, {RequestId, {{_, _, _}, _, Body}}} ->
+            %% Server didn't actually stream; print one shot.
+            io:put_chars([Body, "\n"]),
+            ok
+    after 30000 ->
+        {error, timeout}
+    end.
+
+stream_recv_ndjson(RequestId, Buf) ->
+    receive
+        {http, {RequestId, stream, Chunk}} ->
+            Buf1 = print_ndjson_lines(<<Buf/binary, Chunk/binary>>),
+            stream_recv_ndjson(RequestId, Buf1);
+        {http, {RequestId, stream_end, _}} ->
+            _ = print_ndjson_lines(<<Buf/binary, "\n">>),
+            ok;
+        {http, {RequestId, {error, Reason}}} ->
+            {error, Reason}
+    after 600000 ->
+        {error, timeout}
+    end.
+
+print_ndjson_lines(Buf) ->
+    case binary:split(Buf, <<"\n">>) of
+        [Last] ->
+            Last;
+        [Line, Rest] ->
+            print_status_line(Line),
+            print_ndjson_lines(Rest)
+    end.
+
+print_status_line(<<>>) ->
+    ok;
+print_status_line(Line) ->
+    try json:decode(Line) of
+        #{<<"status">> := <<"success">>} ->
+            io:put_chars("success\n");
+        #{<<"status">> := S, <<"completed">> := C, <<"total">> := T} when is_integer(T) ->
+            io:put_chars(
+                io_lib:format("~ts  ~B / ~B~n", [S, C, T])
+            );
+        #{<<"status">> := S} ->
+            io:put_chars(io_lib:format("~ts~n", [S]));
+        #{<<"error">> := E} ->
+            io:put_chars(io_lib:format("error: ~ts~n", [E]));
+        Other ->
+            io:put_chars(io_lib:format("~p~n", [Other]))
+    catch
+        _:_ -> io:put_chars([Line, "\n"])
+    end.
+
+%% Streaming POST that prints OpenAI SSE deltas as they arrive.
+stream_post_sse(URL, Body) ->
+    Req = {URL, [], "application/json", Body},
+    case
+        httpc:request(
+            post, Req, [], [{sync, false}, {stream, self}, {body_format, binary}]
+        )
+    of
+        {ok, RequestId} ->
+            stream_recv_sse(RequestId, <<>>);
+        {error, _} = E ->
+            E
+    end.
+
+stream_recv_sse(RequestId, Buf) ->
+    receive
+        {http, {RequestId, stream_start, _Hdrs}} ->
+            stream_recv_sse(RequestId, Buf);
+        {http, {RequestId, stream, Chunk}} ->
+            Buf1 = print_sse_events(<<Buf/binary, Chunk/binary>>),
+            stream_recv_sse(RequestId, Buf1);
+        {http, {RequestId, stream_end, _}} ->
+            io:put_chars("\n"),
+            ok;
+        {http, {RequestId, {error, Reason}}} ->
+            {error, Reason};
+        {http, {RequestId, {{_, Code, _}, _, B}}} when Code >= 400 ->
+            {error, {http, Code, B}}
+    after 600000 ->
+        {error, timeout}
+    end.
+
+print_sse_events(Buf) ->
+    case binary:split(Buf, <<"\n">>) of
+        [Last] ->
+            Last;
+        [Line, Rest] ->
+            handle_sse_line(strip_cr(Line)),
+            print_sse_events(Rest)
+    end.
+
+strip_cr(<<>>) ->
+    <<>>;
+strip_cr(B) ->
+    case binary:last(B) =:= $\r of
+        true -> binary:part(B, 0, byte_size(B) - 1);
+        false -> B
+    end.
+
+handle_sse_line(<<>>) ->
+    ok;
+handle_sse_line(<<": ", _Comment/binary>>) ->
+    %% SSE comment (used as a server-side keepalive during model
+    %% loading). Ignore in the CLI; the user only cares about content.
+    ok;
+handle_sse_line(<<"data: [DONE]">>) ->
+    ok;
+handle_sse_line(<<"data: ", Json/binary>>) ->
+    try json:decode(Json) of
+        #{<<"choices">> := [#{<<"delta">> := #{<<"content">> := Text}} | _]} ->
+            io:put_chars(Text);
+        _ ->
+            ok
+    catch
+        _:_ -> ok
+    end;
+handle_sse_line(_) ->
+    ok.
+
+%% =============================================================================
+%% Misc
+%% =============================================================================
+
+prompt_from([]) ->
+    case io:get_chars("", 65536) of
+        eof -> <<"">>;
+        Bin -> iolist_to_binary(Bin)
+    end;
+prompt_from(Words) ->
+    iolist_to_binary(lists:join(" ", Words)).
+
+usage() ->
+    io:put_chars(
+        "erllama - command-line client for erllama_server\n"
+        "\n"
+        "Usage:\n"
+        "  erllama pull <name>             pull a model into the registry\n"
+        "  erllama list                    list registered models\n"
+        "  erllama show <name>             print one manifest\n"
+        "  erllama rm <name>               remove a manifest\n"
+        "  erllama copy <src> <dst>        alias under a new name:tag\n"
+        "  erllama search <query>          search HF / Ollama\n"
+        "  erllama run <name> [prompt..]   stream a single chat completion\n"
+        "  erllama help                    this message\n"
+        "\n"
+        "Server URL via ERLLAMA_HOST env (default http://127.0.0.1:8080).\n"
+    ).
+
+-spec die(string(), term()) -> no_return().
+die(Msg, Detail) ->
+    io:put_chars(io_lib:format("~ts: ~p~n", [Msg, Detail])),
+    halt(1).
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(L) when is_list(L) -> unicode:characters_to_binary(L);
+to_bin(A) when is_atom(A) -> atom_to_binary(A, utf8);
+to_bin(I) when is_integer(I) -> integer_to_binary(I).

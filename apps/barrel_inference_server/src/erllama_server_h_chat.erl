@@ -77,7 +77,10 @@
     buf_reason :: iodata(),
     %% mode (text vs tool-call buffering)
     mode :: text | tool_buffer,
-    grammar_set :: boolean()
+    grammar_set :: boolean(),
+    %% true once stream_reply/3 has fired. Separate from `ref` because
+    %% a loading keepalive can open the stream before admission.
+    stream_started = false :: boolean()
 }).
 
 %%====================================================================
@@ -175,7 +178,19 @@ grammar_active(#erllama_request{tools = Tools, tool_choice = TC}) ->
 %%====================================================================
 
 %% --- pipeline progress ---
+info({pipeline, loading, _ModelId}, Req0, S0 = #st{stream = true}) ->
+    %% Long load: emit an SSE comment keepalive every tick. Opens
+    %% the stream on the first tick so cowboy + downstream clients
+    %% keep the connection alive.
+    {Req1, S1} = ensure_stream(Req0, S0),
+    ok = sse_comment(Req1, <<"loading">>),
+    {ok, Req1, S1, hibernate};
+info({pipeline, loading, _ModelId}, Req, S) ->
+    %% Non-streaming request: nothing to write yet; cowboy
+    %% idle_timeout (configured at the listener) is the safety net.
+    {ok, Req, S, hibernate};
 info({pipeline, loaded}, Req, S) ->
+    ok = erllama_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template}, hibernate};
 info({pipeline, templated, _Tokens}, Req, S) ->
     {ok, Req, S#st{phase = waiting_queue}, hibernate};
@@ -191,15 +206,21 @@ info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
             _ -> S0
         end,
     S2 = S1#st{slot = Slot},
-    case {S2#st.stream, S0#st.ref} of
-        {true, undefined} ->
-            %% First admit path with no preceding token: send the
-            %% stream_reply now.
-            Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
-            {ok, Req1, S2, hibernate};
-        _ ->
+    case S2#st.stream of
+        true ->
+            {Req1, S3} = ensure_stream(Req0, S2),
+            {ok, Req1, S3, hibernate};
+        false ->
             {ok, Req0, S2, hibernate}
     end;
+info({pipeline, error, Status, Reason}, Req0, S = #st{stream_started = true}) ->
+    %% Post-stream error: stream_reply has already gone out (loading
+    %% keepalive opened it). Emit an SSE error frame instead of JSON,
+    %% close the body, terminate the handler.
+    record_metrics(S, Status),
+    sse_event(Req0, <<"error">>, error_payload(Status, Reason)),
+    cowboy_req:stream_body(<<>>, fin, Req0),
+    {stop, Req0, S};
 info({pipeline, error, Status, Reason}, Req0, S) ->
     record_metrics(S, Status),
     Req1 = json_error(Status, Reason, Req0),
@@ -288,7 +309,20 @@ cleanup(S) ->
         true -> ok;
         false -> ok
     end,
+    %% Decrement the keepalive active count. If this was the last
+    %% request, the model enters the keep-alive grace window.
+    keepalive_release(S#st.model, S#st.phase),
     erllama_server_metrics:dec_active_streams(S#st.model).
+
+%% request_end only fires if request_begin was called (i.e., load
+%% completed). If we never reached `waiting_template`, the active
+%% count was never bumped.
+keepalive_release(_Model, waiting_load) ->
+    ok;
+keepalive_release(Model, _Phase) ->
+    erllama_server_keepalive:request_end(
+        Model, erllama_server_config:keep_alive_default_ms()
+    ).
 
 %%====================================================================
 %% Token handling
@@ -492,13 +526,44 @@ total_ms() ->
 %% streaming requests also call `stream_reply` here so a body chunk
 %% can be sent immediately. Idempotent when admit arrived first.
 learn_ref(S = #st{ref = undefined, stream = true}, Req0, Ref) ->
-    Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
-    S1 = arm_prefill_timer(S#st{phase = running, ref = Ref}),
-    {S1, Req1};
+    {Req1, S1} = ensure_stream(Req0, S),
+    S2 = arm_prefill_timer(S1#st{phase = running, ref = Ref}),
+    {S2, Req1};
 learn_ref(S = #st{ref = undefined}, Req0, Ref) ->
     {arm_prefill_timer(S#st{phase = running, ref = Ref}), Req0};
 learn_ref(S, Req, _Ref) ->
     {S, Req}.
+
+%% Open the SSE stream exactly once. Subsequent calls are no-ops.
+ensure_stream(Req, S = #st{stream_started = true}) ->
+    {Req, S};
+ensure_stream(Req0, S) ->
+    Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
+    {Req1, S#st{stream_started = true}}.
+
+sse_comment(Req, Text) ->
+    cowboy_req:stream_body([<<": ">>, Text, <<"\n\n">>], nofin, Req),
+    ok.
+
+sse_event(Req, EventName, JsonMap) ->
+    Frame = [
+        <<"event: ">>,
+        EventName,
+        <<"\n">>,
+        <<"data: ">>,
+        json:encode(JsonMap),
+        <<"\n\n">>
+    ],
+    cowboy_req:stream_body(Frame, nofin, Req),
+    ok.
+
+error_payload(Status, Reason) ->
+    #{
+        <<"error">> => #{
+            <<"status">> => Status,
+            <<"message">> => to_bin(Reason)
+        }
+    }.
 
 cancel_timer(undefined) ->
     ok;

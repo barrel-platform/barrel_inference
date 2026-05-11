@@ -121,23 +121,47 @@ release_and_fail(W = #work{slot = Slot}, Status, Reason) when is_reference(Slot)
 %%====================================================================
 
 step_load(W) ->
-    case erllama_server_config:ensure_loaded(model_id(W)) of
+    ModelId = model_id(W),
+    case erllama_server_config:ensure_loaded_async(ModelId, self(), load_deadline()) of
         ok ->
-            W#work.handler ! {pipeline, loaded},
-            {ok, W};
-        {error, not_found} ->
-            {error, 404, model_not_found};
-        {error, not_preloaded} ->
-            {error, 503, model_not_preloaded};
-        {error, not_loaded} ->
-            {error, 503, model_not_loaded};
-        {error, load_failed} ->
-            {error, 503, model_load_failed};
-        {error, load_timeout} ->
-            {error, 504, model_load_timeout};
+            wait_for_load(W, ModelId, load_deadline());
         {error, Reason} ->
-            {error, 500, Reason}
+            {error, code_for(Reason), Reason}
     end.
+
+%% Loop on {erllama_load_progress, _} ticks (forwarded to the handler
+%% as {pipeline, loading, _}) until either the done message arrives
+%% or the request deadline fires. Reusing the per-request deadline
+%% keeps the existing load_timeout semantics.
+wait_for_load(W, ModelId, Deadline) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Deadline =< Now of
+        true ->
+            {error, 504, model_load_timeout};
+        false ->
+            receive
+                {erllama_load_progress, ModelId} ->
+                    W#work.handler ! {pipeline, loading, ModelId},
+                    wait_for_load(W, ModelId, Deadline);
+                {erllama_load_done, ModelId, ok} ->
+                    W#work.handler ! {pipeline, loaded},
+                    {ok, W};
+                {erllama_load_done, ModelId, {error, Reason}} ->
+                    {error, code_for(Reason), Reason}
+            after max(0, Deadline - Now) ->
+                {error, 504, model_load_timeout}
+            end
+    end.
+
+code_for(not_found) -> 404;
+code_for(not_preloaded) -> 503;
+code_for(not_loaded) -> 503;
+code_for(load_failed) -> 503;
+code_for(load_timeout) -> 504;
+code_for(_) -> 500.
+
+load_deadline() ->
+    erlang:monotonic_time(millisecond) + erllama_server_config:prefill_ms().
 
 step_template(W) ->
     R = W#work.request,
@@ -155,7 +179,7 @@ apply_chat_template(W) ->
         system => R#erllama_request.system,
         tools => R#erllama_request.tools
     },
-    case erllama:apply_chat_template(model_id(W), Req) of
+    try erllama:apply_chat_template(model_id(W), Req) of
         {ok, Tokens} ->
             W1 = put_tokens(W, Tokens),
             W#work.handler ! {pipeline, templated, Tokens},
@@ -166,16 +190,24 @@ apply_chat_template(W) ->
             {error, 501, chat_template_not_supported};
         {error, Reason} ->
             {error, 400, Reason}
+    catch
+        Class:Why:Stack ->
+            log_erllama_crash(model_id(W), apply_chat_template, Class, Why, Stack),
+            {error, 500, model_crashed}
     end.
 
 tokenise_raw(W, Prompt) ->
-    case erllama:tokenize(model_id(W), Prompt) of
+    try erllama:tokenize(model_id(W), Prompt) of
         {ok, Tokens} ->
             W1 = put_tokens(W, Tokens),
             W#work.handler ! {pipeline, templated, Tokens},
             {ok, W1};
         {error, Reason} ->
             {error, 400, Reason}
+    catch
+        Class:Why:Stack ->
+            log_erllama_crash(model_id(W), tokenize, Class, Why, Stack),
+            {error, 500, model_crashed}
     end.
 
 step_grammar(W) ->
@@ -211,7 +243,7 @@ step_queue(W) ->
 
 step_infer(W) ->
     Params = build_params(W#work.request),
-    case erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler) of
+    try erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler) of
         {ok, Ref} ->
             {ok, W#work{infer_ref = Ref}};
         {error, busy} ->
@@ -219,7 +251,23 @@ step_infer(W) ->
             {error, 429, busy};
         {error, Reason} ->
             {error, 500, Reason}
+    catch
+        Class:Why:Stack ->
+            log_erllama_crash(model_id(W), infer, Class, Why, Stack),
+            {error, 500, model_crashed}
     end.
+
+%% Convert crashes coming back from erllama (gen_statem `call` exits,
+%% function clauses inside the model gen_statem, etc.) into a clean
+%% error tuple. The request process never dies; the supervisor
+%% restart-storm that follows a crashing model still happens upstream
+%% but the client sees a JSON 500 instead of a torn HTTP connection.
+log_erllama_crash(ModelId, Step, Class, Why, Stack) ->
+    logger:error(
+        "erllama crash in ~p for ~ts: ~p:~p~n~p",
+        [Step, ModelId, Class, Why, Stack]
+    ),
+    ok.
 
 %%====================================================================
 %% Helpers

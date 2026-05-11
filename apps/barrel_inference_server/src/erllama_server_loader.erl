@@ -9,19 +9,42 @@
 %%% {error, load_timeout}. The loader keeps running because other
 %%% awaiters may have longer deadlines, and so the next request finds
 %%% the model already loaded.
+%%%
+%%% The actual erllama:load_model/2 call runs in a spawn_monitor'd
+%%% worker so the loader gen_server stays responsive to subscribe
+%%% casts and `progress_tick` timer messages while the load is in
+%%% flight. Subscribers receive:
+%%%
+%%%   {erllama_load_progress, ModelId}              periodic, every 2 s
+%%%   {erllama_load_done, ModelId, ok}              on success
+%%%   {erllama_load_done, ModelId, {error, Reason}} on failure
 
 -module(erllama_server_loader).
 -behaviour(gen_server).
 
--export([start_link/1, await/3]).
+-export([
+    start_link/1,
+    await/3,
+    subscribe/2,
+    default_opts/1,
+    manifest_to_config/1
+]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+-define(APP, erllama_server).
+-define(TICK_INTERVAL_MS, 2000).
 
 -record(state, {
     model_id :: binary(),
     state :: loading | loaded | {failed, term()},
-    %% From, Deadline
-    awaiters :: [{gen_server:from(), integer()}]
+    %% From, Deadline (gen_server:reply targets)
+    awaiters :: [{gen_server:from(), integer()}],
+    %% Pids that receive {erllama_load_progress|done, ModelId, ...}
+    subscribers :: [pid()],
+    tick_timer :: undefined | reference(),
+    worker :: undefined | {pid(), reference()},
+    load_started_at :: undefined | integer()
 }).
 
 %%====================================================================
@@ -38,13 +61,30 @@ start_link(ModelId) ->
 await(Loader, From, Deadline) ->
     gen_server:cast(Loader, {await, From, Deadline}).
 
+%% Subscribe a pid for progress + done messages. If the model is
+%% already loaded or failed, the corresponding `done` message is sent
+%% immediately. Otherwise the subscriber receives a `progress` message
+%% every TICK_INTERVAL_MS while the load is in flight, then exactly
+%% one `done` message.
+-spec subscribe(pid(), pid()) -> ok.
+subscribe(Loader, Pid) when is_pid(Pid) ->
+    gen_server:cast(Loader, {subscribe, Pid}).
+
 %%====================================================================
 %% gen_server
 %%====================================================================
 
 init([ModelId]) ->
     self() ! start_load,
-    {ok, #state{model_id = ModelId, state = loading, awaiters = []}}.
+    {ok, #state{
+        model_id = ModelId,
+        state = loading,
+        awaiters = [],
+        subscribers = [],
+        tick_timer = undefined,
+        worker = undefined,
+        load_started_at = undefined
+    }}.
 
 handle_call(_, _, S) -> {reply, {error, unknown_call}, S}.
 
@@ -55,8 +95,6 @@ handle_cast({await, From, Deadline}, S = #state{state = loading, awaiters = A}) 
             gen_server:reply(From, {error, load_timeout}),
             {noreply, S};
         false ->
-            %% Schedule a self-message at the deadline to expire this
-            %% specific awaiter if the load still has not finished.
             erlang:send_after(
                 max(0, Deadline - Now),
                 self(),
@@ -70,44 +108,49 @@ handle_cast({await, From, _Deadline}, S = #state{state = loaded}) ->
 handle_cast({await, From, _Deadline}, S = #state{state = {failed, Reason}}) ->
     gen_server:reply(From, {error, Reason}),
     {noreply, S};
+handle_cast({subscribe, Pid}, S = #state{state = loading, subscribers = Subs}) ->
+    {noreply, S#state{subscribers = lists:usort([Pid | Subs])}};
+handle_cast({subscribe, Pid}, S = #state{state = loaded, model_id = Id}) ->
+    Pid ! {erllama_load_done, Id, ok},
+    {noreply, S};
+handle_cast({subscribe, Pid}, S = #state{state = {failed, Reason}, model_id = Id}) ->
+    Pid ! {erllama_load_done, Id, {error, Reason}},
+    {noreply, S};
+handle_cast({load_result, WorkerPid, Result}, S = #state{worker = {WorkerPid, _Mon}}) ->
+    finalize(S, Result);
+handle_cast({load_result, _, _}, S) ->
+    {noreply, S};
 handle_cast(_, S) ->
     {noreply, S}.
 
 handle_info(start_load, S = #state{model_id = ModelId}) ->
-    Result =
-        try erllama:load_model(ModelId, default_opts(ModelId)) of
-            {ok, _ModelRef} -> ok;
-            {error, Reason} -> {error, Reason}
-        catch
-            Class:Why:_Stack -> {error, {Class, Why}}
-        end,
-    NextState =
-        case Result of
-            ok -> loaded;
-            {error, R} -> {failed, R}
-        end,
-    %% Reply to all current awaiters whose deadlines have not expired.
-    Now = erlang:monotonic_time(millisecond),
-    Reply =
-        case Result of
-            ok -> ok;
-            {error, R2} -> {error, R2}
-        end,
-    lists:foreach(
-        fun
-            ({From, Deadline}) when Deadline >= Now ->
-                gen_server:reply(From, Reply);
-            (_) ->
-                ok
-        end,
-        S#state.awaiters
-    ),
-    %% Stay alive on both success AND failure so late-arriving await
-    %% casts (the cast race: start_load may fire before the awaiter
-    %% registers) get the cached state. The config server's `'DOWN'`
-    %% handler removes the loader entry; an explicit retry would need
-    %% a separate API in a future version.
-    {noreply, S#state{state = NextState, awaiters = []}};
+    %% Resolve options on the loader process: this is fast (just a
+    %% manifest read). The slow part (erllama:load_model/2) runs in
+    %% a worker so the gen_server stays responsive.
+    case default_opts(ModelId) of
+        {ok, Opts} ->
+            {Pid, Mon} = spawn_load_worker(self(), ModelId, Opts),
+            {noreply,
+                schedule_tick(S#state{
+                    worker = {Pid, Mon},
+                    load_started_at = erlang:monotonic_time(millisecond)
+                })};
+        {error, _} = E ->
+            finalize(S, E)
+    end;
+handle_info({progress_tick, _Ref}, S = #state{state = loading}) ->
+    #state{subscribers = Subs, model_id = Id} = S,
+    _ = [Pid ! {erllama_load_progress, Id} || Pid <- Subs],
+    {noreply, schedule_tick(S)};
+handle_info({progress_tick, _}, S) ->
+    {noreply, S};
+handle_info({'DOWN', Mon, process, Pid, Reason}, S = #state{state = loading}) ->
+    case S#state.worker of
+        {Pid, Mon} ->
+            finalize(S, {error, {load_worker_crashed, Reason}});
+        _ ->
+            {noreply, S}
+    end;
 handle_info({expire_awaiter, From}, S = #state{state = loading, awaiters = A}) ->
     case lists:keytake(From, 1, A) of
         {value, {From, _}, A1} ->
@@ -127,7 +170,167 @@ terminate(_, _) -> ok.
 %% Internal
 %%====================================================================
 
-default_opts(_ModelId) ->
-    %% Hook for per-model load options; for v0.1 we hand off the empty
-    %% map and let erllama use its defaults.
-    #{}.
+spawn_load_worker(LoaderPid, ModelId, Opts) ->
+    spawn_monitor(fun() ->
+        Result = load_with_opts(ModelId, Opts),
+        gen_server:cast(LoaderPid, {load_result, self(), Result})
+    end).
+
+load_with_opts(ModelId, Opts) ->
+    try erllama:load_model(ModelId, Opts) of
+        {ok, _ModelRef} -> ok;
+        {error, Reason} -> {error, Reason}
+    catch
+        Class:Why:_Stack -> {error, {Class, Why}}
+    end.
+
+%% Reply to all current awaiters whose deadlines have not expired,
+%% then fan out the final done message to subscribers.
+finalize(S = #state{model_id = Id, awaiters = A, subscribers = Subs, worker = W}, Result) ->
+    Now = erlang:monotonic_time(millisecond),
+    Reply =
+        case Result of
+            ok -> ok;
+            {error, _} = E -> E
+        end,
+    _ = [gen_server:reply(From, Reply) || {From, Deadline} <- A, Deadline >= Now],
+    _ = [Pid ! {erllama_load_done, Id, Reply} || Pid <- Subs],
+    NextState =
+        case Result of
+            ok -> loaded;
+            {error, R} -> {failed, R}
+        end,
+    S1 = cancel_worker(W, S),
+    {noreply,
+        cancel_tick(S1#state{
+            state = NextState,
+            awaiters = [],
+            subscribers = [],
+            load_started_at = undefined
+        })}.
+
+cancel_worker(undefined, S) ->
+    S#state{worker = undefined};
+cancel_worker({_Pid, Mon}, S) ->
+    _ = erlang:demonitor(Mon, [flush]),
+    S#state{worker = undefined}.
+
+schedule_tick(S) ->
+    Ref = make_ref(),
+    Timer = erlang:send_after(?TICK_INTERVAL_MS, self(), {progress_tick, Ref}),
+    S#state{tick_timer = Timer}.
+
+cancel_tick(S = #state{tick_timer = T}) when is_reference(T) ->
+    _ = erlang:cancel_timer(T),
+    S#state{tick_timer = undefined};
+cancel_tick(S) ->
+    S#state{tick_timer = undefined}.
+
+%% Resolve a model id into the erllama:load_model/2 config map by
+%% looking up its manifest in the registry. With `auto_pull` enabled,
+%% an unknown model is fetched on the fly. Otherwise the loader
+%% reports `{error, not_found}`, which pipeline.erl maps to 404.
+-spec default_opts(binary()) -> {ok, map()} | {error, term()}.
+default_opts(ModelId) ->
+    case erllama_server_models:get(ModelId) of
+        {ok, Manifest} ->
+            {ok, manifest_to_config(Manifest)};
+        {error, not_found} ->
+            handle_missing(ModelId);
+        {error, _} = E ->
+            E
+    end.
+
+handle_missing(ModelId) ->
+    case erllama_server_config:auto_pull() of
+        true ->
+            case erllama_server_models:pull(ModelId) of
+                {ok, Manifest} -> {ok, manifest_to_config(Manifest)};
+                {error, _} -> {error, not_found}
+            end;
+        false ->
+            {error, not_found}
+    end.
+
+%% Map a manifest into the option set erllama:load_model/2 expects.
+%% Fields not present in the manifest fall through to app-env defaults
+%% (`tier_srv`, `tier`, `policy`, `ctx_params_hash`); operators wire
+%% those once at boot.
+-spec manifest_to_config(map()) -> map().
+manifest_to_config(Manifest) ->
+    Loader = maps:get(<<"loader">>, Manifest, #{}),
+    BaseOpts = base_opts(),
+    MaxCtx = application:get_env(?APP, max_context_size, 4096),
+    NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
+    Ctx = min(NativeCtx, MaxCtx),
+    BaseOpts#{
+        backend => application:get_env(?APP, model_backend, erllama_model_llama),
+        model_path => path_string(maps:get(<<"blob_path">>, Manifest)),
+        fingerprint => fingerprint_from_digest(maps:get(<<"digest">>, Manifest, null)),
+        fingerprint_mode => application:get_env(?APP, fingerprint_mode, safe),
+        quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
+        quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
+        context_size => Ctx
+    }.
+
+base_opts() ->
+    application:get_env(?APP, model_default_opts, #{}).
+
+path_string(B) when is_binary(B) -> unicode:characters_to_list(B);
+path_string(L) when is_list(L) -> L.
+
+fingerprint_from_digest(<<"sha256:", Hex/binary>>) ->
+    case hex_to_bin(Hex) of
+        Bin when byte_size(Bin) =:= 32 -> Bin;
+        _ -> binary:copy(<<0>>, 32)
+    end;
+fingerprint_from_digest(_) ->
+    binary:copy(<<0>>, 32).
+
+hex_to_bin(Hex) ->
+    try
+        <<<<(list_to_integer([A, B], 16))>> || <<A, B>> <= Hex>>
+    catch
+        _:_ -> <<>>
+    end.
+
+quant_atom(undefined) -> f16;
+quant_atom(null) -> f16;
+quant_atom(Bin) when is_binary(Bin) -> map_to_supported_quant(Bin);
+quant_atom(_) -> f16.
+
+%% Pre-Bucket-A workaround: even with upstream erllama_cache_key now
+%% covering every llama.cpp ftype value, this mapping keeps responses
+%% stable across erllama versions and short-circuits any future
+%% additions before they reach the cache key derivation. The mapping
+%% is by quant bits (closest supported bucket).
+map_to_supported_quant(<<"f32">>) -> f32;
+map_to_supported_quant(<<"f16">>) -> f16;
+map_to_supported_quant(<<"bf16">>) -> bf16;
+map_to_supported_quant(<<"q4_0">>) -> q4_0;
+map_to_supported_quant(<<"q4_1">>) -> q4_1;
+map_to_supported_quant(<<"q5_0">>) -> q5_0;
+map_to_supported_quant(<<"q5_1">>) -> q5_1;
+map_to_supported_quant(<<"q8_0">>) -> q8_0;
+map_to_supported_quant(<<"q4_k_m">>) -> q4_k_m;
+map_to_supported_quant(<<"q4_k_s">>) -> q4_k_s;
+map_to_supported_quant(<<"q5_k_m">>) -> q5_k_m;
+map_to_supported_quant(<<"q5_k_s">>) -> q5_k_s;
+map_to_supported_quant(<<"q6_k">>) -> q6_k;
+map_to_supported_quant(<<"q8_k">>) -> q8_k;
+map_to_supported_quant(<<"q2", _/binary>>) -> q2_k;
+map_to_supported_quant(<<"q3_k_s">>) -> q3_k_s;
+map_to_supported_quant(<<"q3_k_m">>) -> q3_k_m;
+map_to_supported_quant(<<"q3_k_l">>) -> q3_k_l;
+map_to_supported_quant(<<"q3", _/binary>>) -> q3_k_m;
+map_to_supported_quant(<<"iq1", _/binary>>) -> iq1_s;
+map_to_supported_quant(<<"iq2", _/binary>>) -> iq2_s;
+map_to_supported_quant(<<"iq3", _/binary>>) -> iq3_s;
+map_to_supported_quant(<<"iq4_nl">>) -> iq4_nl;
+map_to_supported_quant(<<"iq4", _/binary>>) -> iq4_xs;
+map_to_supported_quant(_) -> f16.
+
+default_int(undefined, Default) -> Default;
+default_int(null, Default) -> Default;
+default_int(N, _) when is_integer(N), N > 0 -> N;
+default_int(_, Default) -> Default.

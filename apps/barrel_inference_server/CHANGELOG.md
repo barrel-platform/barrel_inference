@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- HuggingFace + Ollama + HTTPS + file:// model fetcher
+  (`erllama_server_fetch:fetch/1,2`, async variants, `search/1,2`)
+  ported from `erllama`. Content-addressed blob cache with resume +
+  sha256 verification; in-process dedupe of concurrent pulls.
+- GGUF metadata reader (`erllama_server_gguf:read_metadata/1`),
+  pure Erlang, no NIF.
+- Models registry (`erllama_server_models`) with Ollama-style
+  short names, manifests under `<cache_root>/manifests/<name>/<tag>.json`,
+  GGUF metadata sniffing on pull, alias support via `copy/2`.
+- Ollama-compatible `/api/tags`, `/api/pull`, `/api/show`,
+  `/api/delete`, `/api/copy`, `/api/create`, `/api/search`.
+- `erllama` CLI escript (`rebar3 escriptize` -> `_build/default/bin/erllama`).
+  Subcommands: `pull`, `list`, `show`, `rm`, `copy`, `search`, `run`.
+- Per-model load-progress streaming. The loader spawns a worker for
+  the synchronous `erllama:load_model/2` call and emits
+  `{erllama_load_progress, ModelId}` every 2 s while loading. The
+  pipeline forwards each tick to the handler as
+  `{pipeline, loading, _}`; chat / messages handlers emit SSE
+  comments / Anthropic ping events so clients see activity during
+  multi-second loads.
+- `erllama_server_keepalive` gen_server tracks active requests per
+  model and auto-unloads after `keep_alive_default_ms` (default
+  5 min) of inactivity. Long generations never trigger an unload
+  mid-stream because the timer is only armed when the active count
+  reaches zero.
+- Cowboy listener `idle_timeout` bumped to 30 min (configurable via
+  `idle_timeout_ms` in `sys.config`) so long fetches and slow
+  loads no longer close the connection at cowboy's default 60 s.
+- Loader `manifest_to_config/1` caps `context_size` at
+  `max_context_size` (default 4096) so models advertising 128 K
+  contexts in their GGUF do not OOM at load time.
+- Pipeline wraps every call into erllama in try/catch; a crashing
+  model gen_statem returns a 500 JSON envelope or an SSE error
+  frame instead of killing the cowboy request process.
+
 ## [0.1.0] - in progress
 
 Initial release.
