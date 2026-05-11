@@ -68,6 +68,18 @@ dispatch(Base, ["search", Q | _]) ->
     cmd_search(Base, Q);
 dispatch(Base, ["run", Name | Rest]) ->
     cmd_run(Base, Name, prompt_from(Rest));
+dispatch(Base, ["ps" | _]) ->
+    cmd_ps(Base);
+dispatch(Base, ["version" | _]) ->
+    cmd_version(Base);
+dispatch(Base, ["--version" | _]) ->
+    cmd_version(Base);
+dispatch(Base, ["-v" | _]) ->
+    cmd_version(Base);
+dispatch(Base, ["unload", Name | _]) ->
+    cmd_unload(Base, Name);
+dispatch(Base, ["embed", Name | Rest]) ->
+    cmd_embed(Base, Name, prompt_from(Rest));
 dispatch(_, _) ->
     usage(),
     halt(2).
@@ -148,6 +160,54 @@ cmd_run(Base, Name, Prompt) ->
         {error, Reason} -> die("run failed", Reason)
     end.
 
+cmd_ps(Base) ->
+    case json_get(Base ++ "/api/ps") of
+        {ok, #{<<"models">> := []}} ->
+            io:put_chars("(no loaded models)\n");
+        {ok, #{<<"models">> := Models}} ->
+            print_ps_table(Models);
+        {error, Reason} ->
+            die("ps failed", Reason)
+    end.
+
+cmd_version(Base) ->
+    case json_get(Base ++ "/api/version") of
+        {ok, #{<<"version">> := V}} ->
+            io:put_chars(io_lib:format("~ts~n", [V]));
+        {error, Reason} ->
+            die("version failed", Reason)
+    end.
+
+cmd_unload(Base, Name) ->
+    %% Ollama convention: empty prompt + keep_alive 0 -> unload now.
+    Body = json:encode(#{
+        <<"model">> => list_to_binary(Name),
+        <<"prompt">> => <<>>,
+        <<"keep_alive">> => 0,
+        <<"stream">> => false
+    }),
+    case json_post(Base ++ "/api/generate", Body) of
+        {ok, #{<<"done_reason">> := <<"unload">>}} ->
+            io:put_chars(io_lib:format("unloaded ~s~n", [Name]));
+        {ok, _Other} ->
+            io:put_chars(io_lib:format("~s was not loaded~n", [Name]));
+        {error, Reason} ->
+            die("unload failed", Reason)
+    end.
+
+cmd_embed(Base, Name, Text) ->
+    Body = json:encode(#{
+        <<"model">> => list_to_binary(Name),
+        <<"input">> => Text
+    }),
+    case json_post(Base ++ "/api/embed", Body) of
+        {ok, #{<<"embeddings">> := [V | _]}} ->
+            io:put_chars(io_lib:format("dim=~B~n", [length(V)])),
+            io:put_chars(io_lib:format("~p~n", [V]));
+        {error, Reason} ->
+            die("embed failed", Reason)
+    end.
+
 %% =============================================================================
 %% Output helpers
 %% =============================================================================
@@ -191,6 +251,39 @@ pad(Col, W) ->
         true -> <<Bin/binary, (binary:copy(<<" ">>, Need))/binary>>;
         false -> Bin
     end.
+
+%% Ollama-style `ps` table: name, size in VRAM, digest stem,
+%% expires-at (relative seconds remaining or "never").
+print_ps_table(Models) ->
+    Header = [<<"NAME">>, <<"SIZE">>, <<"DIGEST">>, <<"UNTIL">>],
+    Rows = [ps_row(M) || M <- Models],
+    Widths = ps_widths(Header, Rows),
+    io:put_chars([format_row(Widths, Header)]),
+    [io:put_chars([format_row(Widths, R)]) || R <- Rows],
+    ok.
+
+ps_row(M) ->
+    [
+        nullable(maps:get(<<"name">>, M, <<>>)),
+        human_size(maps:get(<<"size">>, M, 0)),
+        digest_stem(maps:get(<<"digest">>, M, null)),
+        until_label(maps:get(<<"expires_at">>, M, null))
+    ].
+
+ps_widths(Header, Rows) ->
+    All = [Header | Rows],
+    [lists:max([byte_size(to_bin(C)) || C <- column(N, All)]) || N <- lists:seq(1, 4)].
+
+digest_stem(null) ->
+    <<"-">>;
+digest_stem(<<"sha256:", Rest/binary>>) when byte_size(Rest) >= 12 ->
+    binary:part(Rest, 0, 12);
+digest_stem(Other) ->
+    nullable(Other).
+
+until_label(null) -> <<"never">>;
+until_label(<<>>) -> <<"never">>;
+until_label(B) when is_binary(B) -> B.
 
 human_size(N) when is_integer(N), N >= 1024 * 1024 * 1024 ->
     iolist_to_binary(io_lib:format("~.2f GB", [N / 1.0e9]));
@@ -450,11 +543,15 @@ usage() ->
         "Usage:\n"
         "  erllama pull <name>             pull a model into the registry\n"
         "  erllama list                    list registered models\n"
+        "  erllama ps                      list currently-loaded models\n"
         "  erllama show <name>             print one manifest\n"
         "  erllama rm <name>               remove a manifest\n"
         "  erllama copy <src> <dst>        alias under a new name:tag\n"
         "  erllama search <query>          search HF / Ollama\n"
         "  erllama run <name> [prompt..]   stream a single chat completion\n"
+        "  erllama embed <name> <text..>   compute an embedding vector\n"
+        "  erllama unload <name>           evict a model from memory now\n"
+        "  erllama version                 print the server version\n"
         "  erllama help                    this message\n"
         "\n"
         "Server URL via ERLLAMA_HOST env (default http://127.0.0.1:8080).\n"

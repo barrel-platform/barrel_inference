@@ -147,14 +147,26 @@ emit_preload(Req0, Opts, Op, Model, MonoStart, KeepAlive, ReasonOk) ->
         load_duration_ns => LoadDurationNs
     },
     Body = erllama_server_translate:ollama_preload_response(Op, Reason, Model, Timings),
-    %% Wire the keep_alive into the per-model counter. The
-    %% request_begin then immediate request_end with KeepAlive
-    %% triggers the configured eviction (0 unloads now, infinity
-    %% never).
-    ok = erllama_server_keepalive:request_begin(Model),
-    ok = erllama_server_keepalive:request_end(Model, KeepAlive),
+    %% Wire the keep_alive into the per-model counter. For 0 we
+    %% unload synchronously so the HTTP response is a real
+    %% acknowledgement that the model is gone from memory.
+    apply_keep_alive(Model, KeepAlive),
     Req1 = cowboy_req:reply(200, json_headers(), Body, Req0),
     {ok, Req1, Opts}.
+
+apply_keep_alive(Model, 0) ->
+    %% Synchronous unload bypasses the keepalive cast queue, so the
+    %% HTTP response is a real acknowledgement that the model is
+    %% gone from memory.
+    try erllama:unload(Model) of
+        _ -> ok
+    catch
+        _:_ -> ok
+    end;
+apply_keep_alive(Model, KeepAlive) ->
+    ok = erllama_server_keepalive:request_begin(Model),
+    ok = erllama_server_keepalive:request_end(Model, KeepAlive),
+    ok.
 
 preload_deadline() ->
     erlang:monotonic_time(millisecond) + erllama_server_config:prefill_ms().
