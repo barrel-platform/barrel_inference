@@ -15,7 +15,9 @@
     pull_streams_status_lines/1,
     list_shows_table_with_pulled_model/1,
     show_returns_manifest_lines/1,
-    rm_removes_manifest/1
+    rm_removes_manifest/1,
+    version_prints_app_version/1,
+    ps_empty_when_nothing_loaded/1
 ]).
 
 -define(T_UINT32, 4).
@@ -29,7 +31,9 @@ all() ->
         pull_streams_status_lines,
         list_shows_table_with_pulled_model,
         show_returns_manifest_lines,
-        rm_removes_manifest
+        rm_removes_manifest,
+        version_prints_app_version,
+        ps_empty_when_nothing_loaded
     ].
 
 init_per_suite(Config) ->
@@ -95,6 +99,16 @@ rm_removes_manifest(Cfg) ->
     Out = run(Cfg, ["rm", "to-be-removed"]),
     ?assert(string:str(Out, "removed to-be-removed") > 0),
     ?assertEqual({error, not_found}, erllama_server_models:get(<<"to-be-removed">>)).
+
+version_prints_app_version(Cfg) ->
+    Out = run(Cfg, ["version"]),
+    %% App vsn is a semver-ish string; assert non-empty and contains a dot.
+    ?assert(length(Out) > 0),
+    ?assert(string:str(Out, ".") > 0).
+
+ps_empty_when_nothing_loaded(Cfg) ->
+    Out = run(Cfg, ["ps"]),
+    ?assert(string:str(Out, "no loaded models") > 0).
 
 %% =============================================================================
 %% Helpers

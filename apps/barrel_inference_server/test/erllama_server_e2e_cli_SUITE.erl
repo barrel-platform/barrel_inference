@@ -67,8 +67,10 @@ init_per_suite(Config) ->
     %% Use the stub backend so the synthetic GGUF blob is loadable.
     application:set_env(erllama_server, model_backend, erllama_model_stub),
     application:set_env(erllama_server, max_context_size, 1024),
-    %% Short keepalive default so the unload test does not hang the suite.
-    application:set_env(erllama_server, keep_alive_default_ms, 500),
+    %% Models stay loaded for the duration of the suite (matches the
+    %% server default). Tests that need explicit unload pass
+    %% keep_alive: 0 in the request body.
+    application:set_env(erllama_server, keep_alive_default_ms, 300000),
 
     {ok, Started} = application:ensure_all_started(erllama_server),
     {ok, _} = application:ensure_all_started(inets),
