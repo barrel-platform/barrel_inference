@@ -24,14 +24,17 @@
 -module(erllama_server_keepalive).
 -behaviour(gen_server).
 
--export([start_link/0, request_begin/1, request_end/2, unload_now/1]).
+-export([start_link/0, request_begin/1, request_end/2, unload_now/1, status/0, status/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SERVER, ?MODULE).
 
 -record(entry, {
     active = 0 :: non_neg_integer(),
-    timer :: undefined | reference()
+    timer :: undefined | reference(),
+    %% Unix-time millisecond when the unload timer will fire. `infinity`
+    %% if no timer is armed (active count > 0 OR keep_alive = infinity).
+    expires_at_ms = infinity :: infinity | non_neg_integer()
 }).
 
 -record(state, {
@@ -61,6 +64,30 @@ request_end(ModelId, KeepAlive) when is_binary(ModelId) ->
 unload_now(ModelId) when is_binary(ModelId) ->
     gen_server:cast(?SERVER, {unload_now, ModelId}).
 
+%% Returns a snapshot of the keepalive registry. Each entry carries
+%% the current active request count and either `infinity` (no timer)
+%% or the millisecond timestamp at which the unload timer will fire.
+-spec status() ->
+    [
+        #{
+            model := binary(),
+            active := non_neg_integer(),
+            expires_at_ms := infinity | non_neg_integer()
+        }
+    ].
+status() ->
+    gen_server:call(?SERVER, status).
+
+-spec status(binary()) ->
+    #{
+        model := binary(),
+        active := non_neg_integer(),
+        expires_at_ms := infinity | non_neg_integer()
+    }
+    | not_tracked.
+status(ModelId) when is_binary(ModelId) ->
+    gen_server:call(?SERVER, {status, ModelId}).
+
 %%====================================================================
 %% gen_server
 %%====================================================================
@@ -68,7 +95,12 @@ unload_now(ModelId) when is_binary(ModelId) ->
 init([]) ->
     {ok, #state{}}.
 
-handle_call(_, _, S) -> {reply, {error, unknown_call}, S}.
+handle_call(status, _, S = #state{models = M}) ->
+    {reply, snapshot_all(M), S};
+handle_call({status, Id}, _, S = #state{models = M}) ->
+    {reply, snapshot_one(Id, M), S};
+handle_call(_, _, S) ->
+    {reply, {error, unknown_call}, S}.
 
 handle_cast({request_begin, ModelId}, S = #state{models = M}) ->
     E0 = maps:get(ModelId, M, #entry{}),
@@ -119,16 +151,17 @@ terminate(_, _) -> ok.
 arm(ModelId, E, 0) ->
     _ = cancel_timer(E#entry.timer),
     _ = unload(ModelId),
-    E#entry{timer = undefined};
+    E#entry{timer = undefined, expires_at_ms = infinity};
 arm(_ModelId, E, infinity) ->
-    E#entry{timer = cancel_timer(E#entry.timer)};
+    E#entry{timer = cancel_timer(E#entry.timer), expires_at_ms = infinity};
 arm(ModelId, E, Ms) when is_integer(Ms), Ms > 0 ->
     _ = cancel_timer(E#entry.timer),
     Ref = make_ref(),
     Timer = erlang:send_after(Ms, self(), {unload_timer, ModelId, Ref}),
-    E#entry{timer = Timer};
+    ExpiresAt = erlang:system_time(millisecond) + Ms,
+    E#entry{timer = Timer, expires_at_ms = ExpiresAt};
 arm(_ModelId, E, _) ->
-    E#entry{timer = cancel_timer(E#entry.timer)}.
+    E#entry{timer = cancel_timer(E#entry.timer), expires_at_ms = infinity}.
 
 cancel_timer(undefined) ->
     undefined;
@@ -142,3 +175,15 @@ unload(ModelId) ->
     catch
         _:_ -> ok
     end.
+
+snapshot_all(M) ->
+    [snapshot_entry(Id, E) || {Id, E} <- maps:to_list(M)].
+
+snapshot_one(Id, M) ->
+    case maps:find(Id, M) of
+        {ok, E} -> snapshot_entry(Id, E);
+        error -> not_tracked
+    end.
+
+snapshot_entry(Id, #entry{active = N, expires_at_ms = X}) ->
+    #{model => Id, active => N, expires_at_ms => X}.

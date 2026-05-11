@@ -20,7 +20,9 @@
     create_unsupported_directive_returns_400/1,
     generate_empty_prompt_preloads/1,
     chat_empty_messages_preloads/1,
-    generate_keep_alive_zero_unloads/1
+    generate_keep_alive_zero_unloads/1,
+    version_returns_app_vsn/1,
+    ps_empty_when_no_loaded_models/1
 ]).
 
 %% GGUF tags.
@@ -41,7 +43,9 @@ all() ->
         create_unsupported_directive_returns_400,
         generate_empty_prompt_preloads,
         chat_empty_messages_preloads,
-        generate_keep_alive_zero_unloads
+        generate_keep_alive_zero_unloads,
+        version_returns_app_vsn,
+        ps_empty_when_no_loaded_models
     ].
 
 %% =============================================================================
@@ -237,6 +241,21 @@ generate_keep_alive_zero_unloads(Cfg) ->
         _ ->
             ok
     end.
+
+version_returns_app_vsn(Cfg) ->
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(?config(base, Cfg) ++ "/api/version"),
+    Decoded = json:decode(list_to_binary(Body)),
+    Vsn = maps:get(<<"version">>, Decoded),
+    ?assert(is_binary(Vsn)),
+    ?assert(byte_size(Vsn) > 0).
+
+ps_empty_when_no_loaded_models(Cfg) ->
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(?config(base, Cfg) ++ "/api/ps"),
+    Decoded = json:decode(list_to_binary(Body)),
+    %% The suite never loads a real model; erllama:list_models/0
+    %% returns []. Response shape must still match Ollama: a top-level
+    %% `models` array (possibly empty).
+    ?assert(is_list(maps:get(<<"models">>, Decoded))).
 
 %% =============================================================================
 %% Helpers

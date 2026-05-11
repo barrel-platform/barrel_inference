@@ -42,7 +42,11 @@ init(Req0, #{op := create} = Opts) ->
 init(Req0, #{op := pull} = Opts) ->
     expect(<<"POST">>, Req0, Opts, fun handle_pull/2);
 init(Req0, #{op := search} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_search/2).
+    expect(<<"POST">>, Req0, Opts, fun handle_search/2);
+init(Req0, #{op := version} = Opts) ->
+    expect(<<"GET">>, Req0, Opts, fun handle_version/2);
+init(Req0, #{op := ps} = Opts) ->
+    expect(<<"GET">>, Req0, Opts, fun handle_ps/2).
 
 info({erllama_fetch_progress, Ref, Bytes, Total}, Req, #pull{job_ref = Ref} = St) ->
     Now = erlang:monotonic_time(millisecond),
@@ -78,6 +82,84 @@ expect(Method, Req0, Opts, Fun) ->
             ),
             {ok, Reply, Opts}
     end.
+
+%% =============================================================================
+%% GET /api/version
+%% =============================================================================
+
+handle_version(Req0, Opts) ->
+    Vsn =
+        case application:get_key(erllama_server, vsn) of
+            {ok, V} when is_list(V) -> list_to_binary(V);
+            {ok, V} when is_binary(V) -> V;
+            _ -> <<"0.0.0">>
+        end,
+    Req1 = cowboy_req:reply(200, json_headers(), json_body(#{<<"version">> => Vsn}), Req0),
+    {ok, Req1, Opts}.
+
+%% =============================================================================
+%% GET /api/ps
+%%
+%% Ollama-shape "running" list. Intersection of erllama:list_models/0
+%% (loaded gen_statems) with the registry manifests + the keepalive
+%% per-model TTL state.
+%% =============================================================================
+
+handle_ps(Req0, Opts) ->
+    Loaded = safe_list_loaded(),
+    Statuses = safe_keepalive_status(),
+    StatusMap = maps:from_list([{maps:get(model, S), S} || S <- Statuses]),
+    Manifests = manifests_by_name(),
+    Models = [ps_entry(Info, StatusMap, Manifests) || Info <- Loaded],
+    Req1 = cowboy_req:reply(
+        200, json_headers(), json_body(#{<<"models">> => Models}), Req0
+    ),
+    {ok, Req1, Opts}.
+
+safe_list_loaded() ->
+    try erllama:list_models() of
+        L when is_list(L) -> L
+    catch
+        _:_ -> []
+    end.
+
+safe_keepalive_status() ->
+    try erllama_server_keepalive:status() of
+        L when is_list(L) -> L
+    catch
+        _:_ -> []
+    end.
+
+manifests_by_name() ->
+    Ms = erllama_server_models:list(),
+    maps:from_list([
+        {<<(maps:get(<<"name">>, M))/binary, ":", (maps:get(<<"tag">>, M))/binary>>, M}
+     || M <- Ms
+    ]).
+
+ps_entry(Info, StatusMap, Manifests) ->
+    Id = maps:get(id, Info, <<>>),
+    Manifest = maps:get(Id, Manifests, #{}),
+    KeepAlive = maps:get(Id, StatusMap, #{}),
+    #{
+        <<"name">> => Id,
+        <<"model">> => Id,
+        <<"size">> => maps:get(<<"size_bytes">>, Manifest, 0),
+        <<"digest">> => maps:get(<<"digest">>, Manifest, null),
+        <<"details">> => details(Manifest),
+        <<"expires_at">> => iso_or_null(maps:get(expires_at_ms, KeepAlive, infinity)),
+        <<"size_vram">> => maps:get(<<"size_bytes">>, Manifest, 0)
+    }.
+
+iso_or_null(infinity) -> null;
+iso_or_null(Ms) when is_integer(Ms) -> iso_from_unix_ms(Ms).
+
+iso_from_unix_ms(Ms) ->
+    Seconds = Ms div 1000,
+    {{Y, Mo, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Seconds, second),
+    list_to_binary(
+        io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ", [Y, Mo, D, H, Mi, S])
+    ).
 
 %% =============================================================================
 %% GET /api/tags
