@@ -296,14 +296,65 @@ print(litellm.completion(
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
 ANTHROPIC_AUTH_TOKEN=not-used \
-  claude
+  claude --model qwen-sonnet
 ```
 
-Set an alias in `sys.config` if you want a specific model id
-to map to your locally-pulled GGUF:
+Claude Code sends the model id in every `/v1/messages` request.
+`erllama_server` then runs that id through alias resolution and
+looks up the result in the manifest registry. Two ways to wire it:
+
+**1. Pass a local id directly.** `claude --model <registry-id>` or
+the `ANTHROPIC_MODEL` env var. The id has to match something in
+`erllama list`:
+
+```sh
+erllama list
+# NAME                                       SIZE   MODIFIED
+# Qwen/Qwen2.5-7B-Instruct-GGUF:main         4.4G   2026-05-11
+
+claude --model "Qwen/Qwen2.5-7B-Instruct-GGUF:main"
+```
+
+**2. Define an alias.** Add to `config/sys.config` and restart:
 
 ```erlang
 {model_aliases, #{
-  <<"claude-sonnet">> => <<"Qwen/Qwen2.5-7B-Instruct-GGUF:main">>
+  <<"qwen-sonnet">>               => <<"Qwen/Qwen2.5-7B-Instruct-GGUF:main">>,
+  <<"claude-sonnet-4-5">>         => <<"Qwen/Qwen2.5-7B-Instruct-GGUF:main">>,
+  <<"claude-opus-4-7">>           => <<"Qwen/Qwen2.5-7B-Instruct-GGUF:main">>
 }}
 ```
+
+After that, `claude --model qwen-sonnet` works, and if you alias
+the upstream Claude ids themselves, Claude Code's own defaults
+will route to your local model without flags. Aliases are pure
+rewrite: `claude-sonnet-4-5` -> `Qwen/...:main` -> registry
+lookup. Unknown ids fall through to a registry lookup as-is, so
+the registry name itself always works.
+
+## Model resolution flow
+
+Every API family is identical here. The handler:
+
+1. Reads the `model` field from the request body (OpenAI / Ollama)
+   or path/body (Anthropic `/v1/messages`).
+2. Calls `erllama_server_config:resolve_model/1`. This is a
+   one-line `maps:get/3` over `model_aliases` with the requested
+   id as the default, so aliases are an alias-or-identity
+   passthrough.
+3. Calls `erllama_server_models:get/1` with the resolved id. If
+   the registry has no manifest under that name, the request
+   fails with `404 model_not_found`, unless `auto_pull = true` in
+   which case the loader pulls it from the default registry first.
+
+Practical consequences:
+
+- Whatever the client sends in `model` reaches the registry,
+  optionally rewritten by `model_aliases`. There is no
+  per-API-family translation table.
+- Tag-less ids resolve to `:latest`. `Qwen/Qwen2.5-7B-Instruct-GGUF`
+  on the wire matches the manifest at
+  `manifests/Qwen:Qwen2.5-7B-Instruct-GGUF/latest.json`.
+- Aliases are hot-reloadable via
+  `erllama_server_config:set_aliases/1` from a shell, no restart
+  needed.

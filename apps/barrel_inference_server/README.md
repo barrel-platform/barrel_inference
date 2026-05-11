@@ -233,6 +233,49 @@ CORS:
 }}
 ```
 
+## Model resolution
+
+The `model` field in every request is run through one shared
+rewrite step before the loader touches it:
+
+```
+client request -> model_aliases lookup -> registry manifest
+   "claude-sonnet-4-5"  ─►  "Qwen/...:main"  ─►  manifests/Qwen:.../main.json
+```
+
+`resolve_model/1` does an alias-or-identity `maps:get/3`, so any
+id missing from `model_aliases` falls through unchanged. The
+result has to exist in the registry (`erllama list`); otherwise
+the request fails with `404 model_not_found` unless
+`auto_pull = true`, in which case the loader pulls it from the
+default Ollama-style registry first.
+
+Three common shapes:
+
+```sh
+# 1) Pass the registry id directly. Works in every SDK.
+curl -sN http://127.0.0.1:8080/v1/chat/completions \
+  -d '{"model":"Qwen/Qwen2.5-7B-Instruct-GGUF:main", ...}'
+
+# 2) Alias an SDK's default id so it Just Works without flags.
+#    In sys.config:
+{model_aliases, #{
+  <<"claude-sonnet-4-5">> => <<"Qwen/Qwen2.5-7B-Instruct-GGUF:main">>,
+  <<"gpt-4o-mini">>       => <<"Qwen/Qwen2.5-7B-Instruct-GGUF:main">>
+}}
+
+# 3) Hot-update aliases from a running shell, no restart needed.
+1> erllama_server_config:set_aliases(
+1>   #{<<"claude-sonnet-4-5">> => <<"Qwen/...:main">>}).
+```
+
+Tag-less ids resolve to `:latest`. The CLI prints the canonical
+form: `erllama list` for what's installed, `erllama show <id>`
+for the resolved manifest.
+
+See [`guides/clients.md`](guides/clients.md#model-resolution-flow)
+for the per-SDK breakdown.
+
 ## Authentication for `pull`
 
 HuggingFace gated repos: set `HF_TOKEN` before starting the server.
