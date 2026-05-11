@@ -181,9 +181,7 @@ apply_chat_template(W) ->
     },
     try erllama:apply_chat_template(model_id(W), Req) of
         {ok, Tokens} ->
-            W1 = put_tokens(W, Tokens),
-            W#work.handler ! {pipeline, templated, Tokens},
-            {ok, W1};
+            check_token_budget(W, Tokens);
         {error, no_template} ->
             {error, 501, no_chat_template};
         {error, not_supported} ->
@@ -201,9 +199,7 @@ apply_chat_template(W) ->
 tokenise_raw(W, Prompt) ->
     try erllama:tokenize(model_id(W), Prompt) of
         {ok, Tokens} ->
-            W1 = put_tokens(W, Tokens),
-            W#work.handler ! {pipeline, templated, Tokens},
-            {ok, W1};
+            check_token_budget(W, Tokens);
         {error, Reason} ->
             {error, 400, Reason}
     catch
@@ -212,6 +208,39 @@ tokenise_raw(W, Prompt) ->
         Class:Why:Stack ->
             log_erllama_crash(model_id(W), tokenize, Class, Why, Stack),
             {error, 500, model_crashed}
+    end.
+
+%% Guard against oversized prompts. llama.cpp segfaults if the input
+%% token count >= n_ctx — the KV cache can't fit the prompt and the
+%% decode dereferences off the end of the slab. We need at least one
+%% token of headroom for generation, so the check is `NToks >= Ctx`.
+%% Generation truncation past max_tokens is handled by the sampler;
+%% it's not a server-side error.
+check_token_budget(W, Tokens) ->
+    NToks = length(Tokens),
+    case context_size(model_id(W)) of
+        undefined ->
+            %% Model went away between load and template; surface
+            %% as 503 rather than risk a NIF segfault on the next call.
+            {error, 503, not_loaded};
+        Ctx when NToks >= Ctx ->
+            {error, 413, #{
+                error => context_overflow,
+                prompt_tokens => NToks,
+                context_size => Ctx
+            }};
+        _Ctx ->
+            W1 = put_tokens(W, Tokens),
+            W#work.handler ! {pipeline, templated, Tokens},
+            {ok, W1}
+    end.
+
+context_size(ModelId) ->
+    try erllama:model_info(ModelId) of
+        #{context_size := N} when is_integer(N), N > 0 -> N;
+        _ -> undefined
+    catch
+        _:_ -> undefined
     end.
 
 step_grammar(W) ->
