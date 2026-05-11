@@ -332,7 +332,6 @@ manifest_to_config(Manifest) ->
     NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
     Ctx = min(default_int(ParamCtx, NativeCtx), MaxCtx),
     NBatch = default_int(maps:get(<<"n_batch">>, Loader, undefined), 512),
-    NGpuLayers = default_int(maps:get(<<"n_gpu_layers">>, Loader, undefined), 0),
     %% erllama_model_llama reads `context_opts` (forwarded to
     %% erllama_nif:new_context/2) and `model_opts` (forwarded to
     %% erllama_nif:load_model/2). Without these the NIF falls back to
@@ -340,6 +339,13 @@ manifest_to_config(Manifest) ->
     %% too small for SDK clients that ship system + tool definitions
     %% in the first turn and causes a hard segfault during prefill
     %% when the input overflows the context.
+    %%
+    %% n_gpu_layers is opt-in: only forward it when the manifest (or
+    %% a Modelfile PARAMETER) sets a positive value. Otherwise we'd
+    %% override llama.cpp's platform default (offload-all on Metal /
+    %% CUDA / ROCm) with the manifest's 0 placeholder and force CPU
+    %% inference, which is slow and breaks the compute-buffer sizing
+    %% for the larger contexts SDK clients send.
     BaseOpts#{
         backend => application:get_env(?APP, model_backend, erllama_model_llama),
         model_path => path_string(maps:get(<<"blob_path">>, Manifest)),
@@ -352,10 +358,42 @@ manifest_to_config(Manifest) ->
             n_ctx => Ctx,
             n_batch => NBatch
         },
-        model_opts => #{
-            n_gpu_layers => NGpuLayers
-        }
+        model_opts => model_opts_from(Loader, Params)
     }.
+
+%% Build the model_opts map. Only set keys the manifest actually
+%% supplies; let llama.cpp pick its own platform-appropriate default
+%% for everything else (in particular, `n_gpu_layers` defaults to
+%% offload-all on GPU builds).
+model_opts_from(Loader, Params) ->
+    Sources = [
+        {n_gpu_layers, <<"n_gpu_layers">>},
+        {main_gpu, <<"main_gpu">>},
+        {use_mmap, <<"use_mmap">>},
+        {use_mlock, <<"use_mlock">>}
+    ],
+    lists:foldl(
+        fun({Atom, BinKey}, Acc) ->
+            case manifest_param(BinKey, Loader, Params) of
+                undefined -> Acc;
+                Value -> Acc#{Atom => Value}
+            end
+        end,
+        #{},
+        Sources
+    ).
+
+%% Modelfile PARAMETER (Params) takes precedence over the manifest's
+%% loader sub-map. n_gpu_layers must be a positive integer to count
+%% as a deliberate override; 0 / null / missing means "let the NIF
+%% pick its platform default".
+manifest_param(Key, Loader, Params) ->
+    case maps:get(Key, Params, maps:get(Key, Loader, undefined)) of
+        undefined -> undefined;
+        null -> undefined;
+        0 when Key =:= <<"n_gpu_layers">> -> undefined;
+        Value -> Value
+    end.
 
 base_opts() ->
     application:get_env(?APP, model_default_opts, #{}).

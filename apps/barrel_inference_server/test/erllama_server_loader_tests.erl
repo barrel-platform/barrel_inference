@@ -73,6 +73,32 @@ manifest_to_config_propagates_loader_overrides_test() ->
     ?assertEqual(256, maps:get(n_batch, maps:get(context_opts, Config))),
     ?assertEqual(33, maps:get(n_gpu_layers, maps:get(model_opts, Config))).
 
+%% Regression for the Metal-offload bug: a manifest with the default
+%% `n_gpu_layers: 0` placeholder must NOT force CPU inference. Drop
+%% the key from model_opts entirely so llama.cpp keeps its own
+%% platform default (offload-all on GPU builds).
+manifest_to_config_drops_zero_n_gpu_layers_test() ->
+    Manifest = (manifest(<<"sha256:0003">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{
+            <<"n_ctx">> => 4096,
+            <<"n_batch">> => 512,
+            <<"n_gpu_layers">> => 0,
+            <<"quant_bits">> => 4
+        }
+    },
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    ModelOpts = maps:get(model_opts, Config),
+    ?assertNot(maps:is_key(n_gpu_layers, ModelOpts)).
+
+%% Modelfile PARAMETER overrides manifest's loader value.
+manifest_to_config_param_overrides_loader_for_n_gpu_layers_test() ->
+    Manifest = (manifest(<<"sha256:0004">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{<<"n_gpu_layers">> => 0, <<"quant_bits">> => 4},
+        <<"parameters">> => #{<<"n_gpu_layers">> => 99}
+    },
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    ?assertEqual(99, maps:get(n_gpu_layers, maps:get(model_opts, Config))).
+
 %% =============================================================================
 %% default_opts/1
 %% =============================================================================

@@ -207,18 +207,19 @@ schema_array(Schema) ->
     Inner = iolist_to_binary([Items, <<" (\",\" ws ">>, Items, <<")*">>]),
     iolist_to_binary([<<"\"[\" ws (">>, Inner, <<")? ws \"]\"">>]).
 
+schema_one_of(Schemas) ->
+    alternation([iolist_to_binary(schema_value(S)) || S <- Schemas]).
+
+schema_enum(Enum) ->
+    alternation([json_value_literal(V) || V <- Enum]).
+
 %% Alternations are emitted inline inside a host rule, so they MUST
 %% be wrapped in `( ... )` — otherwise GBNF's right-associative `|`
 %% extends through any trailing tokens of the host rule (e.g. the
 %% `,` separating object fields and the closing `}`), and llama.cpp
 %% refuses the grammar with "failed to parse grammar".
-schema_one_of(Schemas) ->
-    Rendered = [iolist_to_binary(schema_value(S)) || S <- Schemas],
-    [<<"(">>, join_with(Rendered, [<<" | ">>]), <<")">>].
-
-schema_enum(Enum) ->
-    Lits = [json_value_literal(V) || V <- Enum],
-    [<<"(">>, join_with(Lits, [<<" | ">>]), <<")">>].
+alternation(Branches) ->
+    [<<"(">>, join_with(Branches, [<<" | ">>]), <<")">>].
 
 props(#{<<"properties">> := P}) -> P;
 props(_) -> #{}.
