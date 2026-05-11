@@ -36,6 +36,13 @@
     anthropic_tools_normalise/1,
     anthropic_tool_choice_any_maps_required/1,
     anthropic_thinking_enabled/1,
+    anthropic_content_string_passthrough/1,
+    anthropic_content_blocks_flatten/1,
+    anthropic_content_blocks_multiple_join/1,
+    anthropic_content_blocks_drop_non_text/1,
+    anthropic_content_blocks_tool_result/1,
+    anthropic_content_blocks_empty/1,
+    openai_content_blocks_flatten/1,
     %% response shapes
     openai_chat_response_shape/1,
     openai_chat_streaming_chunk_shape/1,
@@ -81,6 +88,13 @@ all() ->
         anthropic_tools_normalise,
         anthropic_tool_choice_any_maps_required,
         anthropic_thinking_enabled,
+        anthropic_content_string_passthrough,
+        anthropic_content_blocks_flatten,
+        anthropic_content_blocks_multiple_join,
+        anthropic_content_blocks_drop_non_text,
+        anthropic_content_blocks_tool_result,
+        anthropic_content_blocks_empty,
+        openai_content_blocks_flatten,
         %% responses out
         openai_chat_response_shape,
         openai_chat_streaming_chunk_shape,
@@ -356,6 +370,173 @@ anthropic_thinking_enabled(_Cfg) ->
     },
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
     ?assertEqual(enabled, R#erllama_request.thinking).
+
+%% Bare-string content is the simple Anthropic shape; must survive
+%% the flattening helper unchanged so OpenAI Python / curl examples
+%% keep working.
+anthropic_content_string_passthrough(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"hi">>}],
+        R#erllama_request.messages
+    ).
+
+%% Single Anthropic content block. Claude Code sends this on every
+%% turn; before the fix this crashed nif_apply_chat_template/2 with
+%% badarg because the NIF only handles binary content.
+anthropic_content_blocks_flatten(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"hello">>}
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"hello">>}],
+        R#erllama_request.messages
+    ).
+
+anthropic_content_blocks_multiple_join(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"part1">>},
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"part2">>}
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"part1 part2">>}],
+        R#erllama_request.messages
+    ).
+
+%% Image / unknown blocks drop out; the text block is retained.
+%% Multimodal isn't wired through to the NIF yet, so dropping is the
+%% right default rather than passing structured maps the template
+%% engine can't render.
+anthropic_content_blocks_drop_non_text(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{
+                        <<"type">> => <<"image">>,
+                        <<"source">> => #{
+                            <<"type">> => <<"base64">>,
+                            <<"media_type">> => <<"image/png">>,
+                            <<"data">> => <<"...">>
+                        }
+                    },
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"describe">>}
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"describe">>}],
+        R#erllama_request.messages
+    ).
+
+%% tool_result is a wrapping block whose `content` is itself either
+%% a binary or a nested block list. Both shapes flatten to plain text
+%% so the assistant turn can be rendered by the template.
+anthropic_content_blocks_tool_result(_Cfg) ->
+    BodyA = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{
+                        <<"type">> => <<"tool_result">>,
+                        <<"tool_use_id">> => <<"tool-1">>,
+                        <<"content">> => <<"ok">>
+                    }
+                ]
+            }
+        ]
+    },
+    {ok, RA} = erllama_server_translate:anthropic_messages_to_internal(BodyA),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"ok">>}],
+        RA#erllama_request.messages
+    ),
+    BodyB = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{
+                        <<"type">> => <<"tool_result">>,
+                        <<"tool_use_id">> => <<"tool-1">>,
+                        <<"content">> => [
+                            #{<<"type">> => <<"text">>, <<"text">> => <<"ok">>}
+                        ]
+                    }
+                ]
+            }
+        ]
+    },
+    {ok, RB} = erllama_server_translate:anthropic_messages_to_internal(BodyB),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"ok">>}],
+        RB#erllama_request.messages
+    ).
+
+anthropic_content_blocks_empty(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => []}
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<>>}],
+        R#erllama_request.messages
+    ).
+
+%% The same translator path serves OpenAI multimodal content. Confirm
+%% the helper flattens that too so /v1/chat/completions with typed
+%% blocks does not hit the same NIF crash.
+openai_content_blocks_flatten(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"m">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"x">>}
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:openai_chat_to_internal(Body),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"x">>}],
+        R#erllama_request.messages
+    ).
 
 %%====================================================================
 %% Response shapes

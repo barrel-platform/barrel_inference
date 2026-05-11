@@ -902,22 +902,36 @@ split_system(Messages) ->
 normalise_message(M = #{<<"role">> := Role}) ->
     #{role => Role, content => content_value(maps:get(<<"content">>, M, <<>>))}.
 
+%% Anthropic + OpenAI both accept content as either a plain string or
+%% a list of typed blocks (text / image / tool_use / tool_result /
+%% thinking). The underlying chat-template NIF only knows how to
+%% render a binary, so we flatten blocks to a single text string on
+%% the way in. Non-text blocks (images, tool envelopes) are dropped;
+%% the surrounding tool-call grammar handles the structured paths.
 content_value(B) when is_binary(B) -> B;
-content_value(L) when is_list(L) -> L;
+content_value(L) when is_list(L) -> flatten_content_blocks(L);
 content_value(_) -> <<>>.
+
+flatten_content_blocks(L) ->
+    iolist_to_binary(
+        lists:join(<<" ">>, [block_text(B) || B <- L, block_text(B) =/= <<>>])
+    ).
+
+block_text(#{<<"type">> := <<"text">>, <<"text">> := T}) when is_binary(T) -> T;
+block_text(#{<<"text">> := T}) when is_binary(T) -> T;
+block_text(#{<<"type">> := <<"tool_result">>, <<"content">> := C}) -> tool_result_text(C);
+block_text(B) when is_binary(B) -> B;
+block_text(_) -> <<>>.
+
+tool_result_text(B) when is_binary(B) -> B;
+tool_result_text(L) when is_list(L) -> flatten_content_blocks(L);
+tool_result_text(_) -> <<>>.
 
 content_to_text(M) ->
     case maps:get(<<"content">>, M, <<>>) of
         B when is_binary(B) -> B;
-        L when is_list(L) ->
-            iolist_to_binary(
-                lists:join(
-                    <<" ">>,
-                    [T || #{<<"type">> := <<"text">>, <<"text">> := T} <- L]
-                )
-            );
-        _ ->
-            <<>>
+        L when is_list(L) -> flatten_content_blocks(L);
+        _ -> <<>>
     end.
 
 binary_join([], _Sep) -> <<>>;
