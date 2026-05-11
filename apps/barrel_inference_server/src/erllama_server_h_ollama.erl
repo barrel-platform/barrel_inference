@@ -228,13 +228,21 @@ info({pipeline, templated, _}, Req, S) ->
 info({pipeline, queued}, Req, S) ->
     {ok, Req, S#st{phase = waiting_admit}, hibernate};
 info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
-    S1 = S0#st{ref = Ref, slot = Slot, phase = running},
-    case S1#st.stream of
+    %% learn_ref/3 may have arrived ahead of us via a token message;
+    %% in that case phase/ref are already set and we just attach the
+    %% queue slot. Otherwise this is the canonical admit point.
+    S1 =
+        case S0#st.ref of
+            undefined -> S0#st{phase = running, ref = Ref};
+            _ -> S0
+        end,
+    S2 = S1#st{slot = Slot},
+    case S2#st.stream of
         true ->
-            {Req1, S2} = ensure_stream(Req0, S1),
-            {ok, Req1, S2, hibernate};
+            {Req1, S3} = ensure_stream(Req0, S2),
+            {ok, Req1, S3, hibernate};
         false ->
-            {ok, Req0, S1, hibernate}
+            {ok, Req0, S2, hibernate}
     end;
 info({pipeline, error, Status, Reason}, Req0, S = #st{stream_started = true}) ->
     ndjson_line(Req0, json:encode(error_body(Reason))),
@@ -243,15 +251,28 @@ info({pipeline, error, Status, Reason}, Req0, S = #st{stream_started = true}) ->
 info({pipeline, error, Status, Reason}, Req0, S) ->
     Req1 = cowboy_req:reply(Status, json_headers(), json:encode(error_body(Reason)), Req0),
     {stop, Req1, S};
-info({erllama_token, Ref, Tok}, Req0, S = #st{ref = Ref}) ->
-    handle_token(Tok, Req0, S);
-info({erllama_reasoning_token, _Ref, _Tok}, Req, S) ->
+%% Token / done / error messages may arrive BEFORE
+%% {pipeline, admitted, ...} because the pipeline worker calls
+%% erllama:infer/4 (which immediately starts decoding) and *then*
+%% sends `admitted` to the handler. Because the handler is
+%% per-request, any erllama_* message in our mailbox is necessarily
+%% ours; learn the Ref on first sight via learn_ref/3 instead of
+%% guarding on `S#st{ref = Ref}` (which would drop early tokens).
+info({erllama_token, Ref, Tok}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    handle_token(Tok, Req, S);
+info({erllama_reasoning_token, Ref, _Tok}, Req0, S0) ->
     %% Ollama doesn't surface reasoning tokens separately; drop.
+    %% Still learn Ref so a subsequent done/error isn't lost if
+    %% reasoning happens to arrive first.
+    {S, Req} = learn_ref(S0, Req0, Ref),
     {ok, Req, S, hibernate};
-info({erllama_done, Ref, Stats}, Req0, S = #st{ref = Ref}) ->
-    finish_ok(Req0, S, Stats);
-info({erllama_error, Ref, Reason}, Req0, S = #st{ref = Ref}) ->
-    finish_err(Req0, S, Reason);
+info({erllama_done, Ref, Stats}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    finish_ok(Req, S, Stats);
+info({erllama_error, Ref, Reason}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    finish_err(Req, S, Reason);
 info({'DOWN', Mon, process, _Pid, _Reason}, Req, S = #st{worker_mon = Mon}) ->
     %% Pipeline worker exited after admit; ignore.
     {ok, Req, S#st{worker = undefined, worker_mon = undefined}, hibernate};
@@ -367,6 +388,20 @@ ensure_stream(Req, S = #st{stream_started = true}) ->
 ensure_stream(Req0, S) ->
     Req1 = cowboy_req:stream_reply(200, ndjson_headers(), Req0),
     {Req1, S#st{stream_started = true}}.
+
+%% Record the inference Ref on first sight. The pipeline worker
+%% sends `admitted` *after* starting `erllama:infer/4`, so token /
+%% done / error messages can land before `admitted` and would
+%% otherwise be silently dropped by the catch-all clause. For
+%% streaming requests also open the NDJSON stream here so the first
+%% chunk can flush immediately. Idempotent when admit arrived first.
+learn_ref(S = #st{ref = undefined, stream = true}, Req0, Ref) ->
+    {Req1, S1} = ensure_stream(Req0, S),
+    {S1#st{phase = running, ref = Ref}, Req1};
+learn_ref(S = #st{ref = undefined}, Req0, Ref) ->
+    {S#st{phase = running, ref = Ref}, Req0};
+learn_ref(S, Req, _Ref) ->
+    {S, Req}.
 
 ndjson_line(Req, Body) ->
     cowboy_req:stream_body([Body, <<"\n">>], nofin, Req),
