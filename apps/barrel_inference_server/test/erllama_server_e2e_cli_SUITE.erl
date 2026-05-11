@@ -21,6 +21,7 @@
     api_chat_streams_against_stub/1,
     api_generate_empty_prompt_preloads/1,
     api_chat_keep_alive_zero_unloads/1,
+    api_chat_after_unload_reloads_cleanly/1,
     api_embed_returns_vectors/1,
     api_embeddings_legacy_returns_embedding/1
 ]).
@@ -39,6 +40,7 @@ all() ->
         api_chat_streams_against_stub,
         api_generate_empty_prompt_preloads,
         api_chat_keep_alive_zero_unloads,
+        api_chat_after_unload_reloads_cleanly,
         api_embed_returns_vectors,
         api_embeddings_legacy_returns_embedding
     ].
@@ -243,6 +245,38 @@ api_chat_keep_alive_zero_unloads(Cfg) ->
     Resp = json:decode(list_to_binary(Raw)),
     ?assertEqual(true, maps:get(<<"done">>, Resp)),
     ?assertEqual(<<"unload">>, maps:get(<<"done_reason">>, Resp)).
+
+%% Regression for the stale-loader bug. Load the model, unload it via
+%% keep_alive: 0, then issue a real chat. Before the loader monitored
+%% the underlying gen_statem the next request would crash with
+%% {noproc, {erllama_model, not_found, _}} because the loader was
+%% latched on `loaded`. After the fix, the loader has exited and the
+%% next ensure_loaded creates a fresh loader that re-runs load_model.
+api_chat_after_unload_reloads_cleanly(Cfg) ->
+    {ok, _} = pull_for(<<"reload-1">>, <<"latest">>, Cfg),
+    %% First: load + unload synchronously via keep_alive: 0.
+    Unload = json:encode(#{
+        <<"model">> => <<"reload-1:latest">>,
+        <<"messages">> => [],
+        <<"keep_alive">> => 0,
+        <<"stream">> => false
+    }),
+    {ok, {{_, 200, _}, _, _}} = post_json(Cfg, "/api/chat", Unload),
+    %% Give the loader's model monitor a tick to fire and exit.
+    timer:sleep(50),
+    %% Then: real chat. Must NOT 500 with model_crashed / noproc.
+    Chat = json:encode(#{
+        <<"model">> => <<"reload-1:latest">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}
+        ],
+        <<"keep_alive">> => 300000,
+        <<"stream">> => false
+    }),
+    {ok, {{_, Status, _}, _, Raw}} = post_json(Cfg, "/api/chat", Chat),
+    ?assertEqual(200, Status),
+    Resp = json:decode(list_to_binary(Raw)),
+    ?assertEqual(true, maps:get(<<"done">>, Resp)).
 
 %%====================================================================
 %% Helpers

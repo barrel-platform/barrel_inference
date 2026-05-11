@@ -191,6 +191,8 @@ apply_chat_template(W) ->
         {error, Reason} ->
             {error, 400, Reason}
     catch
+        exit:{noproc, {erllama_model, not_found, _}} ->
+            {error, 503, not_loaded};
         Class:Why:Stack ->
             log_erllama_crash(model_id(W), apply_chat_template, Class, Why, Stack),
             {error, 500, model_crashed}
@@ -205,6 +207,8 @@ tokenise_raw(W, Prompt) ->
         {error, Reason} ->
             {error, 400, Reason}
     catch
+        exit:{noproc, {erllama_model, not_found, _}} ->
+            {error, 503, not_loaded};
         Class:Why:Stack ->
             log_erllama_crash(model_id(W), tokenize, Class, Why, Stack),
             {error, 500, model_crashed}
@@ -262,6 +266,8 @@ step_infer(W) ->
         {error, Reason} ->
             {error, 500, Reason}
     catch
+        exit:{noproc, {erllama_model, not_found, _}} ->
+            {error, 503, not_loaded};
         Class:Why:Stack ->
             log_erllama_crash(model_id(W), infer, Class, Why, Stack),
             {error, 500, model_crashed}

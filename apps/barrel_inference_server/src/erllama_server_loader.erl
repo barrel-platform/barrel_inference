@@ -44,7 +44,14 @@
     subscribers :: [pid()],
     tick_timer :: undefined | reference(),
     worker :: undefined | {pid(), reference()},
-    load_started_at :: undefined | integer()
+    load_started_at :: undefined | integer(),
+    %% Monitor on the underlying erllama_model gen_statem once it is
+    %% registered. The loader exits when this fires so the config
+    %% server's 'DOWN' handler removes its entry from `state.loaders`
+    %% and the next ensure_loaded creates a fresh loader. Without
+    %% this the loader latches `loaded` even after the keep_alive
+    %% subsystem (or a manual unload) tears the gen_statem down.
+    model_mon :: undefined | reference()
 }).
 
 %%====================================================================
@@ -83,7 +90,8 @@ init([ModelId]) ->
         subscribers = [],
         tick_timer = undefined,
         worker = undefined,
-        load_started_at = undefined
+        load_started_at = undefined,
+        model_mon = undefined
     }}.
 
 handle_call(_, _, S) -> {reply, {error, unknown_call}, S}.
@@ -102,17 +110,29 @@ handle_cast({await, From, Deadline}, S = #state{state = loading, awaiters = A}) 
             ),
             {noreply, S#state{awaiters = [{From, Deadline} | A]}}
     end;
-handle_cast({await, From, _Deadline}, S = #state{state = loaded}) ->
-    gen_server:reply(From, ok),
-    {noreply, S};
+handle_cast({await, From, _Deadline}, S = #state{state = loaded, model_id = Id}) ->
+    case model_alive(Id) of
+        true ->
+            gen_server:reply(From, ok),
+            {noreply, S};
+        false ->
+            gen_server:reply(From, {error, not_loaded}),
+            {stop, normal, S}
+    end;
 handle_cast({await, From, _Deadline}, S = #state{state = {failed, Reason}}) ->
     gen_server:reply(From, {error, Reason}),
     {noreply, S};
 handle_cast({subscribe, Pid}, S = #state{state = loading, subscribers = Subs}) ->
     {noreply, S#state{subscribers = lists:usort([Pid | Subs])}};
 handle_cast({subscribe, Pid}, S = #state{state = loaded, model_id = Id}) ->
-    Pid ! {erllama_load_done, Id, ok},
-    {noreply, S};
+    case model_alive(Id) of
+        true ->
+            Pid ! {erllama_load_done, Id, ok},
+            {noreply, S};
+        false ->
+            Pid ! {erllama_load_done, Id, {error, not_loaded}},
+            {stop, normal, S}
+    end;
 handle_cast({subscribe, Pid}, S = #state{state = {failed, Reason}, model_id = Id}) ->
     Pid ! {erllama_load_done, Id, {error, Reason}},
     {noreply, S};
@@ -151,6 +171,8 @@ handle_info({'DOWN', Mon, process, Pid, Reason}, S = #state{state = loading}) ->
         _ ->
             {noreply, S}
     end;
+handle_info({'DOWN', Mon, process, _, _Reason}, S = #state{model_mon = Mon}) ->
+    {stop, normal, S};
 handle_info({expire_awaiter, From}, S = #state{state = loading, awaiters = A}) ->
     case lists:keytake(From, 1, A) of
         {value, {From, _}, A1} ->
@@ -178,8 +200,22 @@ spawn_load_worker(LoaderPid, ModelId, Opts) ->
 
 load_with_opts(ModelId, Opts) ->
     try erllama:load_model(ModelId, Opts) of
-        {ok, _ModelRef} -> ok;
-        {error, Reason} -> {error, Reason}
+        {ok, _ModelRef} ->
+            ok;
+        {error, already_loaded} ->
+            %% Race: the previous gen_statem died but the registry
+            %% gen_server has not yet processed the 'DOWN' that
+            %% removes the ETS row, so register_name/2 fell through.
+            %% Clear the stale entry and retry once.
+            _ = erllama_registry:unregister_name(ModelId),
+            try erllama:load_model(ModelId, Opts) of
+                {ok, _} -> ok;
+                {error, R} -> {error, R}
+            catch
+                C:W:_ -> {error, {C, W}}
+            end;
+        {error, Reason} ->
+            {error, Reason}
     catch
         Class:Why:_Stack -> {error, {Class, Why}}
     end.
@@ -200,14 +236,42 @@ finalize(S = #state{model_id = Id, awaiters = A, subscribers = Subs, worker = W}
             ok -> loaded;
             {error, R} -> {failed, R}
         end,
-    S1 = cancel_worker(W, S),
-    {noreply,
-        cancel_tick(S1#state{
-            state = NextState,
-            awaiters = [],
-            subscribers = [],
-            load_started_at = undefined
-        })}.
+    S1 = cancel_tick(cancel_worker(W, S)),
+    S2 = S1#state{
+        state = NextState,
+        awaiters = [],
+        subscribers = [],
+        load_started_at = undefined
+    },
+    case NextState of
+        loaded -> attach_model_monitor(S2);
+        _ -> {noreply, S2}
+    end.
+
+%% After a successful load, monitor the gen_statem the load just
+%% registered. When it goes away (keep_alive timer fires, manual
+%% unload, crash) we exit so the config server's 'DOWN' handler
+%% drops our stale entry and the next ensure_loaded creates a fresh
+%% loader. Without this, the loaded-state cache replies `ok` to new
+%% callers and the pipeline crashes on the next gen_statem:call
+%% with {noproc, {erllama_model, not_found, _}}.
+attach_model_monitor(S = #state{model_id = Id}) ->
+    case erllama_registry:whereis_name(Id) of
+        Pid when is_pid(Pid) ->
+            Mon = erlang:monitor(process, Pid),
+            {noreply, S#state{model_mon = Mon}};
+        undefined ->
+            {stop, normal, S}
+    end.
+
+%% Cheap registry probe used by the loaded-state cast handlers to
+%% catch a model that's already been torn down between finalize and
+%% the next subscribe.
+model_alive(Id) ->
+    case erllama_registry:whereis_name(Id) of
+        Pid when is_pid(Pid) -> is_process_alive(Pid);
+        _ -> false
+    end.
 
 cancel_worker(undefined, S) ->
     S#state{worker = undefined};

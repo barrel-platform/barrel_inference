@@ -149,9 +149,9 @@ embed_each(Real, Inputs) ->
 embed_each(_Real, [], Vectors, PromptTokens) ->
     {ok, lists:reverse(Vectors), PromptTokens};
 embed_each(Real, [Text | Rest], Vectors, PromptTokens) ->
-    case erllama:tokenize(Real, Text) of
+    case call_model(fun() -> erllama:tokenize(Real, Text) end) of
         {ok, Tokens} ->
-            case erllama:embed(Real, Tokens) of
+            case call_model(fun() -> erllama:embed(Real, Tokens) end) of
                 {ok, Vec} ->
                     embed_each(
                         Real,
@@ -166,8 +166,23 @@ embed_each(Real, [Text | Rest], Vectors, PromptTokens) ->
             E
     end.
 
+%% Wrap erllama gen_statem calls so an evicted/crashed model surfaces
+%% as a clean {error, not_loaded} instead of exiting the cowboy
+%% request process. Without this the noproc exit from
+%% erllama_model:via/1 escapes the handler and Ranch reports a
+%% torn stream.
+call_model(F) ->
+    try F() of
+        Result -> Result
+    catch
+        exit:{noproc, {erllama_model, not_found, _}} -> {error, not_loaded};
+        exit:{noproc, _} -> {error, not_loaded};
+        Class:Why -> {error, {Class, Why}}
+    end.
+
 embed_status({error, not_supported}) -> 501;
 embed_status(not_supported) -> 501;
+embed_status({error, not_loaded}) -> 503;
 embed_status(_) -> 500.
 
 %%====================================================================
