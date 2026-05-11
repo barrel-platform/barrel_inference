@@ -44,6 +44,35 @@ manifest_to_config_fingerprint_padding_test() ->
     Config = erllama_server_loader:manifest_to_config(Manifest),
     ?assertEqual(32, byte_size(maps:get(fingerprint, Config))).
 
+%% erllama_model_llama reads context_opts/model_opts and forwards them
+%% to the NIF. Without n_ctx wired through, llama.cpp falls back to
+%% 512 and segfaults on any input larger than that. Regression for
+%% the segfault hit while pointing Claude Code at the daemon.
+manifest_to_config_passes_n_ctx_to_context_opts_test() ->
+    application:set_env(erllama_server, max_context_size, 4096),
+    Manifest = manifest(<<"sha256:0001">>, <<"q4_k_m">>, 8192, 4),
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    %% Capped at max_context_size.
+    ?assertEqual(4096, maps:get(n_ctx, CtxOpts)),
+    %% n_batch falls through from the manifest's loader.n_batch when
+    %% set; defaults to 512 otherwise.
+    ?assert(is_integer(maps:get(n_batch, CtxOpts))).
+
+manifest_to_config_propagates_loader_overrides_test() ->
+    application:set_env(erllama_server, max_context_size, 8192),
+    Manifest = (manifest(<<"sha256:0002">>, <<"q4_k_m">>, 8192, 4))#{
+        <<"loader">> => #{
+            <<"n_ctx">> => 8192,
+            <<"n_batch">> => 256,
+            <<"n_gpu_layers">> => 33,
+            <<"quant_bits">> => 4
+        }
+    },
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    ?assertEqual(256, maps:get(n_batch, maps:get(context_opts, Config))),
+    ?assertEqual(33, maps:get(n_gpu_layers, maps:get(model_opts, Config))).
+
 %% =============================================================================
 %% default_opts/1
 %% =============================================================================

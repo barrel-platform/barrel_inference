@@ -331,6 +331,15 @@ manifest_to_config(Manifest) ->
     ParamCtx = maps:get(<<"num_ctx">>, Params, undefined),
     NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
     Ctx = min(default_int(ParamCtx, NativeCtx), MaxCtx),
+    NBatch = default_int(maps:get(<<"n_batch">>, Loader, undefined), 512),
+    NGpuLayers = default_int(maps:get(<<"n_gpu_layers">>, Loader, undefined), 0),
+    %% erllama_model_llama reads `context_opts` (forwarded to
+    %% erllama_nif:new_context/2) and `model_opts` (forwarded to
+    %% erllama_nif:load_model/2). Without these the NIF falls back to
+    %% llama.cpp's defaults — most importantly n_ctx=512, which is far
+    %% too small for SDK clients that ship system + tool definitions
+    %% in the first turn and causes a hard segfault during prefill
+    %% when the input overflows the context.
     BaseOpts#{
         backend => application:get_env(?APP, model_backend, erllama_model_llama),
         model_path => path_string(maps:get(<<"blob_path">>, Manifest)),
@@ -338,7 +347,14 @@ manifest_to_config(Manifest) ->
         fingerprint_mode => application:get_env(?APP, fingerprint_mode, safe),
         quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
         quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
-        context_size => Ctx
+        context_size => Ctx,
+        context_opts => #{
+            n_ctx => Ctx,
+            n_batch => NBatch
+        },
+        model_opts => #{
+            n_gpu_layers => NGpuLayers
+        }
     }.
 
 base_opts() ->
