@@ -1,0 +1,893 @@
+openapi: 3.1.0
+info:
+  title: erllama_server
+  description: |
+    OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of
+    `erllama`. Drop-in for clients that already speak the OpenAI Python
+    SDK, the Anthropic SDK, the Ollama HTTP API, or LangChain /
+    LiteLLM connectors that point at any of the above. Runs locally
+    against any GGUF model `llama.cpp` can load.
+
+    Three families of endpoints live side by side:
+
+    - `/v1/*`  OpenAI (chat, completions, embeddings, models) + Anthropic (messages)
+    - `/api/*` Ollama (generate, chat, embed, pull, tags, show, ps, version, ...)
+    - top-level: `/health`, `/health/ready`, `/metrics`
+  version: "0.1.0"
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  contact:
+    name: erllama_server
+    url: https://github.com/benoitc/erllama_server
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development daemon
+  - url: http://{host}:{port}
+    description: Custom host
+    variables:
+      host:
+        default: 127.0.0.1
+      port:
+        default: "8080"
+
+tags:
+  - name: openai
+    description: OpenAI-compatible endpoints under /v1
+  - name: anthropic
+    description: Anthropic-compatible /v1/messages
+  - name: ollama-inference
+    description: Ollama-compatible generate / chat / embed
+  - name: ollama-registry
+    description: Ollama-compatible model management
+  - name: health
+    description: Liveness, readiness, metrics
+
+paths:
+  # =============================================================================
+  # OpenAI
+  # =============================================================================
+  /v1/chat/completions:
+    post:
+      tags: [openai]
+      summary: OpenAI chat completion (streaming + non-streaming)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenAIChatRequest'
+      responses:
+        '200':
+          description: |
+            Non-streaming: a single `chat.completion` object.
+            Streaming (`stream=true`): `text/event-stream` carrying
+            `chat.completion.chunk` frames terminated by `data: [DONE]`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIChatResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE stream of chat.completion.chunk frames
+        '400':
+          $ref: '#/components/responses/OpenAIError400'
+        '404':
+          $ref: '#/components/responses/OpenAIError404'
+        '429':
+          $ref: '#/components/responses/OpenAIError429'
+
+  /v1/completions:
+    post:
+      tags: [openai]
+      summary: OpenAI legacy text completion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, prompt]
+              properties:
+                model: {type: string}
+                prompt: {type: string}
+                max_tokens: {type: integer, default: 1024}
+                temperature: {type: number, default: 1.0}
+                top_p: {type: number, default: 1.0}
+                stream: {type: boolean, default: false}
+                response_format:
+                  $ref: '#/components/schemas/ResponseFormat'
+      responses:
+        '200': {description: completion response}
+        '400': {$ref: '#/components/responses/OpenAIError400'}
+
+  /v1/embeddings:
+    post:
+      tags: [openai]
+      summary: OpenAI embeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              properties:
+                model: {type: string}
+                input:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: {type: string}
+      responses:
+        '200':
+          description: OpenAI embeddings response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: {type: string, enum: [list]}
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        object: {type: string, enum: [embedding]}
+                        embedding: {type: array, items: {type: number}}
+                        index: {type: integer}
+                  model: {type: string}
+                  usage:
+                    type: object
+                    properties:
+                      prompt_tokens: {type: integer}
+                      total_tokens: {type: integer}
+
+  /v1/models:
+    get:
+      tags: [openai]
+      summary: List models (loaded + aliases)
+      responses:
+        '200':
+          description: OpenAI-style model list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: {type: string, enum: [list]}
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OpenAIModel'
+
+  /v1/models/{model_id}:
+    get:
+      tags: [openai]
+      summary: Get one model
+      parameters:
+        - name: model_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIModel'
+        '404':
+          $ref: '#/components/responses/OpenAIError404'
+
+  # =============================================================================
+  # Anthropic
+  # =============================================================================
+  /v1/messages:
+    post:
+      tags: [anthropic]
+      summary: Anthropic Messages API (named SSE events on stream=true)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, messages, max_tokens]
+              properties:
+                model: {type: string}
+                max_tokens: {type: integer}
+                messages:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/AnthropicMessage'
+                system:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items:
+                        type: object
+                tools:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/AnthropicTool'
+                tool_choice:
+                  type: object
+                stream: {type: boolean, default: false}
+                temperature: {type: number}
+                thinking:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [enabled, disabled]
+                    budget_tokens: {type: integer}
+      responses:
+        '200':
+          description: |
+            Non-streaming: a `message` object.
+            Streaming: SSE named events `message_start`,
+            `content_block_start`, `content_block_delta`,
+            `content_block_stop`, `message_delta`, `message_stop`.
+
+  # =============================================================================
+  # Ollama: inference
+  # =============================================================================
+  /api/generate:
+    post:
+      tags: [ollama-inference]
+      summary: Ollama generate (streaming NDJSON)
+      description: |
+        Empty `prompt` returns `{"done": true, "done_reason": "load"}`
+        after loading the model. `keep_alive: 0` unloads after the
+        request; `keep_alive: -1` keeps the model loaded forever.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OllamaGenerateRequest'
+      responses:
+        '200':
+          description: |
+            Streaming (default): one JSON object per line
+            (Content-Type: application/x-ndjson).
+            Non-streaming: a single JSON object with timing fields.
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/OllamaGenerateStreamChunk'
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OllamaGenerateResponse'
+
+  /api/chat:
+    post:
+      tags: [ollama-inference]
+      summary: Ollama chat (streaming NDJSON)
+      description: |
+        Empty `messages[]` returns `{"done": true, "done_reason": "load"}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OllamaChatRequest'
+      responses:
+        '200':
+          description: Streaming NDJSON or single JSON object
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/OllamaChatStreamChunk'
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OllamaChatResponse'
+
+  /api/embed:
+    post:
+      tags: [ollama-inference]
+      summary: Ollama embeddings (multi-input)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              properties:
+                model: {type: string}
+                input:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: {type: string}
+                truncate: {type: boolean, default: true}
+                keep_alive:
+                  $ref: '#/components/schemas/KeepAlive'
+                options:
+                  type: object
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  model: {type: string}
+                  embeddings:
+                    type: array
+                    items:
+                      type: array
+                      items: {type: number}
+                  total_duration: {type: integer, description: nanoseconds}
+                  load_duration:  {type: integer, description: nanoseconds}
+                  prompt_eval_count: {type: integer}
+
+  /api/embeddings:
+    post:
+      tags: [ollama-inference]
+      summary: Ollama legacy single-prompt embedding
+      deprecated: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, prompt]
+              properties:
+                model: {type: string}
+                prompt: {type: string}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  embedding: {type: array, items: {type: number}}
+
+  # =============================================================================
+  # Ollama: registry
+  # =============================================================================
+  /api/pull:
+    post:
+      tags: [ollama-registry]
+      summary: Pull a model into the registry (NDJSON progress)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: |
+                    Short Ollama name (`llama3`), full Ollama spec
+                    (`ollama://library/llama3:8b`), HuggingFace
+                    (`hf://Qwen/Qwen2.5-7B-Instruct-GGUF`), HTTPS,
+                    or `file://`.
+                tag: {type: string, description: "Optional tag override"}
+                stream: {type: boolean, default: true}
+                insecure: {type: boolean, default: false}
+      responses:
+        '200':
+          description: |
+            NDJSON status events: `pulling manifest` -> `pulling sha256:...`
+            (with progress) -> `verifying sha256 digest` -> `writing
+            manifest` -> `success`.
+          content:
+            application/x-ndjson:
+              schema:
+                type: object
+                properties:
+                  status: {type: string}
+                  digest: {type: string}
+                  total: {type: integer}
+                  completed: {type: integer}
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [success]}
+
+  /api/tags:
+    get:
+      tags: [ollama-registry]
+      summary: List registered models
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RegistryEntry'
+
+  /api/show:
+    post:
+      tags: [ollama-registry]
+      summary: Show a model's manifest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  modelfile: {type: string}
+                  parameters: {type: string}
+                  template: {type: string, nullable: true}
+                  details:
+                    $ref: '#/components/schemas/ModelDetails'
+                  model_info:
+                    type: object
+
+  /api/delete:
+    delete:
+      tags: [ollama-registry]
+      summary: Remove a manifest (blob preserved)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string}
+      responses:
+        '200': {description: removed}
+        '404': {description: model_not_found}
+
+  /api/copy:
+    post:
+      tags: [ollama-registry]
+      summary: Alias a manifest under a new name:tag
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, destination]
+              properties:
+                source: {type: string}
+                destination: {type: string}
+      responses:
+        '200': {description: copied}
+        '404': {description: model_not_found}
+
+  /api/create:
+    post:
+      tags: [ollama-registry]
+      summary: Create from a Modelfile (FROM + PARAMETER + SYSTEM + TEMPLATE)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, modelfile]
+              properties:
+                name: {type: string}
+                modelfile:
+                  type: string
+                  description: |
+                    Modelfile directives supported in v0.1:
+                    `FROM <spec>`, `PARAMETER <key> <value>`,
+                    `SYSTEM "<text>"`, `TEMPLATE "<text>"`.
+                    `ADAPTER`, `MESSAGE`, `LICENSE` return 400.
+      responses:
+        '200': {description: created}
+        '400':
+          description: bad_request / unsupported_directive
+
+  /api/search:
+    post:
+      tags: [ollama-registry]
+      summary: Search HuggingFace + Ollama registries
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: {type: string}
+                limit: {type: integer, default: 20}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hits:
+                    type: array
+                    items:
+                      type: object
+
+  /api/ps:
+    get:
+      tags: [ollama-registry]
+      summary: List currently-loaded (in-memory) models
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: {type: string}
+                        model: {type: string}
+                        size: {type: integer}
+                        digest: {type: string, nullable: true}
+                        details:
+                          $ref: '#/components/schemas/ModelDetails'
+                        expires_at: {type: string, nullable: true}
+                        size_vram: {type: integer}
+
+  /api/version:
+    get:
+      tags: [ollama-registry]
+      summary: Server version
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: {type: string}
+
+  # =============================================================================
+  # Health + observability
+  # =============================================================================
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [ok]}
+
+  /health/ready:
+    get:
+      tags: [health]
+      summary: Readiness (does the listener accept + are aliases set)
+      responses:
+        '200': {description: ready}
+        '503': {description: not_ready}
+
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus text-format metrics
+      responses:
+        '200':
+          content:
+            text/plain:
+              schema: {type: string}
+
+# =============================================================================
+# Schemas
+# =============================================================================
+components:
+  schemas:
+    KeepAlive:
+      description: |
+        Number (seconds), duration string (`"5m"`, `"1h"`, `"30s"`),
+        `0` to unload immediately, or `-1` to never unload.
+      oneOf:
+        - type: integer
+        - type: string
+
+    ResponseFormat:
+      oneOf:
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [text]
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [json_object]
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [json_schema]
+            json_schema:
+              type: object
+              properties:
+                name: {type: string}
+                schema: {type: object}
+                strict: {type: boolean}
+
+    OpenAIChatRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: {type: string}
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenAIMessage'
+        max_tokens: {type: integer, default: 1024}
+        temperature: {type: number, default: 1.0}
+        top_p: {type: number, default: 1.0}
+        top_k: {type: integer, default: 40}
+        stream: {type: boolean, default: false}
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items: {type: string}
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenAITool'
+        tool_choice:
+          oneOf:
+            - type: string
+              enum: [auto, none, required]
+            - type: object
+        response_format:
+          $ref: '#/components/schemas/ResponseFormat'
+
+    OpenAIMessage:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items: {type: object}
+
+    OpenAITool:
+      type: object
+      properties:
+        type: {type: string, enum: [function]}
+        function:
+          type: object
+          properties:
+            name: {type: string}
+            description: {type: string}
+            parameters: {type: object}
+
+    OpenAIChatResponse:
+      type: object
+      properties:
+        id: {type: string}
+        object: {type: string, enum: [chat.completion]}
+        created: {type: integer}
+        model: {type: string}
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: {type: integer}
+              message:
+                $ref: '#/components/schemas/OpenAIMessage'
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter]
+        usage:
+          type: object
+          properties:
+            prompt_tokens: {type: integer}
+            completion_tokens: {type: integer}
+            total_tokens: {type: integer}
+
+    OpenAIModel:
+      type: object
+      properties:
+        id: {type: string}
+        object: {type: string, enum: [model]}
+        created: {type: integer}
+        owned_by: {type: string}
+
+    AnthropicMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role: {type: string, enum: [user, assistant]}
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items: {type: object}
+
+    AnthropicTool:
+      type: object
+      properties:
+        name: {type: string}
+        description: {type: string}
+        input_schema: {type: object}
+
+    OllamaGenerateRequest:
+      type: object
+      required: [model]
+      properties:
+        model: {type: string}
+        prompt:
+          type: string
+          description: "Empty string triggers preload."
+        system: {type: string}
+        stream: {type: boolean, default: true}
+        keep_alive:
+          $ref: '#/components/schemas/KeepAlive'
+        format:
+          description: |
+            `"json"` for any-JSON, or a JSON Schema object for strict
+            schema constraint.
+          oneOf:
+            - type: string
+              enum: [json]
+            - type: object
+        options:
+          type: object
+          properties:
+            num_predict: {type: integer}
+            temperature: {type: number}
+            top_p: {type: number}
+            top_k: {type: integer}
+            stop: {type: array, items: {type: string}}
+
+    OllamaGenerateResponse:
+      type: object
+      properties:
+        model: {type: string}
+        created_at: {type: string}
+        response: {type: string}
+        done: {type: boolean}
+        done_reason:
+          type: string
+          enum: [stop, length, load, unload, cancelled, tool_call]
+        context: {type: array, items: {type: integer}}
+        total_duration: {type: integer}
+        load_duration:  {type: integer}
+        prompt_eval_count: {type: integer}
+        prompt_eval_duration: {type: integer}
+        eval_count: {type: integer}
+        eval_duration: {type: integer}
+
+    OllamaGenerateStreamChunk:
+      type: object
+      properties:
+        model: {type: string}
+        created_at: {type: string}
+        response: {type: string}
+        done: {type: boolean}
+
+    OllamaChatRequest:
+      type: object
+      required: [model]
+      properties:
+        model: {type: string}
+        messages:
+          type: array
+          description: Empty array triggers preload.
+          items:
+            $ref: '#/components/schemas/OpenAIMessage'
+        stream: {type: boolean, default: true}
+        keep_alive:
+          $ref: '#/components/schemas/KeepAlive'
+        format:
+          oneOf:
+            - type: string
+              enum: [json]
+            - type: object
+        options: {type: object}
+
+    OllamaChatStreamChunk:
+      type: object
+      properties:
+        model: {type: string}
+        created_at: {type: string}
+        message:
+          type: object
+          properties:
+            role: {type: string, enum: [assistant]}
+            content: {type: string}
+        done: {type: boolean}
+
+    OllamaChatResponse:
+      type: object
+      properties:
+        model: {type: string}
+        created_at: {type: string}
+        message:
+          type: object
+          properties:
+            role: {type: string, enum: [assistant]}
+            content: {type: string}
+        done: {type: boolean}
+        done_reason: {type: string}
+        total_duration: {type: integer}
+        load_duration:  {type: integer}
+        prompt_eval_count: {type: integer}
+        eval_count: {type: integer}
+
+    ModelDetails:
+      type: object
+      properties:
+        format: {type: string}
+        family: {type: string, nullable: true}
+        parameter_size: {type: string, nullable: true}
+        quantization_level: {type: string, nullable: true}
+
+    RegistryEntry:
+      type: object
+      properties:
+        name: {type: string, description: "name:tag"}
+        modified_at: {type: string}
+        size: {type: integer}
+        digest: {type: string, nullable: true}
+        details:
+          $ref: '#/components/schemas/ModelDetails'
+
+    OpenAIError:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: {type: string}
+            type: {type: string}
+            code: {type: string}
+
+  responses:
+    OpenAIError400:
+      description: invalid_request_error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OpenAIError'
+    OpenAIError404:
+      description: model_not_found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OpenAIError'
+    OpenAIError429:
+      description: rate_limit_error (pool exhausted)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OpenAIError'
