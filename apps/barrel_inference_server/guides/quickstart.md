@@ -101,4 +101,4 @@ _build/default/rel/erllama_server/bin/erllama_server stop
 - [`clients.md`](clients.md) — Python / JS / Erlang client snippets
 - [`registry.md`](registry.md) — Modelfile + pull semantics
 - [`fetching.md`](fetching.md) — URL syntax, cache layout, resume
-- [`../openapi.yaml`](../openapi.yaml) — full OpenAPI 3.1 spec
+- [`openapi.yaml`](openapi.md) — full OpenAPI 3.1 spec

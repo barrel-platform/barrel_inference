@@ -4,7 +4,7 @@ Every endpoint, one or two curl examples each. Server assumed at
 `http://127.0.0.1:8080`.
 
 > The canonical machine-readable spec lives at
-> [`../openapi.yaml`](../openapi.yaml).
+> [`openapi.yaml`](openapi.md).
 
 ## Observability
 
