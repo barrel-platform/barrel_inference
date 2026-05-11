@@ -155,6 +155,7 @@ info({pipeline, loading, _ModelId}, Req0, S0 = #st{stream = true}) ->
 info({pipeline, loading, _ModelId}, Req, S) ->
     {ok, Req, S, hibernate};
 info({pipeline, loaded}, Req, S) ->
+    ok = erllama_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template}, hibernate};
 info({pipeline, templated, _}, Req, S) ->
     {ok, Req, S#st{phase = waiting_queue}, hibernate};
@@ -265,7 +266,15 @@ cleanup(S) ->
         undefined -> ok;
         Slot -> erllama_server_queue:release(S#st.model, Slot)
     end,
+    keepalive_release(S#st.model, S#st.phase),
     erllama_server_metrics:dec_active_streams(S#st.model).
+
+keepalive_release(_Model, waiting_load) ->
+    ok;
+keepalive_release(Model, _Phase) ->
+    erllama_server_keepalive:request_end(
+        Model, erllama_server_config:keep_alive_default_ms()
+    ).
 
 %%====================================================================
 %% Token handling

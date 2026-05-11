@@ -190,6 +190,7 @@ info({pipeline, loading, _ModelId}, Req, S) ->
     %% idle_timeout (configured at the listener) is the safety net.
     {ok, Req, S, hibernate};
 info({pipeline, loaded}, Req, S) ->
+    ok = erllama_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template}, hibernate};
 info({pipeline, templated, _Tokens}, Req, S) ->
     {ok, Req, S#st{phase = waiting_queue}, hibernate};
@@ -308,7 +309,20 @@ cleanup(S) ->
         true -> ok;
         false -> ok
     end,
+    %% Decrement the keepalive active count. If this was the last
+    %% request, the model enters the keep-alive grace window.
+    keepalive_release(S#st.model, S#st.phase),
     erllama_server_metrics:dec_active_streams(S#st.model).
+
+%% request_end only fires if request_begin was called (i.e., load
+%% completed). If we never reached `waiting_template`, the active
+%% count was never bumped.
+keepalive_release(_Model, waiting_load) ->
+    ok;
+keepalive_release(Model, _Phase) ->
+    erllama_server_keepalive:request_end(
+        Model, erllama_server_config:keep_alive_default_ms()
+    ).
 
 %%====================================================================
 %% Token handling

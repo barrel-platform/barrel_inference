@@ -25,6 +25,7 @@
     cors/0,
     request_id_header/0,
     auto_pull/0,
+    keep_alive_default_ms/0,
     ensure_loaded_async/3
 ]).
 
@@ -124,6 +125,10 @@ request_id_header() ->
 auto_pull() ->
     persistent_term:get({?MODULE, auto_pull}, false).
 
+-spec keep_alive_default_ms() -> non_neg_integer() | infinity.
+keep_alive_default_ms() ->
+    persistent_term:get({?MODULE, keep_alive_default_ms}, 300000).
+
 %% Synchronous on a successful in-cache check; otherwise the call is
 %% un-replied and the loader process replies later. Caller's deadline
 %% is honoured by the loader.
@@ -193,6 +198,10 @@ init([]) ->
         app_env(request_id_header, <<"x-request-id">>)
     ),
     persistent_term:put({?MODULE, auto_pull}, app_env(auto_pull, false)),
+    persistent_term:put(
+        {?MODULE, keep_alive_default_ms},
+        app_env(keep_alive_default_ms, 300000)
+    ),
     {ok, #state{
         aliases = Aliases,
         load_policy = LoadPolicy,

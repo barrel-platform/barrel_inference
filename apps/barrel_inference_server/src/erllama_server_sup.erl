@@ -66,6 +66,13 @@ init([]) ->
         },
 
         #{
+            id => erllama_server_keepalive,
+            start => {erllama_server_keepalive, start_link, []},
+            type => worker,
+            shutdown => 5000
+        },
+
+        #{
             id => erllama_server_listener_mon,
             start => {erllama_server_listener_mon, start_link, []},
             type => worker,
