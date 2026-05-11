@@ -32,14 +32,22 @@ dispatch(Body, Req0, Opts) ->
     end.
 
 translate(Map, Req0, Opts) ->
-    case erllama_server_translate:openai_embeddings_to_internal(Map) of
-        {ok, #{model := Requested, inputs := Inputs}} ->
-            run(Requested, Inputs, Req0, Opts);
+    Api = maps:get(api, Opts, openai),
+    Translated =
+        case Api of
+            openai -> erllama_server_translate:openai_embeddings_to_internal(Map);
+            ollama -> erllama_server_translate:ollama_embed_to_internal(Map);
+            ollama_legacy -> erllama_server_translate:ollama_embeddings_legacy_to_internal(Map)
+        end,
+    case Translated of
+        {ok, Parsed = #{model := Requested, inputs := Inputs}} ->
+            KeepAlive = maps:get(keep_alive_ms, Parsed, undefined),
+            run(Requested, Inputs, Req0, Opts, KeepAlive);
         {error, Reason} ->
             reply_error(400, Reason, Req0, Opts)
     end.
 
-run(Requested, Inputs, Req0, Opts) ->
+run(Requested, Inputs, Req0, Opts, KeepAlive) ->
     Started = erlang:monotonic_time(millisecond),
     case length(Inputs) > erllama_server_config:max_embedding_inputs() of
         true ->
@@ -48,7 +56,7 @@ run(Requested, Inputs, Req0, Opts) ->
             Real = erllama_server_config:resolve_model(Requested),
             case erllama_server_config:ensure_loaded(Real) of
                 ok ->
-                    do_embed(Real, Requested, Inputs, Started, Req0, Opts);
+                    do_embed(Real, Requested, Inputs, Started, Req0, Opts, KeepAlive);
                 {error, not_found} ->
                     reply_error(404, model_not_found, Req0, Opts);
                 {error, Reason} ->
@@ -56,45 +64,77 @@ run(Requested, Inputs, Req0, Opts) ->
             end
     end.
 
-do_embed(Real, Requested, Inputs, Started, Req0, Opts) ->
+do_embed(Real, Requested, Inputs, Started, Req0, Opts, KeepAlive) ->
     Timeout = queue_timeout(Real),
     case erllama_server_queue:acquire(Real, Timeout) of
         {ok, Slot} ->
+            ok = erllama_server_keepalive:request_begin(Real),
             try
                 run_embed(Real, Requested, Inputs, Started, Req0, Opts)
             after
-                erllama_server_queue:release(Real, Slot)
+                erllama_server_queue:release(Real, Slot),
+                erllama_server_keepalive:request_end(
+                    Real, effective_keep_alive(KeepAlive)
+                )
             end;
         {error, pool_exhausted} ->
             erllama_server_metrics:inc_pool_exhausted(Real),
-            record_metrics(<<"/v1/embeddings">>, Requested, 429, Started),
+            record_metrics(endpoint(Opts), Requested, 429, Started),
             reply_error(429, pool_exhausted, Req0, Opts);
         {error, queue_timeout} ->
-            record_metrics(<<"/v1/embeddings">>, Requested, 504, Started),
+            record_metrics(endpoint(Opts), Requested, 504, Started),
             reply_error(504, queue_timeout, Req0, Opts)
     end.
 
 run_embed(Real, Requested, Inputs, Started, Req0, Opts) ->
     case embed_each(Real, Inputs) of
         {ok, Vectors, PromptTokens} ->
-            Body = erllama_server_translate:internal_to_openai_embedding_response(
-                Vectors, PromptTokens, Requested
-            ),
-            Encoded = json:encode(Body),
+            Body = build_response(Opts, Vectors, PromptTokens, Requested, Started),
             Req1 = cowboy_req:reply(
                 200,
                 #{<<"content-type">> => <<"application/json">>},
-                Encoded,
+                Body,
                 Req0
             ),
-            record_metrics(<<"/v1/embeddings">>, Requested, 200, Started),
+            record_metrics(endpoint(Opts), Requested, 200, Started),
             erllama_server_metrics:inc_prompt_tokens(Requested, PromptTokens),
             {ok, Req1, Opts};
         {error, Reason} ->
             Status = embed_status(Reason),
-            record_metrics(<<"/v1/embeddings">>, Requested, Status, Started),
+            record_metrics(endpoint(Opts), Requested, Status, Started),
             reply_error(Status, Reason, Req0, Opts)
     end.
+
+build_response(Opts, Vectors, PromptTokens, Requested, Started) ->
+    Now = erlang:monotonic_time(millisecond),
+    Timings = #{
+        total_duration_ns => (Now - Started) * 1_000_000,
+        load_duration_ns => 0
+    },
+    case maps:get(api, Opts, openai) of
+        ollama ->
+            erllama_server_translate:internal_to_ollama_embed_response(
+                Requested, Vectors, PromptTokens, Timings
+            );
+        ollama_legacy ->
+            [Vec | _] = Vectors,
+            erllama_server_translate:internal_to_ollama_embeddings_legacy_response(
+                Requested, Vec, Timings
+            );
+        _ ->
+            json:encode(
+                erllama_server_translate:internal_to_openai_embedding_response(
+                    Vectors, PromptTokens, Requested
+                )
+            )
+    end.
+
+endpoint(#{api := ollama}) -> <<"/api/embed">>;
+endpoint(#{api := ollama_legacy}) -> <<"/api/embeddings">>;
+endpoint(_) -> <<"/v1/embeddings">>.
+
+effective_keep_alive(undefined) -> erllama_server_config:keep_alive_default_ms();
+effective_keep_alive(V) -> V.
 
 queue_timeout(Model) ->
     case erllama_server_config:pool_policy_for(Model) of

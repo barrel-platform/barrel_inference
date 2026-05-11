@@ -36,6 +36,8 @@
     anthropic_messages_to_internal/1,
     ollama_generate_to_internal/1,
     ollama_chat_to_internal/1,
+    ollama_embed_to_internal/1,
+    ollama_embeddings_legacy_to_internal/1,
     %% response: out
     internal_to_openai_chat_response/3,
     internal_to_openai_chat_chunk/3,
@@ -52,6 +54,8 @@
     internal_to_ollama_chat_final/4,
     internal_to_ollama_chat_response/4,
     ollama_preload_response/4,
+    internal_to_ollama_embed_response/4,
+    internal_to_ollama_embeddings_legacy_response/3,
     %% helpers
     parse_keep_alive/1
 ]).
@@ -516,6 +520,85 @@ base_request_ollama(Body) ->
 ensure_binary_or_undef(undefined) -> undefined;
 ensure_binary_or_undef(B) when is_binary(B) -> B;
 ensure_binary_or_undef(_) -> undefined.
+
+%% =============================================================================
+%% Ollama: embeddings (new + legacy shape)
+%% =============================================================================
+
+%% New shape (`POST /api/embed`):
+%%   {"model": "...", "input": "text" | ["a","b"], "truncate": bool,
+%%    "keep_alive": "5m", "options": {...}}
+-spec ollama_embed_to_internal(map()) ->
+    {ok, #{model := binary(), inputs := [binary()], keep_alive_ms := term()}} | {error, term()}.
+ollama_embed_to_internal(Body) when is_map(Body) ->
+    try
+        Model = required_binary(Body, <<"model">>),
+        Inputs =
+            case maps:get(<<"input">>, Body, undefined) of
+                undefined ->
+                    throw({error, missing_input});
+                I when is_binary(I) ->
+                    [I];
+                L when is_list(L) ->
+                    lists:map(
+                        fun
+                            (B) when is_binary(B) -> B;
+                            (_) -> throw({error, unsupported_input_type})
+                        end,
+                        L
+                    );
+                _ ->
+                    throw({error, unsupported_input_type})
+            end,
+        KeepAlive = parse_keep_alive(maps:get(<<"keep_alive">>, Body, undefined)),
+        {ok, #{model => Model, inputs => Inputs, keep_alive_ms => KeepAlive}}
+    catch
+        throw:{error, _} = E -> E
+    end;
+ollama_embed_to_internal(_) ->
+    {error, invalid_json}.
+
+%% Legacy shape (`POST /api/embeddings`, pre-Ollama-0.5):
+%%   {"model": "...", "prompt": "text"} -> {"embedding": [...]}
+-spec ollama_embeddings_legacy_to_internal(map()) ->
+    {ok, #{model := binary(), inputs := [binary()], keep_alive_ms := term()}} | {error, term()}.
+ollama_embeddings_legacy_to_internal(Body) when is_map(Body) ->
+    try
+        Model = required_binary(Body, <<"model">>),
+        Prompt = required_binary(Body, <<"prompt">>),
+        KeepAlive = parse_keep_alive(maps:get(<<"keep_alive">>, Body, undefined)),
+        {ok, #{model => Model, inputs => [Prompt], keep_alive_ms => KeepAlive}}
+    catch
+        throw:{error, _} = E -> E
+    end;
+ollama_embeddings_legacy_to_internal(_) ->
+    {error, invalid_json}.
+
+%% New /api/embed response: array of vectors + timing fields.
+-spec internal_to_ollama_embed_response(binary(), [[float()]], non_neg_integer(), map()) ->
+    iodata().
+internal_to_ollama_embed_response(Model, Vectors, PromptTokens, Timings) ->
+    json:encode(
+        maps:merge(
+            #{
+                <<"model">> => Model,
+                <<"embeddings">> => Vectors
+            },
+            embed_timing_fields(PromptTokens, Timings)
+        )
+    ).
+
+%% Legacy /api/embeddings response: single vector under `embedding`.
+-spec internal_to_ollama_embeddings_legacy_response(binary(), [float()], map()) -> iodata().
+internal_to_ollama_embeddings_legacy_response(_Model, Vector, _Timings) ->
+    json:encode(#{<<"embedding">> => Vector}).
+
+embed_timing_fields(PromptTokens, Timings) ->
+    #{
+        <<"total_duration">> => maps:get(total_duration_ns, Timings, 0),
+        <<"load_duration">> => maps:get(load_duration_ns, Timings, 0),
+        <<"prompt_eval_count">> => PromptTokens
+    }.
 
 %% =============================================================================
 %% keep_alive parsing

@@ -207,3 +207,69 @@ preload_response_unload_test() ->
         #{<<"role">> => <<"assistant">>, <<"content">> => <<>>},
         maps:get(<<"message">>, M)
     ).
+
+%% =============================================================================
+%% ollama_embed_to_internal / legacy
+%% =============================================================================
+
+embed_string_input_test() ->
+    {ok, #{model := M, inputs := In}} =
+        erllama_server_translate:ollama_embed_to_internal(#{
+            <<"model">> => <<"em">>,
+            <<"input">> => <<"hello">>
+        }),
+    ?assertEqual(<<"em">>, M),
+    ?assertEqual([<<"hello">>], In).
+
+embed_array_input_test() ->
+    {ok, #{inputs := In}} =
+        erllama_server_translate:ollama_embed_to_internal(#{
+            <<"model">> => <<"em">>,
+            <<"input">> => [<<"a">>, <<"b">>]
+        }),
+    ?assertEqual([<<"a">>, <<"b">>], In).
+
+embed_missing_model_test() ->
+    ?assertMatch(
+        {error, _},
+        erllama_server_translate:ollama_embed_to_internal(#{<<"input">> => <<"hi">>})
+    ).
+
+embed_missing_input_test() ->
+    ?assertMatch(
+        {error, missing_input},
+        erllama_server_translate:ollama_embed_to_internal(#{<<"model">> => <<"em">>})
+    ).
+
+embeddings_legacy_test() ->
+    {ok, #{model := M, inputs := In}} =
+        erllama_server_translate:ollama_embeddings_legacy_to_internal(#{
+            <<"model">> => <<"em">>,
+            <<"prompt">> => <<"hi">>
+        }),
+    ?assertEqual(<<"em">>, M),
+    ?assertEqual([<<"hi">>], In).
+
+embed_response_shape_test() ->
+    Bin = iolist_to_binary(
+        erllama_server_translate:internal_to_ollama_embed_response(
+            <<"em">>,
+            [[0.1, 0.2], [0.3, 0.4]],
+            8,
+            #{total_duration_ns => 5000, load_duration_ns => 1000}
+        )
+    ),
+    M = json:decode(Bin),
+    ?assertEqual(<<"em">>, maps:get(<<"model">>, M)),
+    ?assertEqual([[0.1, 0.2], [0.3, 0.4]], maps:get(<<"embeddings">>, M)),
+    ?assertEqual(8, maps:get(<<"prompt_eval_count">>, M)),
+    ?assertEqual(5000, maps:get(<<"total_duration">>, M)).
+
+embeddings_legacy_response_test() ->
+    Bin = iolist_to_binary(
+        erllama_server_translate:internal_to_ollama_embeddings_legacy_response(
+            <<"em">>, [0.1, 0.2], #{}
+        )
+    ),
+    M = json:decode(Bin),
+    ?assertEqual([0.1, 0.2], maps:get(<<"embedding">>, M)).

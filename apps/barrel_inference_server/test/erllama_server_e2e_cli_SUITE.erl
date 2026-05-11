@@ -20,7 +20,9 @@
     api_generate_streams_against_stub/1,
     api_chat_streams_against_stub/1,
     api_generate_empty_prompt_preloads/1,
-    api_chat_keep_alive_zero_unloads/1
+    api_chat_keep_alive_zero_unloads/1,
+    api_embed_returns_vectors/1,
+    api_embeddings_legacy_returns_embedding/1
 ]).
 
 %% GGUF tags.
@@ -36,7 +38,9 @@ all() ->
         api_generate_streams_against_stub,
         api_chat_streams_against_stub,
         api_generate_empty_prompt_preloads,
-        api_chat_keep_alive_zero_unloads
+        api_chat_keep_alive_zero_unloads,
+        api_embed_returns_vectors,
+        api_embeddings_legacy_returns_embedding
     ].
 
 %%====================================================================
@@ -195,6 +199,34 @@ api_generate_empty_prompt_preloads(Cfg) ->
     ?assertEqual(true, maps:get(<<"done">>, Resp)),
     ?assertEqual(<<"load">>, maps:get(<<"done_reason">>, Resp)),
     ?assertEqual(<<>>, maps:get(<<"response">>, Resp)).
+
+%% Ollama /api/embed against the stub: array of vectors + timings.
+api_embed_returns_vectors(Cfg) ->
+    {ok, _} = pull_for(<<"embed-1">>, <<"latest">>, Cfg),
+    Body = json:encode(#{
+        <<"model">> => <<"embed-1:latest">>,
+        <<"input">> => [<<"a">>, <<"b">>]
+    }),
+    {ok, {{_, 200, _}, _, Raw}} = post_json(Cfg, "/api/embed", Body),
+    R = json:decode(list_to_binary(Raw)),
+    Vecs = maps:get(<<"embeddings">>, R),
+    ?assertEqual(2, length(Vecs)),
+    [V | _] = Vecs,
+    ?assert(is_list(V)),
+    ?assert(length(V) > 0).
+
+%% Legacy /api/embeddings: one prompt, one vector.
+api_embeddings_legacy_returns_embedding(Cfg) ->
+    {ok, _} = pull_for(<<"embed-legacy">>, <<"latest">>, Cfg),
+    Body = json:encode(#{
+        <<"model">> => <<"embed-legacy:latest">>,
+        <<"prompt">> => <<"hello">>
+    }),
+    {ok, {{_, 200, _}, _, Raw}} = post_json(Cfg, "/api/embeddings", Body),
+    R = json:decode(list_to_binary(Raw)),
+    V = maps:get(<<"embedding">>, R),
+    ?assert(is_list(V)),
+    ?assert(length(V) > 0).
 
 %% keep_alive: 0 on a preload request emits done_reason: "unload".
 api_chat_keep_alive_zero_unloads(Cfg) ->
