@@ -39,6 +39,8 @@ jobs:
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
+      - name: System deps (erllama C++ backend)
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
       - uses: actions/cache@v5
         with:
           path: |
@@ -57,6 +59,8 @@ jobs:
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
+      - name: System deps (erllama C++ backend)
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
       - uses: actions/cache@v5
         with:
           path: |
@@ -83,6 +87,9 @@ jobs:
         with:
           otp-version: ${{ matrix.otp }}
           rebar3-version: '3.25.0'
+      - name: System deps (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
       - uses: actions/cache@v5
         with:
           path: |
@@ -91,6 +98,32 @@ jobs:
           key: build-${{ matrix.os }}-otp-${{ matrix.otp }}-${{ hashFiles('rebar.lock') }}
           restore-keys: build-${{ matrix.os }}-otp-${{ matrix.otp }}-
       - run: rebar3 compile
+
+  eunit:
+    name: EUnit on ${{ matrix.os }}
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: System deps (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - uses: actions/cache@v5
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: build-${{ matrix.os }}-otp-28-${{ hashFiles('rebar.lock') }}
+          restore-keys: build-${{ matrix.os }}-otp-28-
+      - run: rebar3 eunit
 
   ct:
     name: Common Test on ${{ matrix.os }}
@@ -106,6 +139,9 @@ jobs:
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
+      - name: System deps (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
       - uses: actions/cache@v5
         with:
           path: |
@@ -113,4 +149,6 @@ jobs:
             ~/.cache/rebar3
           key: build-${{ matrix.os }}-otp-28-${{ hashFiles('rebar.lock') }}
           restore-keys: build-${{ matrix.os }}-otp-28-
+      - name: Build escript (required by CLI suites)
+        run: rebar3 escriptize
       - run: rebar3 ct
