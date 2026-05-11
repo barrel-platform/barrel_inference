@@ -43,6 +43,14 @@
     anthropic_content_blocks_tool_result/1,
     anthropic_content_blocks_empty/1,
     openai_content_blocks_flatten/1,
+    anthropic_cache_control_captured_on_system/1,
+    anthropic_cache_control_captured_on_tool/1,
+    anthropic_cache_control_captured_on_message_block/1,
+    anthropic_no_cache_hints_when_unmarked/1,
+    anthropic_cache_hints_hash_is_stable/1,
+    anthropic_usage_emits_cache_read_on_exact_hit/1,
+    anthropic_usage_emits_cache_creation_on_cold/1,
+    openai_usage_emits_cached_tokens_on_exact_hit/1,
     %% response shapes
     openai_chat_response_shape/1,
     openai_chat_streaming_chunk_shape/1,
@@ -95,6 +103,14 @@ all() ->
         anthropic_content_blocks_tool_result,
         anthropic_content_blocks_empty,
         openai_content_blocks_flatten,
+        anthropic_cache_control_captured_on_system,
+        anthropic_cache_control_captured_on_tool,
+        anthropic_cache_control_captured_on_message_block,
+        anthropic_no_cache_hints_when_unmarked,
+        anthropic_cache_hints_hash_is_stable,
+        anthropic_usage_emits_cache_read_on_exact_hit,
+        anthropic_usage_emits_cache_creation_on_cold,
+        openai_usage_emits_cached_tokens_on_exact_hit,
         %% responses out
         openai_chat_response_shape,
         openai_chat_streaming_chunk_shape,
@@ -537,6 +553,160 @@ openai_content_blocks_flatten(_Cfg) ->
         [#{role := <<"user">>, content := <<"x">>}],
         R#erllama_request.messages
     ).
+
+%% Anthropic prompt-caching markers are captured into
+%% cache_hints. The translator does NOT alter the system / messages
+%% content; markers only flow through to the response builder so
+%% usage counters can credit hits.
+anthropic_cache_control_captured_on_system(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"system">> => [
+            #{
+                <<"type">> => <<"text">>,
+                <<"text">> => <<"persona">>,
+                <<"cache_control">> => #{<<"type">> => <<"ephemeral">>}
+            }
+        ],
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    Hints = R#erllama_request.cache_hints,
+    ?assertEqual(1, length(Hints)),
+    [#{kind := Kind, hash := Hash}] = Hints,
+    ?assertEqual(system, Kind),
+    ?assertEqual(32, byte_size(Hash)).
+
+anthropic_cache_control_captured_on_tool(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}
+        ],
+        <<"tools">> => [
+            #{
+                <<"name">> => <<"search">>,
+                <<"description">> => <<"d">>,
+                <<"input_schema">> => #{<<"type">> => <<"object">>},
+                <<"cache_control">> => #{<<"type">> => <<"ephemeral">>}
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch([#{kind := tool}], R#erllama_request.cache_hints).
+
+anthropic_cache_control_captured_on_message_block(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{
+                        <<"type">> => <<"text">>,
+                        <<"text">> => <<"big context">>,
+                        <<"cache_control">> => #{<<"type">> => <<"ephemeral">>}
+                    },
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"now do x">>}
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch([#{kind := message}], R#erllama_request.cache_hints).
+
+anthropic_no_cache_hints_when_unmarked(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual([], R#erllama_request.cache_hints).
+
+%% The hash depends only on block content, not on the order of map
+%% keys (Erlang map iteration order is unspecified) and not on the
+%% cache_control TTL field. Same content -> same hash across turns.
+anthropic_cache_hints_hash_is_stable(_Cfg) ->
+    SystemA = [
+        #{
+            <<"text">> => <<"persona">>,
+            <<"type">> => <<"text">>,
+            <<"cache_control">> => #{<<"type">> => <<"ephemeral">>}
+        }
+    ],
+    SystemB = [
+        #{
+            <<"type">> => <<"text">>,
+            <<"text">> => <<"persona">>,
+            <<"cache_control">> => #{<<"type">> => <<"ephemeral">>, <<"ttl">> => <<"1h">>}
+        }
+    ],
+    BodyA = #{
+        <<"model">> => <<"c">>,
+        <<"system">> => SystemA,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ]
+    },
+    BodyB = BodyA#{<<"system">> => SystemB},
+    {ok, RA} = erllama_server_translate:anthropic_messages_to_internal(BodyA),
+    {ok, RB} = erllama_server_translate:anthropic_messages_to_internal(BodyB),
+    [#{hash := HashA}] = RA#erllama_request.cache_hints,
+    [#{hash := HashB}] = RB#erllama_request.cache_hints,
+    ?assertEqual(HashA, HashB).
+
+%% usage.cache_read_input_tokens is populated when erllama reports an
+%% exact KV-cache hit. The cache_creation_input_tokens counter is
+%% credited on cold / partial misses. Coarse: we don't yet split
+%% partial-hit prefix-tokens from the new tail, so partial is
+%% reported as a full creation. Real users with an exact prefix hit
+%% see the cache_read counter; cold first turns see cache_creation.
+anthropic_usage_emits_cache_read_on_exact_hit(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 128,
+        completion_tokens => 16,
+        cache_hit_kind => exact,
+        finish_reason => stop
+    },
+    Resp = erllama_server_translate:internal_to_anthropic_messages_response(
+        <<"hi">>, Stats, <<"m">>
+    ),
+    Usage = maps:get(<<"usage">>, Resp),
+    ?assertEqual(128, maps:get(<<"cache_read_input_tokens">>, Usage)),
+    ?assertNot(maps:is_key(<<"cache_creation_input_tokens">>, Usage)).
+
+anthropic_usage_emits_cache_creation_on_cold(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 128,
+        completion_tokens => 16,
+        cache_hit_kind => cold,
+        finish_reason => stop
+    },
+    Resp = erllama_server_translate:internal_to_anthropic_messages_response(
+        <<"hi">>, Stats, <<"m">>
+    ),
+    Usage = maps:get(<<"usage">>, Resp),
+    ?assertEqual(128, maps:get(<<"cache_creation_input_tokens">>, Usage)),
+    ?assertNot(maps:is_key(<<"cache_read_input_tokens">>, Usage)).
+
+%% OpenAI surfaces the same info via prompt_tokens_details.cached_tokens.
+openai_usage_emits_cached_tokens_on_exact_hit(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 64,
+        completion_tokens => 4,
+        cache_hit_kind => exact,
+        finish_reason => stop
+    },
+    Resp = erllama_server_translate:internal_to_openai_chat_response(
+        <<"x">>, Stats, <<"m">>
+    ),
+    Usage = maps:get(<<"usage">>, Resp),
+    Details = maps:get(<<"prompt_tokens_details">>, Usage),
+    ?assertEqual(64, maps:get(<<"cached_tokens">>, Details)).
 
 %%====================================================================
 %% Response shapes

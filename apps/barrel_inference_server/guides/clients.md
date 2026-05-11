@@ -332,6 +332,37 @@ rewrite: `claude-sonnet-4-5` -> `Qwen/...:main` -> registry
 lookup. Unknown ids fall through to a registry lookup as-is, so
 the registry name itself always works.
 
+### Big requests and the 32 MB ceiling
+
+Claude Code's HTTP client refuses to send any request body larger
+than 32 MB. With many MCP servers connected, the system prompt +
+tool definitions alone can approach that on every turn. The server
+accepts up to 32 MB by default (`max_request_body_bytes` in
+`sys.config`); the ceiling lives in the client.
+
+If you see `Request too large (max 32MB)` in your Claude Code
+terminal, the only fix is to **reduce what Claude Code sends**:
+
+- Disconnect MCP servers you aren't using (`claude mcp remove …`).
+- Shorten `~/.claude/CLAUDE.md`.
+- Trim project-level `CLAUDE.md` content.
+
+Server-side caching helps with speed and cost, not upload size:
+
+- erllama's **KV cache** (RAM/ramfile/disk tiered) hits when the
+  prompt prefix repeats across turns, so the second turn skips
+  prefill server-side. Already enabled.
+- **Anthropic prompt caching** markers (`cache_control: {type:
+  "ephemeral"}` on system / tools / message blocks) are recognised
+  and reported back in `usage.cache_creation_input_tokens` /
+  `usage.cache_read_input_tokens`. Claude Code attaches these
+  automatically; you'll see hits on the second turn even when the
+  full body is shipped every time.
+
+What neither cache can do today: reduce client→server bytes. That
+needs a non-standard session API the client also implements; not
+on the roadmap until SDKs agree on one.
+
 ## Model resolution flow
 
 Every API family is identical here. The handler:

@@ -65,7 +65,13 @@
     is_preload = false :: boolean(),
     %% Structured-output constraint. `text` = no grammar; any other
     %% value installs a GBNF that constrains the response.
-    response_format = text :: text | json_object | {json_schema, map()}
+    response_format = text :: text | json_object | {json_schema, map()},
+    %% Anthropic prompt-caching markers captured from cache_control
+    %% on system / tools / messages blocks. Each entry is the kind
+    %% of block and the sha256 of its normalised content. Surfaced
+    %% in `usage.cache_creation_input_tokens` /
+    %% `usage.cache_read_input_tokens` on the way out.
+    cache_hints = [] :: [#{kind := system | tool | message, hash := binary()}]
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

@@ -160,6 +160,7 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
         check_tools_cap(Tools),
         ToolChoice = parse_anthropic_tool_choice(Body),
         Thinking = parse_anthropic_thinking(Body),
+        CacheHints = collect_cache_hints(SystemRaw, MessagesIn, Body),
         Base = base_request(Body, anthropic),
         {ok, Base#erllama_request{
             model_id = Model,
@@ -168,7 +169,8 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
             system = System,
             tools = Tools,
             tool_choice = ToolChoice,
-            thinking = Thinking
+            thinking = Thinking,
+            cache_hints = CacheHints
         }}
     catch
         throw:{error, _} = E -> E
@@ -321,11 +323,29 @@ internal_to_anthropic_messages_response(Text, Stats, Model) ->
         <<"content">> => [#{<<"type">> => <<"text">>, <<"text">> => Text}],
         <<"stop_reason">> => anthropic_stop_reason(Stats),
         <<"stop_sequence">> => null,
-        <<"usage">> => #{
-            <<"input_tokens">> => maps:get(prompt_tokens, Stats, 0),
-            <<"output_tokens">> => maps:get(completion_tokens, Stats, 0)
-        }
+        <<"usage">> => anthropic_usage_map(Stats)
     }.
+
+%% Anthropic's `usage` schema carries cache_creation_input_tokens and
+%% cache_read_input_tokens whenever prompt caching is involved. Emit
+%% them based on erllama's `cache_hit_kind`; the same coarse mapping
+%% as the OpenAI `cached_tokens` field.
+anthropic_usage_map(Stats) ->
+    Base = #{
+        <<"input_tokens">> => maps:get(prompt_tokens, Stats, 0),
+        <<"output_tokens">> => maps:get(completion_tokens, Stats, 0)
+    },
+    Read = cached_tokens(Stats),
+    Create = cache_creation_tokens(Stats),
+    Maybe1 =
+        case Read of
+            0 -> Base;
+            _ -> Base#{<<"cache_read_input_tokens">> => Read}
+        end,
+    case Create of
+        0 -> Maybe1;
+        _ -> Maybe1#{<<"cache_creation_input_tokens">> => Create}
+    end.
 
 %% Anthropic SSE event encoder. Returns iolist containing
 %% `event: <name>\ndata: <json>\n\n`.
@@ -1004,6 +1024,98 @@ parse_anthropic_tools(Body) ->
             undefined
     end.
 
+%% Anthropic prompt-caching markers can appear on:
+%%   - system: [{type:"text", text, cache_control}]
+%%   - tools[i].cache_control
+%%   - messages[i].content[j].cache_control (any block kind)
+%% We walk all three and emit a #{kind, hash} per marker. The hash is
+%% the sha256 of the JSON-stable canonical form of the block content
+%% (text or schema), so identical markers across turns produce the
+%% same hash and the response builder can credit cache hits.
+collect_cache_hints(System, MessagesIn, Body) ->
+    SysHints = system_cache_hints(System),
+    ToolHints = tools_cache_hints(maps:get(<<"tools">>, Body, undefined)),
+    MsgHints = messages_cache_hints(MessagesIn),
+    SysHints ++ ToolHints ++ MsgHints.
+
+system_cache_hints(undefined) ->
+    [];
+system_cache_hints(B) when is_binary(B) -> [];
+system_cache_hints(L) when is_list(L) ->
+    [
+        #{kind => system, hash => block_hash(<<"system">>, B)}
+     || B <- L, has_cache_control(B)
+    ].
+
+tools_cache_hints(undefined) ->
+    [];
+tools_cache_hints(L) when is_list(L) ->
+    [
+        #{kind => tool, hash => block_hash(<<"tool">>, T)}
+     || T <- L, is_map(T), has_cache_control(T)
+    ].
+
+messages_cache_hints(L) when is_list(L) ->
+    lists:flatten([message_cache_hints(M) || M <- L]).
+
+message_cache_hints(#{<<"content">> := Blocks}) when is_list(Blocks) ->
+    [
+        #{kind => message, hash => block_hash(<<"message">>, B)}
+     || B <- Blocks, is_map(B), has_cache_control(B)
+    ];
+message_cache_hints(_) ->
+    [].
+
+has_cache_control(M) when is_map(M) ->
+    maps:is_key(<<"cache_control">>, M);
+has_cache_control(_) ->
+    false.
+
+%% The hash covers the kind + a JSON-canonicalised view of the block
+%% so re-ordered keys still match. We strip cache_control itself
+%% before hashing — its TTL field isn't part of the content identity.
+block_hash(Kind, Block) when is_map(Block) ->
+    Stripped = maps:remove(<<"cache_control">>, Block),
+    Canon = canonical_json(Stripped),
+    crypto:hash(sha256, [Kind, $:, Canon]).
+
+%% Order keys lexicographically so identical content with different
+%% map iteration order hashes the same. Recurses into nested maps and
+%% lists. Cheap enough for the few-KB blocks we expect.
+canonical_json(M) when is_map(M) ->
+    Pairs = lists:sort(maps:to_list(M)),
+    [
+        $\{,
+        lists:join(
+            $,,
+            [[canonical_json(K), $:, canonical_json(V)] || {K, V} <- Pairs]
+        ),
+        $\}
+    ];
+canonical_json(L) when is_list(L) ->
+    %% Distinguish JSON array from a binary written as a list. Erlang
+    %% binaries hit the `is_binary` clause above; raw strings landed
+    %% here only when caller passed an iolist, which we encode as the
+    %% concatenated bytes (rare path; safe).
+    case io_lib:printable_list(L) of
+        true -> [$", L, $"];
+        false -> [$[, lists:join($,, [canonical_json(X) || X <- L]), $]]
+    end;
+canonical_json(B) when is_binary(B) ->
+    %% Escape only what JSON requires for hash stability; we never
+    %% emit this for transport.
+    [$", binary:replace(B, [<<"\"">>, <<"\\">>], <<"\\">>, [global]), $"];
+canonical_json(N) when is_integer(N); is_float(N) ->
+    io_lib:write(N);
+canonical_json(true) ->
+    <<"true">>;
+canonical_json(false) ->
+    <<"false">>;
+canonical_json(null) ->
+    <<"null">>;
+canonical_json(undefined) ->
+    <<"null">>.
+
 parse_anthropic_tool_choice(Body) ->
     case maps:get(<<"tool_choice">>, Body, undefined) of
         undefined -> auto;
@@ -1110,11 +1222,38 @@ anthropic_stop_reason(Stats) ->
 usage_map(Stats) ->
     Prompt = maps:get(prompt_tokens, Stats, 0),
     Completion = maps:get(completion_tokens, Stats, 0),
-    #{
+    Base = #{
         <<"prompt_tokens">> => Prompt,
         <<"completion_tokens">> => Completion,
         <<"total_tokens">> => Prompt + Completion
-    }.
+    },
+    %% OpenAI surfaces cache stats via `prompt_tokens_details.cached_tokens`
+    %% (the field the OpenAI Python SDK reads). Populate it from the
+    %% Stats `cache_hit_kind` flag erllama exposes so SDKs that
+    %% observe cache hits show real numbers.
+    case cached_tokens(Stats) of
+        0 -> Base;
+        N -> Base#{<<"prompt_tokens_details">> => #{<<"cached_tokens">> => N}}
+    end.
+
+%% Coarse approximation: erllama exposes `cache_hit_kind` but not the
+%% exact prefix-length, so we report all prompt tokens as cached on
+%% an exact hit, none on partial / cold. Once erllama surfaces a
+%% prefix-tokens count we can promote `partial` to the real number.
+cached_tokens(Stats) ->
+    case maps:get(cache_hit_kind, Stats, undefined) of
+        exact -> maps:get(prompt_tokens, Stats, 0);
+        _ -> 0
+    end.
+
+cache_creation_tokens(Stats) ->
+    %% Anthropic's protocol counts tokens added to the cache on this
+    %% request. cold / partial both add the whole prompt (or its tail);
+    %% under our coarse model we treat them as a full-prompt addition.
+    case maps:get(cache_hit_kind, Stats, undefined) of
+        exact -> 0;
+        _ -> maps:get(prompt_tokens, Stats, 0)
+    end.
 
 unix_seconds() -> erlang:system_time(second).
 

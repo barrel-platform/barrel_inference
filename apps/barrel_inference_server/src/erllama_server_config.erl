@@ -83,7 +83,7 @@ pool_policy_for(ModelId) ->
 
 -spec max_request_body_bytes() -> pos_integer().
 max_request_body_bytes() ->
-    persistent_term:get({?MODULE, max_request_body_bytes}, 1048576).
+    persistent_term:get({?MODULE, max_request_body_bytes}, 33554432).
 
 -spec max_embedding_inputs() -> pos_integer().
 max_embedding_inputs() ->
@@ -171,7 +171,7 @@ init([]) ->
     persistent_term:put({?MODULE, per_model_pool_policy}, PerModel),
     persistent_term:put(
         {?MODULE, max_request_body_bytes},
-        app_env(max_request_body_bytes, 1048576)
+        app_env(max_request_body_bytes, 33554432)
     ),
     persistent_term:put(
         {?MODULE, max_embedding_inputs},
