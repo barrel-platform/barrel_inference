@@ -212,18 +212,28 @@ tokenise_raw(W, Prompt) ->
 
 step_grammar(W) ->
     R = W#work.request,
-    case
-        erllama_server_grammar:from_tools(
-            R#erllama_request.tools,
-            R#erllama_request.tool_choice
-        )
-    of
+    %% Tools-driven grammar wins if a non-empty tools array is set.
+    %% Otherwise honour the response_format / format directive.
+    Build =
+        case has_tools(R) of
+            true ->
+                erllama_server_grammar:from_tools(
+                    R#erllama_request.tools, R#erllama_request.tool_choice
+                );
+            false ->
+                erllama_server_grammar:from_response_format(R#erllama_request.response_format)
+        end,
+    case Build of
         {ok, Bin} ->
             W1 = W#work{request = R#erllama_request{grammar = nullable_bin(Bin)}},
             {ok, W1};
         {error, Reason} ->
             {error, 400, Reason}
     end.
+
+has_tools(#erllama_request{tools = undefined}) -> false;
+has_tools(#erllama_request{tools = []}) -> false;
+has_tools(#erllama_request{tools = [_ | _]}) -> true.
 
 step_queue(W) ->
     Model = model_id(W),

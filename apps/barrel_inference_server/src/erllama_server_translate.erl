@@ -57,7 +57,9 @@
     internal_to_ollama_embed_response/4,
     internal_to_ollama_embeddings_legacy_response/3,
     %% helpers
-    parse_keep_alive/1
+    parse_keep_alive/1,
+    parse_response_format_openai/1,
+    parse_response_format_ollama/1
 ]).
 
 %%====================================================================
@@ -75,6 +77,7 @@ openai_chat_to_internal(Body) when is_map(Body) ->
         Tools = parse_openai_tools(Body),
         check_tools_cap(Tools),
         ToolChoice = parse_openai_tool_choice(Body),
+        RF = parse_response_format_openai(maps:get(<<"response_format">>, Body, undefined)),
         Base = base_request(Body, openai),
         {ok, Base#erllama_request{
             model_id = Model,
@@ -82,7 +85,8 @@ openai_chat_to_internal(Body) when is_map(Body) ->
             prompt = undefined,
             system = System,
             tools = Tools,
-            tool_choice = ToolChoice
+            tool_choice = ToolChoice,
+            response_format = RF
         }}
     catch
         throw:{error, _} = E -> E
@@ -96,6 +100,7 @@ openai_completion_to_internal(Body) when is_map(Body) ->
     try
         Model = required_binary(Body, <<"model">>),
         Prompt = required_binary(Body, <<"prompt">>),
+        RF = parse_response_format_openai(maps:get(<<"response_format">>, Body, undefined)),
         Base = base_request(Body, openai),
         {ok, Base#erllama_request{
             model_id = Model,
@@ -103,7 +108,8 @@ openai_completion_to_internal(Body) when is_map(Body) ->
             prompt = Prompt,
             system = undefined,
             tools = undefined,
-            tool_choice = none
+            tool_choice = none,
+            response_format = RF
         }}
     catch
         throw:{error, _} = E -> E
@@ -445,6 +451,7 @@ ollama_generate_to_internal(Body) when is_map(Body) ->
                 true -> undefined;
                 false -> Prompt
             end,
+        RF = parse_response_format_ollama(maps:get(<<"format">>, Body, undefined)),
         {ok, Base#erllama_request{
             model_id = Model,
             messages = [],
@@ -452,7 +459,8 @@ ollama_generate_to_internal(Body) when is_map(Body) ->
             system = System,
             tools = undefined,
             tool_choice = none,
-            is_preload = IsPreload
+            is_preload = IsPreload,
+            response_format = RF
         }}
     catch
         throw:{error, _} = E -> E
@@ -477,6 +485,7 @@ ollama_chat_to_internal(Body) when is_map(Body) ->
         end,
         {System, Messages} = split_system(MessagesIn),
         Base = base_request_ollama(Body),
+        RF = parse_response_format_ollama(maps:get(<<"format">>, Body, undefined)),
         {ok, Base#erllama_request{
             model_id = Model,
             messages = Messages,
@@ -484,7 +493,8 @@ ollama_chat_to_internal(Body) when is_map(Body) ->
             system = System,
             tools = undefined,
             tool_choice = none,
-            is_preload = IsPreload
+            is_preload = IsPreload,
+            response_format = RF
         }}
     catch
         throw:{error, _} = E -> E
@@ -614,6 +624,51 @@ embed_timing_fields(PromptTokens, Timings) ->
 %%   binary "0"       -> 0
 %%   binary "-1"      -> infinity
 %% =============================================================================
+
+%% =============================================================================
+%% response_format / format parsing
+%% =============================================================================
+
+%% OpenAI `response_format`:
+%%   undefined         -> text
+%%   {"type":"text"}   -> text
+%%   {"type":"json_object"}                                -> json_object
+%%   {"type":"json_schema", "json_schema": {"schema":...}} -> {json_schema, Schema}
+%%
+%% On a malformed value we fall back to `text` rather than 400 so SDKs
+%% that pass extra unknown fields don't break.
+-spec parse_response_format_openai(term()) ->
+    text | json_object | {json_schema, map()}.
+parse_response_format_openai(undefined) ->
+    text;
+parse_response_format_openai(null) ->
+    text;
+parse_response_format_openai(#{<<"type">> := <<"text">>}) ->
+    text;
+parse_response_format_openai(#{<<"type">> := <<"json_object">>}) ->
+    json_object;
+parse_response_format_openai(#{<<"type">> := <<"json_schema">>, <<"json_schema">> := JS}) when
+    is_map(JS)
+->
+    case maps:get(<<"schema">>, JS, undefined) of
+        S when is_map(S) -> {json_schema, S};
+        _ -> json_object
+    end;
+parse_response_format_openai(_) ->
+    text.
+
+%% Ollama `format`:
+%%   undefined / null       -> text
+%%   "json"                 -> json_object
+%%   <map> (JSON Schema)    -> {json_schema, Map}
+-spec parse_response_format_ollama(term()) ->
+    text | json_object | {json_schema, map()}.
+parse_response_format_ollama(undefined) -> text;
+parse_response_format_ollama(null) -> text;
+parse_response_format_ollama(<<>>) -> text;
+parse_response_format_ollama(<<"json">>) -> json_object;
+parse_response_format_ollama(M) when is_map(M) -> {json_schema, M};
+parse_response_format_ollama(_) -> text.
 
 -spec parse_keep_alive(term()) -> non_neg_integer() | infinity | undefined.
 parse_keep_alive(undefined) ->
