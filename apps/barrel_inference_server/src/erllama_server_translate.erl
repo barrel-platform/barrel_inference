@@ -34,6 +34,8 @@
     openai_completion_to_internal/1,
     openai_embeddings_to_internal/1,
     anthropic_messages_to_internal/1,
+    ollama_generate_to_internal/1,
+    ollama_chat_to_internal/1,
     %% response: out
     internal_to_openai_chat_response/3,
     internal_to_openai_chat_chunk/3,
@@ -42,7 +44,16 @@
     internal_to_openai_completion_response/3,
     internal_to_openai_embedding_response/3,
     internal_to_anthropic_messages_response/3,
-    internal_to_anthropic_event/4
+    internal_to_anthropic_event/4,
+    internal_to_ollama_generate_chunk/3,
+    internal_to_ollama_generate_final/4,
+    internal_to_ollama_generate_response/4,
+    internal_to_ollama_chat_chunk/3,
+    internal_to_ollama_chat_final/4,
+    internal_to_ollama_chat_response/4,
+    ollama_preload_response/4,
+    %% helpers
+    parse_keep_alive/1
 ]).
 
 %%====================================================================
@@ -402,7 +413,337 @@ base_request(Body, Api) ->
     }.
 
 prefix_for(openai) -> <<"chatcmpl-">>;
-prefix_for(anthropic) -> <<"msg_">>.
+prefix_for(anthropic) -> <<"msg_">>;
+prefix_for(ollama) -> <<"ollama-">>.
+
+%% =============================================================================
+%% Ollama: request -> #erllama_request{}
+%% =============================================================================
+
+%% Translate `POST /api/generate` body into the internal request.
+%% Empty `prompt` -> `is_preload = true`.
+-spec ollama_generate_to_internal(map()) -> {ok, #erllama_request{}} | {error, term()}.
+ollama_generate_to_internal(Body) when is_map(Body) ->
+    try
+        Model = required_binary(Body, <<"model">>),
+        PromptRaw = maps:get(<<"prompt">>, Body, <<>>),
+        Prompt = ensure_binary_or_undef(PromptRaw),
+        System = maps:get(<<"system">>, Body, undefined),
+        Base = base_request_ollama(Body),
+        IsPreload =
+            case Prompt of
+                undefined -> true;
+                <<>> -> true;
+                _ -> false
+            end,
+        EffectivePrompt =
+            case IsPreload of
+                true -> undefined;
+                false -> Prompt
+            end,
+        {ok, Base#erllama_request{
+            model_id = Model,
+            messages = [],
+            prompt = EffectivePrompt,
+            system = System,
+            tools = undefined,
+            tool_choice = none,
+            is_preload = IsPreload
+        }}
+    catch
+        throw:{error, _} = E -> E
+    end;
+ollama_generate_to_internal(_) ->
+    {error, invalid_json}.
+
+%% Translate `POST /api/chat` body. Empty `messages` -> preload.
+-spec ollama_chat_to_internal(map()) -> {ok, #erllama_request{}} | {error, term()}.
+ollama_chat_to_internal(Body) when is_map(Body) ->
+    try
+        Model = required_binary(Body, <<"model">>),
+        MessagesIn =
+            case maps:get(<<"messages">>, Body, []) of
+                L when is_list(L) -> L;
+                _ -> throw({error, invalid_messages})
+            end,
+        IsPreload = (MessagesIn =:= []),
+        case IsPreload of
+            true -> ok;
+            false -> check_messages_cap(MessagesIn)
+        end,
+        {System, Messages} = split_system(MessagesIn),
+        Base = base_request_ollama(Body),
+        {ok, Base#erllama_request{
+            model_id = Model,
+            messages = Messages,
+            prompt = undefined,
+            system = System,
+            tools = undefined,
+            tool_choice = none,
+            is_preload = IsPreload
+        }}
+    catch
+        throw:{error, _} = E -> E
+    end;
+ollama_chat_to_internal(_) ->
+    {error, invalid_json}.
+
+base_request_ollama(Body) ->
+    Options = maps:get(<<"options">>, Body, #{}),
+    KeepAlive = parse_keep_alive(maps:get(<<"keep_alive">>, Body, undefined)),
+    #erllama_request{
+        model_id = <<>>,
+        messages = [],
+        prompt = undefined,
+        system = undefined,
+        tools = undefined,
+        tool_choice = none,
+        grammar = undefined,
+        max_tokens = parse_int(Options, <<"num_predict">>, 1024),
+        temperature = parse_float(Options, <<"temperature">>, 1.0),
+        top_p = parse_float(Options, <<"top_p">>, 1.0),
+        top_k = parse_int(Options, <<"top_k">>, 40),
+        min_p = parse_float(Options, <<"min_p">>, 0.0),
+        seed = parse_optional_int(Options, <<"seed">>),
+        stop = parse_stop(Options),
+        stream = parse_bool(Body, <<"stream">>, true),
+        thinking = disabled,
+        api = openai,
+        request_id = make_id(prefix_for(ollama)),
+        keep_alive_ms = KeepAlive
+    }.
+
+ensure_binary_or_undef(undefined) -> undefined;
+ensure_binary_or_undef(B) when is_binary(B) -> B;
+ensure_binary_or_undef(_) -> undefined.
+
+%% =============================================================================
+%% keep_alive parsing
+%%
+%% Accepts:
+%%   undefined / null -> undefined (caller falls back to server default)
+%%   0                -> 0 (unload after this request)
+%%   -1 | negative    -> infinity (never auto-unload)
+%%   integer N        -> N seconds
+%%   binary "5m"      -> 300_000 ms
+%%   binary "30s"     -> 30_000 ms
+%%   binary "1h"      -> 3_600_000 ms
+%%   binary "0"       -> 0
+%%   binary "-1"      -> infinity
+%% =============================================================================
+
+-spec parse_keep_alive(term()) -> non_neg_integer() | infinity | undefined.
+parse_keep_alive(undefined) ->
+    undefined;
+parse_keep_alive(null) ->
+    undefined;
+parse_keep_alive(0) ->
+    0;
+parse_keep_alive(N) when is_integer(N), N < 0 ->
+    infinity;
+parse_keep_alive(N) when is_integer(N) ->
+    N * 1000;
+parse_keep_alive(F) when is_float(F) ->
+    parse_keep_alive(trunc(F));
+parse_keep_alive(B) when is_binary(B) ->
+    parse_keep_alive_binary(string:trim(B));
+parse_keep_alive(_) ->
+    undefined.
+
+parse_keep_alive_binary(<<>>) ->
+    undefined;
+parse_keep_alive_binary(<<"-", Rest/binary>>) ->
+    case parse_keep_alive_unsigned(Rest) of
+        undefined -> infinity;
+        _N -> infinity
+    end;
+parse_keep_alive_binary(B) ->
+    case parse_keep_alive_unsigned(B) of
+        undefined -> undefined;
+        N -> N
+    end.
+
+parse_keep_alive_unsigned(B) ->
+    case binary:match(B, [<<"ms">>, <<"s">>, <<"m">>, <<"h">>]) of
+        nomatch -> int_seconds(B);
+        {Pos, Len} -> parse_unit(B, Pos, Len)
+    end.
+
+parse_unit(B, Pos, Len) ->
+    NumPart = binary:part(B, 0, Pos),
+    Unit = binary:part(B, Pos, Len),
+    case parse_number(NumPart) of
+        undefined -> undefined;
+        N -> apply_unit(N, Unit)
+    end.
+
+apply_unit(N, <<"ms">>) -> N;
+apply_unit(N, <<"s">>) -> N * 1000;
+apply_unit(N, <<"m">>) -> N * 60 * 1000;
+apply_unit(N, <<"h">>) -> N * 60 * 60 * 1000;
+apply_unit(N, _) -> N * 1000.
+
+parse_number(B) ->
+    try
+        case binary:match(B, <<".">>) of
+            nomatch -> binary_to_integer(B);
+            _ -> trunc(binary_to_float(B))
+        end
+    catch
+        _:_ -> undefined
+    end.
+
+int_seconds(B) ->
+    case parse_number(B) of
+        undefined -> undefined;
+        N -> N * 1000
+    end.
+
+%% =============================================================================
+%% Ollama: response builders
+%% =============================================================================
+
+%% Streaming generate chunk: one JSON object per token. Caller writes
+%% it as a single NDJSON line.
+-spec internal_to_ollama_generate_chunk(binary(), binary(), binary()) -> iodata().
+internal_to_ollama_generate_chunk(Token, _ReqId, Model) ->
+    json:encode(#{
+        <<"model">> => Model,
+        <<"created_at">> => iso8601_now(),
+        <<"response">> => Token,
+        <<"done">> => false
+    }).
+
+%% Streaming generate final: emits the closing JSON with timing.
+-spec internal_to_ollama_generate_final(map(), binary(), binary(), map()) -> iodata().
+internal_to_ollama_generate_final(Stats, _ReqId, Model, Timings) ->
+    json:encode(
+        maps:merge(
+            #{
+                <<"model">> => Model,
+                <<"created_at">> => iso8601_now(),
+                <<"response">> => <<>>,
+                <<"done">> => true,
+                <<"done_reason">> => done_reason_atom(Stats)
+            },
+            timing_fields(Stats, Timings)
+        )
+    ).
+
+%% Non-streaming generate response.
+-spec internal_to_ollama_generate_response(binary(), map(), binary(), map()) -> iodata().
+internal_to_ollama_generate_response(Body, Stats, Model, Timings) ->
+    json:encode(
+        maps:merge(
+            #{
+                <<"model">> => Model,
+                <<"created_at">> => iso8601_now(),
+                <<"response">> => Body,
+                <<"done">> => true,
+                <<"done_reason">> => done_reason_atom(Stats)
+            },
+            timing_fields(Stats, Timings)
+        )
+    ).
+
+-spec internal_to_ollama_chat_chunk(binary(), binary(), binary()) -> iodata().
+internal_to_ollama_chat_chunk(Token, _ReqId, Model) ->
+    json:encode(#{
+        <<"model">> => Model,
+        <<"created_at">> => iso8601_now(),
+        <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => Token},
+        <<"done">> => false
+    }).
+
+-spec internal_to_ollama_chat_final(map(), binary(), binary(), map()) -> iodata().
+internal_to_ollama_chat_final(Stats, _ReqId, Model, Timings) ->
+    json:encode(
+        maps:merge(
+            #{
+                <<"model">> => Model,
+                <<"created_at">> => iso8601_now(),
+                <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => <<>>},
+                <<"done">> => true,
+                <<"done_reason">> => done_reason_atom(Stats)
+            },
+            timing_fields(Stats, Timings)
+        )
+    ).
+
+-spec internal_to_ollama_chat_response(binary(), map(), binary(), map()) -> iodata().
+internal_to_ollama_chat_response(Body, Stats, Model, Timings) ->
+    json:encode(
+        maps:merge(
+            #{
+                <<"model">> => Model,
+                <<"created_at">> => iso8601_now(),
+                <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => Body},
+                <<"done">> => true,
+                <<"done_reason">> => done_reason_atom(Stats)
+            },
+            timing_fields(Stats, Timings)
+        )
+    ).
+
+%% Preload / unload one-shot response. `Reason` is `<<"load">>` or
+%% `<<"unload">>`.
+-spec ollama_preload_response(generate | chat, binary(), binary(), map()) -> iodata().
+ollama_preload_response(generate, Reason, Model, Timings) ->
+    json:encode(
+        maps:merge(
+            #{
+                <<"model">> => Model,
+                <<"created_at">> => iso8601_now(),
+                <<"response">> => <<>>,
+                <<"done">> => true,
+                <<"done_reason">> => Reason
+            },
+            timing_fields(#{}, Timings)
+        )
+    );
+ollama_preload_response(chat, Reason, Model, Timings) ->
+    json:encode(
+        maps:merge(
+            #{
+                <<"model">> => Model,
+                <<"created_at">> => iso8601_now(),
+                <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => <<>>},
+                <<"done">> => true,
+                <<"done_reason">> => Reason
+            },
+            timing_fields(#{}, Timings)
+        )
+    ).
+
+timing_fields(Stats, Timings) ->
+    Base = #{
+        <<"total_duration">> => maps:get(total_duration_ns, Timings, 0),
+        <<"load_duration">> => maps:get(load_duration_ns, Timings, 0)
+    },
+    add_token_counts(Stats, Base).
+
+add_token_counts(Stats, Base) ->
+    maps:merge(Base, #{
+        <<"prompt_eval_count">> => maps:get(prompt_tokens, Stats, 0),
+        <<"eval_count">> => maps:get(completion_tokens, Stats, 0)
+    }).
+
+done_reason_atom(Stats) ->
+    case maps:get(finish_reason, Stats, stop) of
+        stop -> <<"stop">>;
+        length -> <<"length">>;
+        cancelled -> <<"cancelled">>;
+        tool_call -> <<"tool_call">>;
+        Other when is_atom(Other) -> atom_to_binary(Other, utf8);
+        _ -> <<"stop">>
+    end.
+
+iso8601_now() ->
+    Now = erlang:system_time(second),
+    {{Y, Mo, D}, {H, M, S}} = calendar:system_time_to_universal_time(Now, second),
+    list_to_binary(
+        io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ", [Y, Mo, D, H, M, S])
+    ).
 
 split_system(Messages) ->
     {SysParts, Rest} =

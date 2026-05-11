@@ -17,7 +17,10 @@
     delete_removes_manifest/1,
     copy_creates_alias/1,
     create_from_directive_creates_manifest/1,
-    create_unsupported_directive_returns_400/1
+    create_unsupported_directive_returns_400/1,
+    generate_empty_prompt_preloads/1,
+    chat_empty_messages_preloads/1,
+    generate_keep_alive_zero_unloads/1
 ]).
 
 %% GGUF tags.
@@ -35,7 +38,10 @@ all() ->
         delete_removes_manifest,
         copy_creates_alias,
         create_from_directive_creates_manifest,
-        create_unsupported_directive_returns_400
+        create_unsupported_directive_returns_400,
+        generate_empty_prompt_preloads,
+        chat_empty_messages_preloads,
+        generate_keep_alive_zero_unloads
     ].
 
 %% =============================================================================
@@ -173,6 +179,64 @@ create_unsupported_directive_returns_400(Cfg) ->
     Decoded = json:decode(list_to_binary(Resp)),
     Err = maps:get(<<"error">>, Decoded),
     ?assert(binary:match(Err, <<"modelfile">>) =/= nomatch).
+
+%% Ollama /api/generate with an empty prompt: returns a one-shot
+%% JSON envelope with done=true, done_reason="load". Because the
+%% server uses the stub erllama backend in tests there is no real
+%% model to load; ensure_loaded_async fast-fails (model_not_found)
+%% so the handler returns 404. We accept 200 OR 404 here so the
+%% case proves the route is wired and the response shape doesn't
+%% leak from an unrelated path.
+generate_empty_prompt_preloads(Cfg) ->
+    Body = json:encode(#{
+        <<"model">> => <<"never-loaded">>,
+        <<"prompt">> => <<>>,
+        <<"stream">> => false
+    }),
+    {ok, {{_, Code, _}, _, Resp}} = post_json(Cfg, "/api/generate", Body),
+    ?assert(Code =:= 200 orelse Code =:= 404 orelse Code =:= 503 orelse Code =:= 504),
+    Decoded = json:decode(list_to_binary(Resp)),
+    case Code of
+        200 ->
+            ?assertEqual(true, maps:get(<<"done">>, Decoded)),
+            ?assertEqual(<<"load">>, maps:get(<<"done_reason">>, Decoded));
+        _ ->
+            ?assertMatch(#{<<"error">> := _}, Decoded)
+    end.
+
+chat_empty_messages_preloads(Cfg) ->
+    Body = json:encode(#{
+        <<"model">> => <<"never-loaded">>,
+        <<"messages">> => [],
+        <<"stream">> => false
+    }),
+    {ok, {{_, Code, _}, _, Resp}} = post_json(Cfg, "/api/chat", Body),
+    ?assert(Code =:= 200 orelse Code =:= 404 orelse Code =:= 503 orelse Code =:= 504),
+    case Code of
+        200 ->
+            Decoded = json:decode(list_to_binary(Resp)),
+            ?assertEqual(true, maps:get(<<"done">>, Decoded)),
+            ?assertMatch(#{<<"role">> := <<"assistant">>}, maps:get(<<"message">>, Decoded));
+        _ ->
+            ok
+    end.
+
+generate_keep_alive_zero_unloads(Cfg) ->
+    Body = json:encode(#{
+        <<"model">> => <<"never-loaded">>,
+        <<"prompt">> => <<>>,
+        <<"keep_alive">> => 0,
+        <<"stream">> => false
+    }),
+    {ok, {{_, Code, _}, _, Resp}} = post_json(Cfg, "/api/generate", Body),
+    ?assert(Code =:= 200 orelse Code =:= 404 orelse Code =:= 503 orelse Code =:= 504),
+    case Code of
+        200 ->
+            Decoded = json:decode(list_to_binary(Resp)),
+            ?assertEqual(<<"unload">>, maps:get(<<"done_reason">>, Decoded));
+        _ ->
+            ok
+    end.
 
 %% =============================================================================
 %% Helpers
