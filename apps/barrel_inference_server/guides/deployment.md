@@ -5,16 +5,16 @@ it to be:
 
 1. **Release tarball** — the canonical artefact. Bundles ERTS, runs
    anywhere with a matching libc/libstdc++.
-2. **Docker image (CPU)** — `ghcr.io/benoitc/erllama_server:latest`,
+2. **Docker image (CPU)** — `ghcr.io/erllama/erllama_server:latest`,
    multi-arch (linux/amd64, linux/arm64). No GPU.
-3. **Docker image (CUDA)** — `ghcr.io/benoitc/erllama_server:cuda`,
+3. **Docker image (CUDA)** — `ghcr.io/erllama/erllama_server:cuda`,
    linux/amd64 only. Compiled with `-DGGML_CUDA=ON`; runs with
    `--gpus all`.
 
 ## One-liner install (Linux + macOS)
 
 ```sh
-curl -fsSL https://github.com/benoitc/erllama_server/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/erllama/erllama_server/releases/latest/download/install.sh | sh
 ```
 
 Detects OS + arch, downloads the right release tarball, untars to
@@ -41,7 +41,7 @@ Variants:
 ## Manual release tarball
 
 Each release publishes per-platform tarballs at
-`https://github.com/benoitc/erllama_server/releases`:
+`https://github.com/erllama/erllama_server/releases`:
 
 ```
 erllama_server-0.1.0-darwin-arm64.tgz       Mac Apple Silicon, Metal
@@ -58,13 +58,13 @@ client.
 
 ```sh
 # Linux .tar.zst
-curl -fLO https://github.com/benoitc/erllama_server/releases/download/v0.1.0/erllama_server-0.1.0-linux-amd64.tar.zst
+curl -fLO https://github.com/erllama/erllama_server/releases/download/v0.1.0/erllama_server-0.1.0-linux-amd64.tar.zst
 sudo tar -C /opt --use-compress-program=zstd -xf erllama_server-0.1.0-linux-amd64.tar.zst
 /opt/erllama_server/bin/erllama_server daemon
 /opt/erllama_server/bin/erllama version
 
 # macOS .tgz
-curl -fLO https://github.com/benoitc/erllama_server/releases/download/v0.1.0/erllama_server-0.1.0-darwin-arm64.tgz
+curl -fLO https://github.com/erllama/erllama_server/releases/download/v0.1.0/erllama_server-0.1.0-darwin-arm64.tgz
 sudo tar -C /opt -xzf erllama_server-0.1.0-darwin-arm64.tgz
 /opt/erllama_server/bin/erllama_server daemon
 ```
@@ -95,7 +95,7 @@ docker run -d --name erllama \
   -p 8080:8080 \
   -v erllama-cache:/home/erllama/.cache \
   -e ERLLAMA_BOOTSTRAP_MODELS="hf://Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
-  ghcr.io/benoitc/erllama_server:latest
+  ghcr.io/erllama/erllama_server:latest
 ```
 
 The container is **AI-ready** on first start: it pulls the
@@ -110,7 +110,7 @@ separated list of fetch specs):
 ```sh
 docker run -d --name erllama \
   -e ERLLAMA_BOOTSTRAP_MODELS="hf://Qwen/Qwen2.5-7B-Instruct-GGUF,llama3:8b" \
-  ghcr.io/benoitc/erllama_server:latest
+  ghcr.io/erllama/erllama_server:latest
 ```
 
 ## Docker (CUDA / NVIDIA GPU)
@@ -132,7 +132,7 @@ docker run -d --name erllama \
   -p 8080:8080 \
   -v erllama-cache:/home/erllama/.cache \
   -e ERLLAMA_BOOTSTRAP_MODELS="hf://Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m.gguf" \
-  ghcr.io/benoitc/erllama_server:cuda
+  ghcr.io/erllama/erllama_server:cuda
 ```
 
 The image bakes llama.cpp with CUDA + cuBLAS. To actually offload
@@ -155,7 +155,7 @@ docker exec -it erllama nvidia-smi
 
 ## Docker Compose
 
-The repository ships a [`docker-compose.yml`](https://github.com/benoitc/erllama_server/blob/main/docker-compose.yml)
+The repository ships a [`docker-compose.yml`](https://github.com/erllama/erllama_server/blob/main/docker-compose.yml)
 with both profiles:
 
 ```sh

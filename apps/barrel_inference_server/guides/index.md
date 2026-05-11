@@ -55,7 +55,7 @@ that already speak any of those three APIs.
 
 ## Project links
 
-- Source on GitHub: <https://github.com/benoitc/erllama_server>
-- These docs: <https://benoitc.github.io/erllama_server/>
-- Issues: <https://github.com/benoitc/erllama_server/issues>
-- Releases: <https://github.com/benoitc/erllama_server/releases>
+- Source on GitHub: <https://github.com/erllama/erllama_server>
+- These docs: <https://erllama.github.io/erllama_server/>
+- Issues: <https://github.com/erllama/erllama_server/issues>
+- Releases: <https://github.com/erllama/erllama_server/releases>

@@ -43,7 +43,7 @@ filter_param(safetensors) -> <<"&filter=safetensors">>.
 
 headers() ->
     [
-        {<<"User-Agent">>, <<"erllama_server/0.1.0 (+https://github.com/benoitc/erllama_server)">>},
+        {<<"User-Agent">>, <<"erllama_server/0.1.0 (+https://github.com/erllama/erllama_server)">>},
         {<<"Accept">>, <<"application/json">>}
         | hf_auth_headers()
     ].

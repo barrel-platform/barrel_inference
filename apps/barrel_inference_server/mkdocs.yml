@@ -2,9 +2,9 @@ site_name: erllama_server
 site_description: >
   OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of
   erllama. One Erlang/OTP node; real GGUF inference via llama.cpp.
-site_url: https://benoitc.github.io/erllama_server/
-repo_url: https://github.com/benoitc/erllama_server
-repo_name: benoitc/erllama_server
+site_url: https://erllama.github.io/erllama_server/
+repo_url: https://github.com/erllama/erllama_server
+repo_name: erllama/erllama_server
 edit_uri: edit/main/
 
 docs_dir: guides
@@ -91,6 +91,6 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/benoitc/erllama_server
+      link: https://github.com/erllama/erllama_server
 
 copyright: Copyright &copy; 2026 Benoit Chesneau

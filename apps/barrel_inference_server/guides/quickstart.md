@@ -5,7 +5,7 @@ Five minutes from clone to first token.
 ## 1. Build
 
 ```sh
-git clone https://github.com/benoitc/erllama_server.git
+git clone https://github.com/erllama/erllama_server.git
 cd erllama_server
 rebar3 release
 rebar3 escriptize

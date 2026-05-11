@@ -4,7 +4,7 @@
 # into the chosen bin dir.
 #
 # Usage:
-#   curl -fsSL https://github.com/benoitc/erllama_server/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/erllama/erllama_server/releases/latest/download/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --variant cuda12
 #   curl -fsSL .../install.sh | sh -s -- --prefix /opt --bindir /usr/local/bin
 #   curl -fsSL .../install.sh | sh -s -- --version 0.1.0
@@ -15,11 +15,11 @@
 #   ERLLAMA_VARIANT    cpu | cuda12 | rocm   (default cpu)
 #   ERLLAMA_VERSION    e.g. 0.1.0        (default: latest release)
 #
-# License: MIT. https://github.com/benoitc/erllama_server
+# License: MIT. https://github.com/erllama/erllama_server
 
 set -eu
 
-REPO="benoitc/erllama_server"
+REPO="erllama/erllama_server"
 PREFIX="${ERLLAMA_PREFIX:-/usr/local}"
 BINDIR="${ERLLAMA_BINDIR:-$PREFIX/bin}"
 VARIANT="${ERLLAMA_VARIANT:-cpu}"
@@ -143,7 +143,7 @@ cat <<EOF
     Verify:             curl http://127.0.0.1:8080/health
     CLI:                erllama help
 
-  Docs: https://benoitc.github.io/erllama_server/
+  Docs: https://erllama.github.io/erllama_server/
   Repo: https://github.com/$REPO
 
 EOF

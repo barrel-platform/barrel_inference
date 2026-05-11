@@ -9,7 +9,7 @@ version: "3.9"
 
 services:
   erllama_server:
-    image: ghcr.io/benoitc/erllama_server:latest
+    image: ghcr.io/erllama/erllama_server:latest
     profiles: [cpu, ""]
     ports:
       - "8080:8080"
@@ -28,7 +28,7 @@ services:
       retries: 5
 
   erllama_server_cuda:
-    image: ghcr.io/benoitc/erllama_server:cuda
+    image: ghcr.io/erllama/erllama_server:cuda
     profiles: [gpu]
     ports:
       - "8080:8080"

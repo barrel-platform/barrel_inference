@@ -19,9 +19,9 @@
     {modules, []},
     {licenses, ["MIT"]},
     {links, [
-        {"GitHub", "https://github.com/benoitc/erllama_server"},
-        {"Docs", "https://benoitc.github.io/erllama_server/"},
-        {"Changelog", "https://github.com/benoitc/erllama_server/blob/main/CHANGELOG.md"}
+        {"GitHub", "https://github.com/erllama/erllama_server"},
+        {"Docs", "https://erllama.github.io/erllama_server/"},
+        {"Changelog", "https://github.com/erllama/erllama_server/blob/main/CHANGELOG.md"}
     ]},
     {build_tools, ["rebar3"]},
     {files, [

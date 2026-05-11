@@ -314,7 +314,7 @@ spec_hash(Parsed) ->
 %% =============================================================================
 
 ua() ->
-    <<"erllama_server/0.1.0 (+https://github.com/benoitc/erllama_server)">>.
+    <<"erllama_server/0.1.0 (+https://github.com/erllama/erllama_server)">>.
 
 hf_auth_headers() ->
     case os:getenv("HF_TOKEN") of

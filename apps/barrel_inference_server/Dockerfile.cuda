@@ -6,7 +6,7 @@
 # Run with --gpus all (or --runtime=nvidia):
 #   docker run --gpus all -p 8080:8080 \
 #     -v erllama-cache:/home/erllama/.cache \
-#     ghcr.io/benoitc/erllama_server:cuda
+#     ghcr.io/erllama/erllama_server:cuda
 #
 # The build uses a multi-stage layout: erlang:28-bookworm + CUDA
 # toolkit for compilation, then an nvidia/cuda runtime image with

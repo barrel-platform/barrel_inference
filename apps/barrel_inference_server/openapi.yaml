@@ -19,7 +19,7 @@ info:
     url: https://opensource.org/licenses/MIT
   contact:
     name: erllama_server
-    url: https://github.com/benoitc/erllama_server
+    url: https://github.com/erllama/erllama_server
 
 servers:
   - url: http://127.0.0.1:8080
