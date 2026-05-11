@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.1.0). Used for manual runs.'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ---- Release tarball -----------------------------------------------------
+  tarball:
+    name: Release tarball (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: System deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Build production tarball
+        run: rebar3 as prod tar
+      - name: Build escript
+        run: rebar3 as prod escriptize
+      - name: Stage artefacts
+        run: |
+          mkdir -p dist
+          cp _build/prod/rel/erllama_server/erllama_server-*.tar.gz dist/
+          cp _build/prod/bin/erllama dist/erllama-${{ runner.os }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erllama_server-${{ runner.os }}
+          path: dist/*
+
+  # ---- Docker image (CPU; multi-arch) --------------------------------------
+  docker:
+    name: Docker image (CPU)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata (CPU)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/erllama_server
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build + push (linux/amd64,linux/arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=cpu
+          cache-to: type=gha,mode=max,scope=cpu
+
+  # ---- Docker image (CUDA; linux/amd64 only) -------------------------------
+  docker-cuda:
+    name: Docker image (CUDA)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata (CUDA)
+        id: meta-cuda
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/erllama_server
+          flavor: |
+            suffix=-cuda,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=cuda,enable={{is_default_branch}}
+      - name: Build + push CUDA image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.cuda
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-cuda.outputs.tags }}
+          labels: ${{ steps.meta-cuda.outputs.labels }}
+          cache-from: type=gha,scope=cuda
+          cache-to: type=gha,mode=max,scope=cuda
+
+  # ---- GitHub Release with attached artefacts -----------------------------
+  publish:
+    name: GitHub Release
+    needs: [tarball, docker, docker-cuda]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from CHANGELOG
+        id: notes
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # awk grabs the body of the `## [VERSION]` section.
+          awk -v v="$ver" '
+            /^## \[/ {
+              if (in_section) exit
+              gsub("[][]", "", $0)
+              gsub("## ", "", $0)
+              if (index($0, v) == 1) { in_section=1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > release_notes.md
+          echo "notes_file=release_notes.md" >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ steps.notes.outputs.notes_file }}
+          files: dist/*
+          draft: false
+          prerelease: false

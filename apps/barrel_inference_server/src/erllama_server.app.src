@@ -1,5 +1,5 @@
 {application, erllama_server, [
-    {description, "OpenAI/Anthropic-compatible HTTP server for erllama"},
+    {description, "OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of erllama"},
     {vsn, "0.1.0"},
     {registered, [erllama_server_sup, erllama_server_config]},
     {mod, {erllama_server_app, []}},
@@ -18,5 +18,22 @@
     {env, []},
     {modules, []},
     {licenses, ["MIT"]},
-    {links, [{"GitHub", "https://github.com/benoitc/erllama_server"}]}
+    {links, [
+        {"GitHub", "https://github.com/benoitc/erllama_server"},
+        {"Docs", "https://benoitc.github.io/erllama_server/"},
+        {"Changelog", "https://github.com/benoitc/erllama_server/blob/main/CHANGELOG.md"}
+    ]},
+    {build_tools, ["rebar3"]},
+    {files, [
+        "src",
+        "include",
+        "config",
+        "guides",
+        "rebar.config",
+        "rebar.lock",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE",
+        "openapi.yaml"
+    ]}
 ]}.
