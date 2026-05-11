@@ -52,3 +52,10 @@ that already speak any of those three APIs.
   generation never trips the unload timer.
 - **Cancel-on-disconnect** propagates back to llama.cpp.
 - Prometheus `/metrics`, CORS preflight, `X-Request-ID` echo.
+
+## Project links
+
+- Source on GitHub: <https://github.com/benoitc/erllama_server>
+- These docs: <https://benoitc.github.io/erllama_server/>
+- Issues: <https://github.com/benoitc/erllama_server/issues>
+- Releases: <https://github.com/benoitc/erllama_server/releases>

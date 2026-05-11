@@ -1,11 +1,16 @@
 # erllama_server
 
+[![Docs](https://img.shields.io/badge/docs-benoitc.github.io%2Ferllama__server-blue)](https://benoitc.github.io/erllama_server/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of
 [erllama](https://github.com/erllama/erllama). One Erlang/OTP node;
 real GGUF inference via llama.cpp under the hood. Drop-in for SDKs
-that already speak any of those three APIs — including the OpenAI
+that already speak any of those three APIs, including the OpenAI
 Python SDK, the Anthropic SDK, Claude Code as a local backend,
 LangChain / LiteLLM connectors, and the `ollama` CLI shims.
+
+**Documentation: <https://benoitc.github.io/erllama_server/>**
 
 ```
 ┌───────────── erllama_server (Erlang/OTP, this repo) ─────────────┐
@@ -286,6 +291,14 @@ rebar3 ct             # 106 cases (6 skipped without a real GGUF)
 
 The real-model CT suite (`erllama_server_real_model_SUITE`) is
 gated on `LLAMA_TEST_MODEL` pointing at a GGUF file.
+
+## Links
+
+- Documentation: <https://benoitc.github.io/erllama_server/>
+- Source: <https://github.com/benoitc/erllama_server>
+- OpenAPI spec: [`openapi.yaml`](openapi.yaml)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+- Issue tracker: <https://github.com/benoitc/erllama_server/issues>
 
 ## License
 
