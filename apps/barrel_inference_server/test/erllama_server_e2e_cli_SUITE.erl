@@ -22,6 +22,8 @@
     api_generate_empty_prompt_preloads/1,
     api_chat_keep_alive_zero_unloads/1,
     api_chat_after_unload_reloads_cleanly/1,
+    api_chat_truncates_old_messages_on_overflow/1,
+    api_chat_413_when_single_message_overflows/1,
     api_embed_returns_vectors/1,
     api_embeddings_legacy_returns_embedding/1
 ]).
@@ -41,6 +43,8 @@ all() ->
         api_generate_empty_prompt_preloads,
         api_chat_keep_alive_zero_unloads,
         api_chat_after_unload_reloads_cleanly,
+        api_chat_truncates_old_messages_on_overflow,
+        api_chat_413_when_single_message_overflows,
         api_embed_returns_vectors,
         api_embeddings_legacy_returns_embedding
     ].
@@ -252,6 +256,47 @@ api_chat_keep_alive_zero_unloads(Cfg) ->
 %% {noproc, {erllama_model, not_found, _}} because the loader was
 %% latched on `loaded`. After the fix, the loader has exited and the
 %% next ensure_loaded creates a fresh loader that re-runs load_model.
+%% Many short messages whose combined token count overflows context.
+%% The pipeline should silently drop the oldest non-final messages
+%% until it fits, then return 200. Mirrors Ollama's truncation
+%% strategy (server/prompt.go).
+api_chat_truncates_old_messages_on_overflow(Cfg) ->
+    {ok, _} = pull_for(<<"trunc-1">>, <<"latest">>, Cfg),
+    %% Stub tokenizer splits on " ", so each space-separated word is
+    %% one token. With max_context_size=1024 in init_per_suite, we
+    %% need to send ~1100+ tokens worth of messages to force truncation.
+    BigContent = iolist_to_binary(lists:duplicate(150, <<"word ">>)),
+    Messages =
+        [
+            #{<<"role">> => <<"user">>, <<"content">> => BigContent}
+         || _ <- lists:seq(1, 10)
+        ] ++ [#{<<"role">> => <<"user">>, <<"content">> => <<"final">>}],
+    Body = json:encode(#{
+        <<"model">> => <<"trunc-1:latest">>,
+        <<"messages">> => Messages,
+        <<"stream">> => false,
+        <<"options">> => #{<<"num_predict">> => 2}
+    }),
+    {ok, {{_, Status, _}, _, Raw}} = post_json(Cfg, "/api/chat", Body),
+    ?assertEqual(200, Status),
+    Resp = json:decode(list_to_binary(Raw)),
+    ?assertEqual(true, maps:get(<<"done">>, Resp)).
+
+%% A single message whose tokens alone overflow context can't be
+%% truncated. The pipeline must return 413 context_overflow rather
+%% than 200 or 500 (NIF crash).
+api_chat_413_when_single_message_overflows(Cfg) ->
+    {ok, _} = pull_for(<<"trunc-2">>, <<"latest">>, Cfg),
+    %% > 1024 tokens in one message (each space-separated word = 1 token).
+    Huge = iolist_to_binary(lists:duplicate(1100, <<"x ">>)),
+    Body = json:encode(#{
+        <<"model">> => <<"trunc-2:latest">>,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => Huge}],
+        <<"stream">> => false
+    }),
+    {ok, {{_, Status, _}, _, _Raw}} = post_json(Cfg, "/api/chat", Body),
+    ?assertEqual(413, Status).
+
 api_chat_after_unload_reloads_cleanly(Cfg) ->
     {ok, _} = pull_for(<<"reload-1">>, <<"latest">>, Cfg),
     %% First: load + unload synchronously via keep_alive: 0.

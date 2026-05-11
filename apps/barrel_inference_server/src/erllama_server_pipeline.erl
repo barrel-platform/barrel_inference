@@ -174,20 +174,48 @@ step_template(W) ->
 
 apply_chat_template(W) ->
     R = W#work.request,
-    Req = #{
-        messages => R#erllama_request.messages,
-        system => R#erllama_request.system,
-        tools => R#erllama_request.tools
-    },
-    try erllama:apply_chat_template(model_id(W), Req) of
+    Messages = R#erllama_request.messages,
+    System = R#erllama_request.system,
+    Tools = R#erllama_request.tools,
+    apply_chat_template_with_truncate(W, System, Tools, Messages).
+
+%% Render the chat template; if the resulting token count would
+%% overflow n_ctx, drop the oldest non-system message and retry.
+%% Mirrors Ollama's `server/prompt.go` truncation strategy: preserve
+%% system + the final (most recent) message, shave from the head.
+%% Cap retries so a single oversized final turn fails cleanly with
+%% 413 rather than looping. llama.cpp would otherwise segfault when
+%% the prefill batch token count >= n_ctx.
+apply_chat_template_with_truncate(W, System, Tools, Messages) ->
+    case render_template(W, System, Tools, Messages) of
         {ok, Tokens} ->
-            check_token_budget(W, Tokens);
-        {error, no_template} ->
-            {error, 501, no_chat_template};
-        {error, not_supported} ->
-            {error, 501, chat_template_not_supported};
-        {error, Reason} ->
-            {error, 400, Reason}
+            case fits_context(W, length(Tokens)) of
+                ok ->
+                    accept_tokens(W, Tokens);
+                {error, 503, _} = E ->
+                    E;
+                {overflow, Ctx} when length(Messages) =< 1 ->
+                    {error, 413, #{
+                        error => context_overflow,
+                        prompt_tokens => length(Tokens),
+                        context_size => Ctx
+                    }};
+                {overflow, _Ctx} ->
+                    apply_chat_template_with_truncate(
+                        W, System, Tools, drop_oldest_non_system(Messages)
+                    )
+            end;
+        {error, _, _} = E ->
+            E
+    end.
+
+render_template(W, System, Tools, Messages) ->
+    Req = #{messages => Messages, system => System, tools => Tools},
+    try erllama:apply_chat_template(model_id(W), Req) of
+        {ok, Tokens} -> {ok, Tokens};
+        {error, no_template} -> {error, 501, no_chat_template};
+        {error, not_supported} -> {error, 501, chat_template_not_supported};
+        {error, Reason} -> {error, 400, Reason}
     catch
         exit:{noproc, {erllama_model, not_found, _}} ->
             {error, 503, not_loaded};
@@ -199,7 +227,18 @@ apply_chat_template(W) ->
 tokenise_raw(W, Prompt) ->
     try erllama:tokenize(model_id(W), Prompt) of
         {ok, Tokens} ->
-            check_token_budget(W, Tokens);
+            case fits_context(W, length(Tokens)) of
+                ok ->
+                    accept_tokens(W, Tokens);
+                {error, _, _} = E ->
+                    E;
+                {overflow, Ctx} ->
+                    {error, 413, #{
+                        error => context_overflow,
+                        prompt_tokens => length(Tokens),
+                        context_size => Ctx
+                    }}
+            end;
         {error, Reason} ->
             {error, 400, Reason}
     catch
@@ -210,30 +249,35 @@ tokenise_raw(W, Prompt) ->
             {error, 500, model_crashed}
     end.
 
-%% Guard against oversized prompts. llama.cpp segfaults if the input
-%% token count >= n_ctx — the KV cache can't fit the prompt and the
-%% decode dereferences off the end of the slab. We need at least one
-%% token of headroom for generation, so the check is `NToks >= Ctx`.
-%% Generation truncation past max_tokens is handled by the sampler;
-%% it's not a server-side error.
-check_token_budget(W, Tokens) ->
-    NToks = length(Tokens),
+accept_tokens(W, Tokens) ->
+    W1 = put_tokens(W, Tokens),
+    W#work.handler ! {pipeline, templated, Tokens},
+    {ok, W1}.
+
+%% Returns `ok` if the prompt fits, `{overflow, Ctx}` if it doesn't,
+%% or `{error, 503, not_loaded}` if the model has gone away between
+%% load and template. Reading context_size via model_info is a single
+%% gen_statem:call into the model itself; cheap enough to call once
+%% per template attempt.
+fits_context(W, NToks) ->
     case context_size(model_id(W)) of
-        undefined ->
-            %% Model went away between load and template; surface
-            %% as 503 rather than risk a NIF segfault on the next call.
-            {error, 503, not_loaded};
-        Ctx when NToks >= Ctx ->
-            {error, 413, #{
-                error => context_overflow,
-                prompt_tokens => NToks,
-                context_size => Ctx
-            }};
-        _Ctx ->
-            W1 = put_tokens(W, Tokens),
-            W#work.handler ! {pipeline, templated, Tokens},
-            {ok, W1}
+        undefined -> {error, 503, not_loaded};
+        Ctx when NToks >= Ctx -> {overflow, Ctx};
+        _Ctx -> ok
     end.
+
+%% Drop the OLDEST non-system message. System messages anchor the
+%% conversation's persona / tool contract and Ollama preserves them
+%% even after truncation. The very last message is always retained;
+%% if it alone overflows, the caller is told (413).
+drop_oldest_non_system([]) ->
+    [];
+drop_oldest_non_system([Last]) ->
+    [Last];
+drop_oldest_non_system([#{role := <<"system">>} = First | Rest]) ->
+    [First | drop_oldest_non_system(Rest)];
+drop_oldest_non_system([_ | Rest]) ->
+    Rest.
 
 context_size(ModelId) ->
     try erllama:model_info(ModelId) of
