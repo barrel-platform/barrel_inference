@@ -11,19 +11,82 @@ it to be:
    linux/amd64 only. Compiled with `-DGGML_CUDA=ON`; runs with
    `--gpus all`.
 
-## Release tarball
+## One-liner install (Linux + macOS)
 
 ```sh
-rebar3 as prod tar
-scp _build/prod/rel/erllama_server/erllama_server-0.1.0.tar.gz host:/opt/
-ssh host
-  cd /opt
-  tar xzf erllama_server-0.1.0.tar.gz
-  bin/erllama_server daemon
+curl -fsSL https://github.com/benoitc/erllama_server/releases/latest/download/install.sh | sh
+```
+
+Detects OS + arch, downloads the right release tarball, untars to
+`/usr/local/erllama_server`, symlinks `erllama_server` and `erllama`
+into `/usr/local/bin`. Override defaults via flags:
+
+```sh
+curl -fsSL .../install.sh | sh -s -- --variant cuda12        # NVIDIA build
+curl -fsSL .../install.sh | sh -s -- --prefix $HOME/.local   # user install
+curl -fsSL .../install.sh | sh -s -- --version 0.1.0
+```
+
+Variants:
+
+| Platform | Variant tag | Build flag |
+|---|---|---|
+| `linux-amd64` | (none) | CPU |
+| `linux-amd64-cuda12` | `cuda12` | `-DGGML_CUDA=ON` (NVIDIA) |
+| `linux-amd64-rocm` | `rocm` | `-DGGML_HIP=ON` (AMD) |
+| `linux-arm64` | (none) | CPU |
+| `darwin-arm64` | (none) | Metal (auto) |
+| `darwin-x86_64` | (none) | CPU (Intel Macs) |
+
+## Manual release tarball
+
+Each release publishes per-platform tarballs at
+`https://github.com/benoitc/erllama_server/releases`:
+
+```
+erllama_server-0.1.0-darwin-arm64.tgz       Mac Apple Silicon, Metal
+erllama_server-0.1.0-darwin-x86_64.tgz      Mac Intel
+erllama_server-0.1.0-linux-amd64.tar.zst    Linux x86_64, CPU
+erllama_server-0.1.0-linux-amd64-cuda12.tar.zst   + NVIDIA CUDA 12
+erllama_server-0.1.0-linux-amd64-rocm.tar.zst     + AMD ROCm
+erllama_server-0.1.0-linux-arm64.tar.zst    Linux aarch64, CPU
+```
+
+Each tarball bundles the release **and the `erllama` CLI escript**
+under `bin/`, so one extract gives you both the daemon and the
+client.
+
+```sh
+# Linux .tar.zst
+curl -fLO https://github.com/benoitc/erllama_server/releases/download/v0.1.0/erllama_server-0.1.0-linux-amd64.tar.zst
+sudo tar -C /opt --use-compress-program=zstd -xf erllama_server-0.1.0-linux-amd64.tar.zst
+/opt/erllama_server/bin/erllama_server daemon
+/opt/erllama_server/bin/erllama version
+
+# macOS .tgz
+curl -fLO https://github.com/benoitc/erllama_server/releases/download/v0.1.0/erllama_server-0.1.0-darwin-arm64.tgz
+sudo tar -C /opt -xzf erllama_server-0.1.0-darwin-arm64.tgz
+/opt/erllama_server/bin/erllama_server daemon
 ```
 
 Stop with `bin/erllama_server stop`. Foreground / console modes are
 `bin/erllama_server foreground` and `bin/erllama_server console`.
+
+## Building from source
+
+```sh
+rebar3 as prod release            # release in _build/prod/rel/erllama_server/
+rebar3 as prod escriptize         # CLI in _build/prod/bin/erllama
+rebar3 as prod tar                # tarball in _build/prod/rel/erllama_server/
+```
+
+For a GPU build, pass through to the erllama CMake config:
+
+```sh
+ERLLAMA_OPTS="-DGGML_CUDA=ON" rebar3 as prod release   # NVIDIA
+ERLLAMA_OPTS="-DGGML_HIP=ON"  rebar3 as prod release   # AMD
+# macOS: Metal is auto-detected; no flag needed.
+```
 
 ## Docker (CPU)
 
