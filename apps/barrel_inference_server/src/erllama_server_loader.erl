@@ -259,10 +259,14 @@ handle_missing(ModelId) ->
 -spec manifest_to_config(map()) -> map().
 manifest_to_config(Manifest) ->
     Loader = maps:get(<<"loader">>, Manifest, #{}),
+    Params = maps:get(<<"parameters">>, Manifest, #{}),
     BaseOpts = base_opts(),
     MaxCtx = application:get_env(?APP, max_context_size, 4096),
+    %% Modelfile PARAMETER num_ctx overrides the GGUF advertised value
+    %% (but the server-wide max_context_size still caps it).
+    ParamCtx = maps:get(<<"num_ctx">>, Params, undefined),
     NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
-    Ctx = min(NativeCtx, MaxCtx),
+    Ctx = min(default_int(ParamCtx, NativeCtx), MaxCtx),
     BaseOpts#{
         backend => application:get_env(?APP, model_backend, erllama_model_llama),
         model_path => path_string(maps:get(<<"blob_path">>, Manifest)),

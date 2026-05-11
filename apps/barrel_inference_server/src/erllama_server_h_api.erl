@@ -42,7 +42,11 @@ init(Req0, #{op := create} = Opts) ->
 init(Req0, #{op := pull} = Opts) ->
     expect(<<"POST">>, Req0, Opts, fun handle_pull/2);
 init(Req0, #{op := search} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_search/2).
+    expect(<<"POST">>, Req0, Opts, fun handle_search/2);
+init(Req0, #{op := version} = Opts) ->
+    expect(<<"GET">>, Req0, Opts, fun handle_version/2);
+init(Req0, #{op := ps} = Opts) ->
+    expect(<<"GET">>, Req0, Opts, fun handle_ps/2).
 
 info({erllama_fetch_progress, Ref, Bytes, Total}, Req, #pull{job_ref = Ref} = St) ->
     Now = erlang:monotonic_time(millisecond),
@@ -78,6 +82,84 @@ expect(Method, Req0, Opts, Fun) ->
             ),
             {ok, Reply, Opts}
     end.
+
+%% =============================================================================
+%% GET /api/version
+%% =============================================================================
+
+handle_version(Req0, Opts) ->
+    Vsn =
+        case application:get_key(erllama_server, vsn) of
+            {ok, V} when is_list(V) -> list_to_binary(V);
+            {ok, V} when is_binary(V) -> V;
+            _ -> <<"0.0.0">>
+        end,
+    Req1 = cowboy_req:reply(200, json_headers(), json_body(#{<<"version">> => Vsn}), Req0),
+    {ok, Req1, Opts}.
+
+%% =============================================================================
+%% GET /api/ps
+%%
+%% Ollama-shape "running" list. Intersection of erllama:list_models/0
+%% (loaded gen_statems) with the registry manifests + the keepalive
+%% per-model TTL state.
+%% =============================================================================
+
+handle_ps(Req0, Opts) ->
+    Loaded = safe_list_loaded(),
+    Statuses = safe_keepalive_status(),
+    StatusMap = maps:from_list([{maps:get(model, S), S} || S <- Statuses]),
+    Manifests = manifests_by_name(),
+    Models = [ps_entry(Info, StatusMap, Manifests) || Info <- Loaded],
+    Req1 = cowboy_req:reply(
+        200, json_headers(), json_body(#{<<"models">> => Models}), Req0
+    ),
+    {ok, Req1, Opts}.
+
+safe_list_loaded() ->
+    try erllama:list_models() of
+        L when is_list(L) -> L
+    catch
+        _:_ -> []
+    end.
+
+safe_keepalive_status() ->
+    try erllama_server_keepalive:status() of
+        L when is_list(L) -> L
+    catch
+        _:_ -> []
+    end.
+
+manifests_by_name() ->
+    Ms = erllama_server_models:list(),
+    maps:from_list([
+        {<<(maps:get(<<"name">>, M))/binary, ":", (maps:get(<<"tag">>, M))/binary>>, M}
+     || M <- Ms
+    ]).
+
+ps_entry(Info, StatusMap, Manifests) ->
+    Id = maps:get(id, Info, <<>>),
+    Manifest = maps:get(Id, Manifests, #{}),
+    KeepAlive = maps:get(Id, StatusMap, #{}),
+    #{
+        <<"name">> => Id,
+        <<"model">> => Id,
+        <<"size">> => maps:get(<<"size_bytes">>, Manifest, 0),
+        <<"digest">> => maps:get(<<"digest">>, Manifest, null),
+        <<"details">> => details(Manifest),
+        <<"expires_at">> => iso_or_null(maps:get(expires_at_ms, KeepAlive, infinity)),
+        <<"size_vram">> => maps:get(<<"size_bytes">>, Manifest, 0)
+    }.
+
+iso_or_null(infinity) -> null;
+iso_or_null(Ms) when is_integer(Ms) -> iso_from_unix_ms(Ms).
+
+iso_from_unix_ms(Ms) ->
+    Seconds = Ms div 1000,
+    {{Y, Mo, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Seconds, second),
+    list_to_binary(
+        io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ", [Y, Mo, D, H, Mi, S])
+    ).
 
 %% =============================================================================
 %% GET /api/tags
@@ -201,9 +283,12 @@ handle_create(Req0, Opts) ->
     case read_json(Req0) of
         {ok, #{<<"name">> := Name, <<"modelfile">> := Modelfile}, Req1} ->
             case parse_modelfile(Modelfile) of
-                {ok, FromSpec} ->
+                {ok, FromSpec, Overrides} ->
                     {DstName, DstTag} = split_name_tag(Name),
-                    case erllama_server_models:pull(FromSpec, #{name => DstName, tag => DstTag}) of
+                    PullOpts = #{
+                        name => DstName, tag => DstTag, modelfile_overrides => Overrides
+                    },
+                    case erllama_server_models:pull(FromSpec, PullOpts) of
                         {ok, _} ->
                             Req2 = cowboy_req:reply(200, json_headers(), <<>>, Req1),
                             {ok, Req2, Opts};
@@ -219,42 +304,98 @@ handle_create(Req0, Opts) ->
             reply(Req1, Opts, Status, error_body(<<"bad_request">>))
     end.
 
-%% v0.1 honours only `FROM <spec>`. Other directives (PARAMETER,
-%% TEMPLATE, SYSTEM, ADAPTER, MESSAGE) are flagged so a future
-%% revision can wire them into the manifest's loader sub-map.
+%% Returns {ok, FromSpec, Overrides} where Overrides is a map with
+%% optional keys `system`, `template`, and `parameters` (itself a map
+%% of string -> json-encodable value).
+%%
+%% v0.1 supports FROM, PARAMETER, SYSTEM, and TEMPLATE. ADAPTER,
+%% MESSAGE, and LICENSE still return 400 modelfile_directive_not_supported.
 parse_modelfile(Modelfile) ->
     Lines = binary:split(Modelfile, [<<"\r\n">>, <<"\n">>], [global, trim]),
-    case scan_modelfile(Lines, undefined) of
-        {ok, undefined} -> {error, modelfile_missing_from};
-        {ok, Spec} -> {ok, Spec};
-        {error, _} = E -> E
+    case scan_modelfile(Lines, #{from => undefined, parameters => #{}}) of
+        {ok, #{from := undefined}} ->
+            {error, modelfile_missing_from};
+        {ok, #{from := Spec} = Acc} ->
+            Overrides = strip_undef(maps:remove(from, Acc)),
+            {ok, Spec, Overrides};
+        {error, _} = E ->
+            E
     end.
 
-scan_modelfile([], From) ->
-    {ok, From};
-scan_modelfile([Line | Rest], From) ->
+scan_modelfile([], Acc) ->
+    {ok, Acc};
+scan_modelfile([Line | Rest], Acc) ->
     case classify_modelfile_line(strip_ws(Line)) of
         skip ->
-            scan_modelfile(Rest, From);
-        {from, Spec} when From =:= undefined ->
-            scan_modelfile(Rest, Spec);
-        {from, _} ->
+            scan_modelfile(Rest, Acc);
+        {from, _Spec} when map_get(from, Acc) =/= undefined ->
             {error, modelfile_multiple_from};
+        {from, Spec} ->
+            scan_modelfile(Rest, Acc#{from => Spec});
+        {system, Text} ->
+            scan_modelfile(Rest, Acc#{system => Text});
+        {template, Text} ->
+            scan_modelfile(Rest, Acc#{template => Text});
+        {parameter, K, V} ->
+            Params = maps:get(parameters, Acc, #{}),
+            scan_modelfile(Rest, Acc#{parameters => Params#{K => V}});
         {unsupported, Directive} ->
-            {error, {modelfile_directive_not_supported, Directive}}
+            {error, {modelfile_directive_not_supported, Directive}};
+        {error, _} = E ->
+            E
     end.
 
 classify_modelfile_line(<<>>) ->
     skip;
 classify_modelfile_line(<<"#", _/binary>>) ->
     skip;
-classify_modelfile_line(<<"FROM ", Rest/binary>>) ->
-    {from, strip_ws(Rest)};
-classify_modelfile_line(<<"from ", Rest/binary>>) ->
-    {from, strip_ws(Rest)};
 classify_modelfile_line(Line) ->
-    [Directive | _] = binary:split(Line, <<" ">>),
-    {unsupported, Directive}.
+    case binary:split(Line, <<" ">>) of
+        [Directive, Rest] -> classify_directive(uppercase(Directive), strip_ws(Rest));
+        [Single] -> {unsupported, Single}
+    end.
+
+classify_directive(<<"FROM">>, Rest) ->
+    {from, Rest};
+classify_directive(<<"SYSTEM">>, Rest) ->
+    {system, unquote(Rest)};
+classify_directive(<<"TEMPLATE">>, Rest) ->
+    {template, unquote(Rest)};
+classify_directive(<<"PARAMETER">>, Rest) ->
+    case binary:split(Rest, <<" ">>) of
+        [K, V] -> {parameter, K, decode_param_value(strip_ws(V))};
+        _ -> {error, {bad_parameter, Rest}}
+    end;
+classify_directive(D, _) ->
+    {unsupported, D}.
+
+uppercase(Bin) ->
+    list_to_binary(string:uppercase(binary_to_list(Bin))).
+
+unquote(<<"\"", _/binary>> = Bin) ->
+    Size = byte_size(Bin),
+    case Size >= 2 andalso binary:at(Bin, Size - 1) =:= $" of
+        true -> binary:part(Bin, 1, Size - 2);
+        false -> Bin
+    end;
+unquote(Bin) ->
+    Bin.
+
+%% Parameter values: numbers stay numbers; everything else stays binary.
+decode_param_value(B) ->
+    try binary_to_integer(B) of
+        N -> N
+    catch
+        _:_ ->
+            try binary_to_float(B) of
+                F -> F
+            catch
+                _:_ -> unquote(B)
+            end
+    end.
+
+strip_undef(M) ->
+    maps:filter(fun(_, V) -> V =/= undefined end, M).
 
 strip_ws(B) ->
     string:trim(B).

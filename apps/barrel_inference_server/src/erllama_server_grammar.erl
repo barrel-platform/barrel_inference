@@ -26,7 +26,7 @@
 
 -include("erllama_server.hrl").
 
--export([from_tools/2, schema_to_gbnf/1]).
+-export([from_tools/2, schema_to_gbnf/1, from_response_format/1]).
 
 -export_type([gbnf/0]).
 
@@ -68,6 +68,30 @@ from_tools(Tools, Choice) when is_list(Tools) ->
 -spec schema_to_gbnf(map()) -> iodata().
 schema_to_gbnf(Schema) ->
     schema_value(Schema).
+
+%% Build a grammar from a response-format directive (OpenAI
+%% `response_format` or Ollama `format`). Returns `{ok, <<>>}` for
+%% the no-constraint case so callers can install it unconditionally.
+-spec from_response_format(
+    text | json_object | {json_schema, map()}
+) -> {ok, gbnf()} | {error, term()}.
+from_response_format(text) ->
+    {ok, no_grammar()};
+from_response_format(json_object) ->
+    %% Any valid JSON value. Reuses the shared `value` non-terminal.
+    Body = render_rules([{<<"root">>, [<<"ws value ws">>]} | shared_rules()]),
+    {ok, iolist_to_binary(Body)};
+from_response_format({json_schema, Schema}) when is_map(Schema) ->
+    try
+        Body = render_rules(
+            [{<<"root">>, schema_value(Schema)} | shared_rules()]
+        ),
+        {ok, iolist_to_binary(Body)}
+    catch
+        throw:{grammar_error, R} -> {error, R}
+    end;
+from_response_format(_) ->
+    {ok, no_grammar()}.
 
 %%====================================================================
 %% Top-level rule

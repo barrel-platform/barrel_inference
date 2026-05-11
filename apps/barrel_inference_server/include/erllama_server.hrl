@@ -62,7 +62,10 @@
     keep_alive_ms :: non_neg_integer() | infinity | undefined,
     %% true when the request is a load-only / unload-only short
     %% circuit (Ollama: empty prompt or empty messages).
-    is_preload = false :: boolean()
+    is_preload = false :: boolean(),
+    %% Structured-output constraint. `text` = no grammar; any other
+    %% value installs a GBNF that constrains the response.
+    response_format = text :: text | json_object | {json_schema, map()}
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

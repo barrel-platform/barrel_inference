@@ -128,7 +128,11 @@ routes() ->
             {"/api/create", erllama_server_h_api, #{op => create}},
             {"/api/search", erllama_server_h_api, #{op => search}},
             {"/api/generate", erllama_server_h_ollama, #{op => generate}},
-            {"/api/chat", erllama_server_h_ollama, #{op => chat}}
+            {"/api/chat", erllama_server_h_ollama, #{op => chat}},
+            {"/api/version", erllama_server_h_api, #{op => version}},
+            {"/api/ps", erllama_server_h_api, #{op => ps}},
+            {"/api/embed", erllama_server_h_embeddings, #{api => ollama}},
+            {"/api/embeddings", erllama_server_h_embeddings, #{api => ollama_legacy}}
         ]}
     ].
 
