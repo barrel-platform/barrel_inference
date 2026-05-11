@@ -6,7 +6,66 @@
 start(_StartType, _StartArgs) ->
     ok = erllama_server_metrics:init(),
     ok = ensure_model_default_opts(),
-    erllama_server_sup:start_link().
+    case erllama_server_sup:start_link() of
+        {ok, _Sup} = OK ->
+            ok = maybe_bootstrap_models(),
+            OK;
+        E ->
+            E
+    end.
+
+%% On boot, kick off a background pull for any spec listed in the
+%% `bootstrap_models` app env (or the `ERLLAMA_BOOTSTRAP_MODELS` env
+%% var, comma-separated). Models that are already in the registry
+%% are short-circuited by the fetch cache. Failures are logged but
+%% non-fatal so the server still comes up if the network is down.
+maybe_bootstrap_models() ->
+    Specs = bootstrap_specs(),
+    case Specs of
+        [] ->
+            ok;
+        _ ->
+            spawn(fun() -> run_bootstrap(Specs) end),
+            ok
+    end.
+
+bootstrap_specs() ->
+    FromEnv =
+        case os:getenv("ERLLAMA_BOOTSTRAP_MODELS") of
+            false -> [];
+            "" -> [];
+            S -> [string:trim(X) || X <- string:split(S, ",", all), X =/= ""]
+        end,
+    FromCfg = application:get_env(erllama_server, bootstrap_models, []),
+    Combined = FromCfg ++ [list_to_binary(X) || X <- FromEnv, X =/= ""],
+    [to_bin(Spec) || Spec <- Combined].
+
+run_bootstrap(Specs) ->
+    logger:notice("erllama_server: bootstrap pulling ~B model(s)", [length(Specs)]),
+    lists:foreach(fun bootstrap_one/1, Specs).
+
+bootstrap_one(Spec) ->
+    try erllama_server_models:pull(Spec) of
+        {ok, _} ->
+            logger:notice("erllama_server: bootstrap pulled ~ts", [Spec]),
+            ok;
+        {error, Reason} ->
+            logger:warning(
+                "erllama_server: bootstrap pull failed for ~ts: ~p",
+                [Spec, Reason]
+            ),
+            ok
+    catch
+        Class:Why ->
+            logger:warning(
+                "erllama_server: bootstrap pull crashed for ~ts: ~p:~p",
+                [Spec, Class, Why]
+            ),
+            ok
+    end.
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(L) when is_list(L) -> unicode:characters_to_binary(L).
 
 %% Bake the default `erllama:load_model/2` options the loader will
 %% layer manifest-derived fields on top of. Operators can override

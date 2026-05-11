@@ -1,0 +1,56 @@
+version: "3.9"
+
+# Two profiles ship in this compose file.  Default (no profile) runs
+# the CPU image.  `--profile gpu` runs the CUDA image with --gpus all
+# wiring through NVIDIA Container Runtime.
+#
+# A small Qwen 2.5 0.5B Instruct model (~400 MB) is bootstrapped on
+# first start so the container is "AI-ready" right after `up`.
+
+services:
+  erllama_server:
+    image: ghcr.io/benoitc/erllama_server:latest
+    profiles: [cpu, ""]
+    ports:
+      - "8080:8080"
+    volumes:
+      - erllama_cache:/home/erllama/.cache
+    environment:
+      ERLLAMA_BOOTSTRAP_MODELS: "hf://Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+      # Override the default model_cache_dir if you want to mount
+      # a host directory directly:
+      # ERL_FLAGS: "-erllama_server model_cache_dir '\"/host/cache\"'"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 60s
+      retries: 5
+
+  erllama_server_cuda:
+    image: ghcr.io/benoitc/erllama_server:cuda
+    profiles: [gpu]
+    ports:
+      - "8080:8080"
+    volumes:
+      - erllama_cache:/home/erllama/.cache
+    environment:
+      ERLLAMA_BOOTSTRAP_MODELS: "hf://Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q3_k_m.gguf"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    runtime: nvidia
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 120s
+      retries: 5
+
+volumes:
+  erllama_cache:
+    name: erllama_cache
