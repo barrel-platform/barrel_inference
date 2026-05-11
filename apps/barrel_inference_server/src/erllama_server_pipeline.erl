@@ -155,7 +155,7 @@ apply_chat_template(W) ->
         system => R#erllama_request.system,
         tools => R#erllama_request.tools
     },
-    case erllama:apply_chat_template(model_id(W), Req) of
+    try erllama:apply_chat_template(model_id(W), Req) of
         {ok, Tokens} ->
             W1 = put_tokens(W, Tokens),
             W#work.handler ! {pipeline, templated, Tokens},
@@ -166,16 +166,24 @@ apply_chat_template(W) ->
             {error, 501, chat_template_not_supported};
         {error, Reason} ->
             {error, 400, Reason}
+    catch
+        Class:Why:Stack ->
+            log_erllama_crash(model_id(W), apply_chat_template, Class, Why, Stack),
+            {error, 500, model_crashed}
     end.
 
 tokenise_raw(W, Prompt) ->
-    case erllama:tokenize(model_id(W), Prompt) of
+    try erllama:tokenize(model_id(W), Prompt) of
         {ok, Tokens} ->
             W1 = put_tokens(W, Tokens),
             W#work.handler ! {pipeline, templated, Tokens},
             {ok, W1};
         {error, Reason} ->
             {error, 400, Reason}
+    catch
+        Class:Why:Stack ->
+            log_erllama_crash(model_id(W), tokenize, Class, Why, Stack),
+            {error, 500, model_crashed}
     end.
 
 step_grammar(W) ->
@@ -211,7 +219,7 @@ step_queue(W) ->
 
 step_infer(W) ->
     Params = build_params(W#work.request),
-    case erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler) of
+    try erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler) of
         {ok, Ref} ->
             {ok, W#work{infer_ref = Ref}};
         {error, busy} ->
@@ -219,7 +227,23 @@ step_infer(W) ->
             {error, 429, busy};
         {error, Reason} ->
             {error, 500, Reason}
+    catch
+        Class:Why:Stack ->
+            log_erllama_crash(model_id(W), infer, Class, Why, Stack),
+            {error, 500, model_crashed}
     end.
+
+%% Convert crashes coming back from erllama (gen_statem `call` exits,
+%% function clauses inside the model gen_statem, etc.) into a clean
+%% error tuple. The request process never dies; the supervisor
+%% restart-storm that follows a crashing model still happens upstream
+%% but the client sees a JSON 500 instead of a torn HTTP connection.
+log_erllama_crash(ModelId, Step, Class, Why, Stack) ->
+    logger:error(
+        "erllama crash in ~p for ~ts: ~p:~p~n~p",
+        [Step, ModelId, Class, Why, Stack]
+    ),
+    ok.
 
 %%====================================================================
 %% Helpers

@@ -205,8 +205,43 @@ hex_to_bin(Hex) ->
 
 quant_atom(undefined) -> f16;
 quant_atom(null) -> f16;
-quant_atom(Bin) when is_binary(Bin) -> binary_to_atom(Bin, utf8);
+quant_atom(Bin) when is_binary(Bin) -> map_to_supported_quant(Bin);
 quant_atom(_) -> f16.
+
+%% erllama_cache_key:quant_byte/1 only knows a fixed subset of quant
+%% atoms (f32, f16, q4_0/1, q5_0/1, q8_0, q4_k_m/s, q5_k_m/s, q6_k,
+%% q8_k). GGUF labels like q3_k_m, q2_k, iq4_xs, bf16 must be mapped
+%% to a supported atom before reaching erllama, otherwise the cache
+%% key derivation crashes the model gen_statem.
+%%
+%% Mapping is by quant bits (closest supported bucket). The model
+%% fingerprint already differentiates files, so collapsing several
+%% GGUF labels into one cache_key bucket is harmless.
+map_to_supported_quant(<<"f32">>) -> f32;
+map_to_supported_quant(<<"f16">>) -> f16;
+map_to_supported_quant(<<"bf16">>) -> f16;
+map_to_supported_quant(<<"q4_0">>) -> q4_0;
+map_to_supported_quant(<<"q4_1">>) -> q4_1;
+map_to_supported_quant(<<"q5_0">>) -> q5_0;
+map_to_supported_quant(<<"q5_1">>) -> q5_1;
+map_to_supported_quant(<<"q8_0">>) -> q8_0;
+map_to_supported_quant(<<"q4_k_m">>) -> q4_k_m;
+map_to_supported_quant(<<"q4_k_s">>) -> q4_k_s;
+map_to_supported_quant(<<"q5_k_m">>) -> q5_k_m;
+map_to_supported_quant(<<"q5_k_s">>) -> q5_k_s;
+map_to_supported_quant(<<"q6_k">>) -> q6_k;
+map_to_supported_quant(<<"q8_k">>) -> q8_k;
+map_to_supported_quant(<<"q2", _/binary>>) -> q4_k_s;
+map_to_supported_quant(<<"q3", _/binary>>) -> q4_k_s;
+map_to_supported_quant(<<"q4", _/binary>>) -> q4_k_m;
+map_to_supported_quant(<<"q5", _/binary>>) -> q5_k_m;
+map_to_supported_quant(<<"q6", _/binary>>) -> q6_k;
+map_to_supported_quant(<<"q8", _/binary>>) -> q8_0;
+map_to_supported_quant(<<"iq1", _/binary>>) -> q4_k_s;
+map_to_supported_quant(<<"iq2", _/binary>>) -> q4_k_s;
+map_to_supported_quant(<<"iq3", _/binary>>) -> q4_k_s;
+map_to_supported_quant(<<"iq4", _/binary>>) -> q4_k_m;
+map_to_supported_quant(_) -> f16.
 
 default_int(undefined, Default) -> Default;
 default_int(null, Default) -> Default;
