@@ -169,6 +169,9 @@ handle_missing(ModelId) ->
 manifest_to_config(Manifest) ->
     Loader = maps:get(<<"loader">>, Manifest, #{}),
     BaseOpts = base_opts(),
+    MaxCtx = application:get_env(?APP, max_context_size, 4096),
+    NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
+    Ctx = min(NativeCtx, MaxCtx),
     BaseOpts#{
         backend => application:get_env(?APP, model_backend, erllama_model_llama),
         model_path => path_string(maps:get(<<"blob_path">>, Manifest)),
@@ -176,7 +179,7 @@ manifest_to_config(Manifest) ->
         fingerprint_mode => application:get_env(?APP, fingerprint_mode, safe),
         quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
         quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
-        context_size => default_int(maps:get(<<"context_size">>, Manifest, undefined), 4096)
+        context_size => Ctx
     }.
 
 base_opts() ->

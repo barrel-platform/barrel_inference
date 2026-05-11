@@ -10,6 +10,7 @@
 %% =============================================================================
 
 manifest_to_config_basic_test() ->
+    application:set_env(erllama_server, max_context_size, 4096),
     Manifest = manifest(<<"sha256:6a01">>, <<"q4_k_m">>, 4096, 4),
     Config = erllama_server_loader:manifest_to_config(Manifest),
     ?assertEqual("/blobs/sha256-6a01.gguf", maps:get(model_path, Config)),
@@ -17,6 +18,12 @@ manifest_to_config_basic_test() ->
     ?assertEqual(4, maps:get(quant_bits, Config)),
     ?assertEqual(4096, maps:get(context_size, Config)),
     ?assert(is_binary(maps:get(fingerprint, Config))).
+
+manifest_to_config_caps_context_size_test() ->
+    application:set_env(erllama_server, max_context_size, 4096),
+    Manifest = manifest(<<"sha256:6a01">>, <<"q4_k_m">>, 131072, 4),
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    ?assertEqual(4096, maps:get(context_size, Config)).
 
 manifest_to_config_defaults_when_missing_test() ->
     Manifest = #{
@@ -52,6 +59,7 @@ default_opts_returns_not_found_when_no_manifest_test() ->
 
 default_opts_reads_existing_manifest_test() ->
     {ok, Cwd, OldEnv} = with_isolated_cache(),
+    application:set_env(erllama_server, max_context_size, 16384),
     try
         Manifest = manifest(<<"sha256:0011">>, <<"q4_k_m">>, 8192, 4),
         ok = write_manifest(Cwd, <<"my-model">>, <<"latest">>, Manifest),
