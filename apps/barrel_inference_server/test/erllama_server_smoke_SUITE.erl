@@ -17,6 +17,7 @@
     embeddings_unknown_model_returns_404/1,
     embeddings_invalid_json_returns_400/1,
     chat_invalid_json_returns_400/1,
+    accepts_body_above_one_mb/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
     request_id_minted_when_absent/1,
@@ -38,6 +39,7 @@ all() ->
         embeddings_unknown_model_returns_404,
         embeddings_invalid_json_returns_400,
         chat_invalid_json_returns_400,
+        accepts_body_above_one_mb,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
         request_id_minted_when_absent,
@@ -179,6 +181,17 @@ chat_invalid_json_returns_400(Cfg) ->
             [],
             []
         ).
+
+%% Pre-c70004d the body cap was 1 MB; SDK clients shipping multi-KB
+%% tool definitions tripped 413. Send a 5 MB garbage body and assert
+%% we reach the JSON decoder (400) rather than being rejected at the
+%% size boundary. Fast-phase — no model load involved.
+accepts_body_above_one_mb(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Big = binary:copy(<<"x">>, 5 * 1024 * 1024),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", Big}, [], []),
+    ?assertEqual(400, Status).
 
 chat_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
