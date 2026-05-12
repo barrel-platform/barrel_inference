@@ -30,6 +30,7 @@
 ]).
 -export([
     models_lists_real_model/1,
+    load_and_decode_round_trip/1,
     chat_streaming_runs/1,
     chat_non_streaming_runs/1,
     messages_streaming_runs/1,
@@ -44,6 +45,7 @@ suite() -> [{timetrap, {minutes, 5}}].
 
 all() ->
     [
+        load_and_decode_round_trip,
         models_lists_real_model,
         chat_streaming_runs,
         chat_non_streaming_runs,
@@ -193,6 +195,63 @@ file_sha256(Path) ->
 %%====================================================================
 %% Tests
 %%====================================================================
+
+%% Regression for the SIGSEGV observed on Apple M4 Pro during Metal
+%% device init / first prefill. The model is already loaded in
+%% init_per_suite via erllama:load_model/2, so if the load itself
+%% crashes the suite errors out at setup. This case then proves the
+%% subsequent prefill + a single decode round-trip survives — the
+%% exact native paths that died on the user's machine (ggml-metal
+%% kernel compile, sched_reserve, first llama_decode). A SIGSEGV in
+%% any of those tears down the BEAM and CT records the suite as
+%% crashed rather than silently passing.
+load_and_decode_round_trip(Cfg) ->
+    Model = ?config(model, Cfg),
+    %% Sanity: the gen_statem registered by load_model is alive and
+    %% addressable. If Metal init segfaulted during load this fails
+    %% at the same instant.
+    Info = erllama:model_info(Model),
+    ?assert(is_map(Info)),
+    ?assert(maps:is_key(status, Info)),
+    %% Minimal end-to-end: tokenize a short prompt, run prefill via
+    %% the inference path, take exactly one generated token. Exercises
+    %% the prefill graph + Metal command-queue submission on the M-series
+    %% device. Cancel rather than letting it run to completion to keep
+    %% the test fast.
+    {ok, Tokens} = erllama:tokenize(Model, <<"hi">>),
+    ?assert(is_list(Tokens) andalso length(Tokens) > 0),
+    Self = self(),
+    {ok, Ref} = erllama:infer(
+        Model,
+        Tokens,
+        #{response_tokens => 1, temperature => 0.0},
+        Self
+    ),
+    %% Wait for at least one token OR a clean done — either proves
+    %% the native path didn't tip over. Hard 30s timeout caps a
+    %% wedged path.
+    Outcome =
+        receive
+            {erllama_token, Ref, _} -> token;
+            {erllama_done, Ref, _} -> done;
+            {erllama_error, Ref, Reason} -> {error, Reason}
+        after 30000 ->
+            timeout
+        end,
+    erllama:cancel(Ref),
+    %% Drain any pending messages so subsequent cases start clean.
+    drain_inference(Ref, 500),
+    ?assert(Outcome =:= token orelse Outcome =:= done).
+
+drain_inference(Ref, BudgetMs) ->
+    receive
+        {erllama_token, Ref, _} -> drain_inference(Ref, BudgetMs);
+        {erllama_done, Ref, _} -> ok;
+        {erllama_error, Ref, _} -> ok;
+        {erllama_cancelled, Ref} -> ok
+    after BudgetMs ->
+        ok
+    end.
 
 models_lists_real_model(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/models",
