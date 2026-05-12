@@ -170,7 +170,11 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
             tools = Tools,
             tool_choice = ToolChoice,
             thinking = Thinking,
-            cache_hints = CacheHints
+            cache_hints = CacheHints,
+            %% Anthropic uses `stop_sequences` (plural); base_request
+            %% only reads `stop` (OpenAI/Ollama naming). Override here
+            %% so Anthropic clients don't lose their stop tokens.
+            stop = parse_stop_sequences(Body)
         }}
     catch
         throw:{error, _} = E -> E
@@ -1197,6 +1201,14 @@ parse_stop(Body) ->
     case maps:get(<<"stop">>, Body, undefined) of
         undefined -> [];
         B when is_binary(B) -> [B];
+        L when is_list(L) -> [X || X <- L, is_binary(X)];
+        _ -> []
+    end.
+
+%% Anthropic's `/v1/messages` uses `stop_sequences` (plural, list-only).
+%% Same semantics as OpenAI's `stop`: generation halts on a match.
+parse_stop_sequences(Body) ->
+    case maps:get(<<"stop_sequences">>, Body, undefined) of
         L when is_list(L) -> [X || X <- L, is_binary(X)];
         _ -> []
     end.
