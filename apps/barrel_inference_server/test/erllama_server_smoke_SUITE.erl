@@ -17,6 +17,7 @@
     embeddings_unknown_model_returns_404/1,
     embeddings_invalid_json_returns_400/1,
     chat_invalid_json_returns_400/1,
+    messages_streaming_unknown_model_emits_event_error/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
     request_id_minted_when_absent/1,
@@ -38,6 +39,7 @@ all() ->
         embeddings_unknown_model_returns_404,
         embeddings_invalid_json_returns_400,
         chat_invalid_json_returns_400,
+        messages_streaming_unknown_model_emits_event_error,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
         request_id_minted_when_absent,
@@ -179,6 +181,28 @@ chat_invalid_json_returns_400(Cfg) ->
             [],
             []
         ).
+
+%% Pre-stream errors on a streaming /v1/messages request must surface
+%% as an Anthropic SSE `event: error` frame, not a JSON envelope.
+%% Anthropic SDKs read the streaming body as SSE; a JSON response
+%% decodes as a transport error rather than a proper error event.
+messages_streaming_unknown_model_emits_event_error(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 8,
+        <<"stream">> => true,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, Status, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Bin = list_to_binary(RespBody),
+    %% Cowboy streams with HTTP 200; the error is conveyed via the
+    %% SSE error event rather than an HTTP status. (200 is what
+    %% Anthropic itself returns for the streaming-error path.)
+    ?assertEqual(200, Status),
+    ?assert(binary:match(Bin, <<"event: error">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"type\":\"error\"">>) =/= nomatch).
 
 chat_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",

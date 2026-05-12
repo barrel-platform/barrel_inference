@@ -181,19 +181,19 @@ info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
 info({pipeline, error, Status, Reason}, Req0, S = #st{stream_started = true}) ->
     %% Post-stream: emit an Anthropic error event, close the body.
     record_metrics(S, Status),
-    anthropic_event(
-        Req0,
-        <<"error">>,
-        #{
-            <<"type">> => <<"error">>,
-            <<"error">> => #{
-                <<"type">> => <<"api_error">>,
-                <<"message">> => to_bin(Reason)
-            }
-        }
-    ),
+    anthropic_event(Req0, <<"error">>, anthropic_error_body(Status, Reason)),
     cowboy_req:stream_body(<<>>, fin, Req0),
     {stop, Req0, S};
+info({pipeline, error, Status, Reason}, Req0, S = #st{stream = true}) ->
+    %% Pre-stream error on a streaming request: open the SSE channel
+    %% and emit the `event: error` frame so Anthropic SDKs see a
+    %% proper stream-error event instead of a JSON envelope they
+    %% can't decode as SSE.
+    record_metrics(S, Status),
+    {Req1, S1} = ensure_stream(Req0, S),
+    anthropic_event(Req1, <<"error">>, anthropic_error_body(Status, Reason)),
+    cowboy_req:stream_body(<<>>, fin, Req1),
+    {stop, Req1, S1};
 info({pipeline, error, Status, Reason}, Req0, S) ->
     record_metrics(S, Status),
     Req1 = json_error(Status, Reason, Req0),
@@ -602,20 +602,23 @@ reply_json_error(Status, Reason, Req0) ->
     {ok, Req1, undefined}.
 
 json_error(Status, Reason, Req0) ->
-    %% Anthropic error envelope: {"type":"error","error":{...}}.
-    Body = #{
+    cowboy_req:reply(
+        Status,
+        #{<<"content-type">> => <<"application/json">>},
+        json:encode(anthropic_error_body(Status, Reason)),
+        Req0
+    ).
+
+%% Shared Anthropic error envelope used by both the JSON pre-stream
+%% reply and the SSE `event: error` frame.
+anthropic_error_body(Status, Reason) ->
+    #{
         <<"type">> => <<"error">>,
         <<"error">> => #{
             <<"type">> => anthropic_error_type(Status),
             <<"message">> => to_bin(Reason)
         }
-    },
-    cowboy_req:reply(
-        Status,
-        #{<<"content-type">> => <<"application/json">>},
-        json:encode(Body),
-        Req0
-    ).
+    }.
 
 anthropic_error_type(400) -> <<"invalid_request_error">>;
 anthropic_error_type(404) -> <<"not_found_error">>;
