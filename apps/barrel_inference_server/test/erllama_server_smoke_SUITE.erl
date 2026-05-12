@@ -19,6 +19,8 @@
     chat_invalid_json_returns_400/1,
     messages_streaming_unknown_model_emits_event_error/1,
     anthropic_version_header_echoed/1,
+    count_tokens_unknown_model_returns_503/1,
+    count_tokens_invalid_json_returns_400/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
     request_id_minted_when_absent/1,
@@ -42,6 +44,8 @@ all() ->
         chat_invalid_json_returns_400,
         messages_streaming_unknown_model_emits_event_error,
         anthropic_version_header_echoed,
+        count_tokens_unknown_model_returns_503,
+        count_tokens_invalid_json_returns_400,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
         request_id_minted_when_absent,
@@ -205,6 +209,30 @@ messages_streaming_unknown_model_emits_event_error(Cfg) ->
     ?assertEqual(200, Status),
     ?assert(binary:match(Bin, <<"event: error">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"type\":\"error\"">>) =/= nomatch).
+
+%% /v1/messages/count_tokens with no loaded model returns 503
+%% rather than try to load on demand. Anthropic's count_tokens is
+%% meant to be cheap; loading a multi-GB model just to count
+%% tokens defeats the purpose.
+count_tokens_unknown_model_returns_503(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
+    }),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    ?assertEqual(503, Status).
+
+count_tokens_invalid_json_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(
+            post,
+            {Url, [], "application/json", "{not json"},
+            [],
+            []
+        ).
 
 %% Anthropic SDKs always send `anthropic-version` and read it back
 %% from the response. Echo whatever the client sent (or our default).

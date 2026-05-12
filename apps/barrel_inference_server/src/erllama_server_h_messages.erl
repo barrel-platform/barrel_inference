@@ -77,23 +77,65 @@ init(Req0, Opts) ->
             {ok, Req2, Opts}
     end.
 
-handle_post(Req0, _Opts) ->
+handle_post(Req0, Opts) ->
     MaxBody = erllama_server_config:max_request_body_bytes(),
     case cowboy_req:read_body(Req0, #{length => MaxBody}) of
-        {ok, Body, Req1} -> fast_phase(Body, Req1);
+        {ok, Body, Req1} -> fast_phase(Body, Req1, Opts);
         {more, _, Req1} -> reply_json_error(413, request_too_large, Req1)
     end.
 
-fast_phase(Body, Req0) ->
+fast_phase(Body, Req0, Opts) ->
     case decode(Body) of
-        {ok, Map} -> translate(Map, Req0);
+        {ok, Map} -> translate(Map, Req0, Opts);
         error -> reply_json_error(400, invalid_json, Req0)
     end.
 
-translate(Map, Req0) ->
+translate(Map, Req0, Opts) ->
     case erllama_server_translate:anthropic_messages_to_internal(Map) of
-        {ok, R} -> start_pipeline(R, Req0);
+        {ok, R} -> dispatch(R, Req0, Opts);
         {error, Reason} -> reply_json_error(400, Reason, Req0)
+    end.
+
+dispatch(R, Req0, #{op := count_tokens}) ->
+    count_tokens(R, Req0);
+dispatch(R, Req0, _Opts) ->
+    start_pipeline(R, Req0).
+
+%% Anthropic's /v1/messages/count_tokens: same body shape as
+%% /v1/messages, returns `{"input_tokens": N}`. No inference, no
+%% queue slot, no streaming. The tokenizer is the model's BPE
+%% table inside the GGUF, so we need the model loaded; if it isn't,
+%% return 503 rather than load on demand — count_tokens is meant
+%% to be CHEAP.
+count_tokens(R0, Req0) ->
+    Requested = R0#erllama_request.model_id,
+    Real = erllama_server_config:resolve_model(Requested),
+    Req = #{
+        messages => R0#erllama_request.messages,
+        system => R0#erllama_request.system,
+        tools => R0#erllama_request.tools
+    },
+    try erllama:apply_chat_template(Real, Req) of
+        {ok, Tokens} ->
+            Body = json:encode(#{<<"input_tokens">> => length(Tokens)}),
+            Req1 = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                Body,
+                Req0
+            ),
+            {ok, Req1, undefined};
+        {error, no_template} ->
+            reply_json_error(501, no_chat_template, Req0);
+        {error, not_supported} ->
+            reply_json_error(501, chat_template_not_supported, Req0);
+        {error, Reason} ->
+            reply_json_error(400, Reason, Req0)
+    catch
+        exit:{noproc, {erllama_model, not_found, _}} ->
+            reply_json_error(503, not_loaded, Req0);
+        _Class:_Why ->
+            reply_json_error(500, model_crashed, Req0)
     end.
 
 start_pipeline(R0, Req0) ->
