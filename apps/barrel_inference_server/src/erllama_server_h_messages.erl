@@ -63,12 +63,18 @@
 %%====================================================================
 
 init(Req0, Opts) ->
-    case cowboy_req:method(Req0) of
+    %% Echo the anthropic-version request header onto the response.
+    %% Anthropic SDKs send this on every request and read it back to
+    %% guard against accidental cross-version proxies. Default to the
+    %% baseline 2023-06-01 if the client omitted it.
+    Version = cowboy_req:header(<<"anthropic-version">>, Req0, <<"2023-06-01">>),
+    Req1 = cowboy_req:set_resp_header(<<"anthropic-version">>, Version, Req0),
+    case cowboy_req:method(Req1) of
         <<"POST">> ->
-            handle_post(Req0, Opts);
+            handle_post(Req1, Opts);
         _ ->
-            Req1 = cowboy_req:reply(405, #{}, <<>>, Req0),
-            {ok, Req1, Opts}
+            Req2 = cowboy_req:reply(405, #{}, <<>>, Req1),
+            {ok, Req2, Opts}
     end.
 
 handle_post(Req0, _Opts) ->

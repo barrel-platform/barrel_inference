@@ -18,6 +18,7 @@
     embeddings_invalid_json_returns_400/1,
     chat_invalid_json_returns_400/1,
     messages_streaming_unknown_model_emits_event_error/1,
+    anthropic_version_header_echoed/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
     request_id_minted_when_absent/1,
@@ -40,6 +41,7 @@ all() ->
         embeddings_invalid_json_returns_400,
         chat_invalid_json_returns_400,
         messages_streaming_unknown_model_emits_event_error,
+        anthropic_version_header_echoed,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
         request_id_minted_when_absent,
@@ -203,6 +205,25 @@ messages_streaming_unknown_model_emits_event_error(Cfg) ->
     ?assertEqual(200, Status),
     ?assert(binary:match(Bin, <<"event: error">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"type\":\"error\"">>) =/= nomatch).
+
+%% Anthropic SDKs always send `anthropic-version` and read it back
+%% from the response. Echo whatever the client sent (or our default).
+anthropic_version_header_echoed(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 4,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, _, _}, Headers, _}} =
+        httpc:request(
+            post,
+            {Url, [{"anthropic-version", "2024-12-01"}], "application/json", Body},
+            [],
+            []
+        ),
+    {value, {_, Version}} = lists:keysearch("anthropic-version", 1, Headers),
+    ?assertEqual("2024-12-01", Version).
 
 chat_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
