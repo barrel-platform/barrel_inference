@@ -298,7 +298,12 @@ chat_cancel_on_disconnect_releases_slot(Cfg) ->
     ],
     ok = gen_tcp:send(Sock, iolist_to_binary(Req)),
     %% Read at least the headers + one chunk to confirm streaming.
-    {ok, _Bytes} = gen_tcp:recv(Sock, 0, 2000),
+    %% CI runners can be slow to schedule the cowboy stream open +
+    %% first model token (the full pipeline: load -> template ->
+    %% queue -> admit -> infer -> first token). 2s was tight; bump
+    %% to 15s so a heavily loaded runner doesn't false-fail before
+    %% we even get to the cancel test.
+    {ok, _Bytes} = gen_tcp:recv(Sock, 0, 15000),
     %% Drop the connection.
     gen_tcp:close(Sock),
     %% Now a fresh non-streaming request must land cleanly. The
@@ -380,8 +385,13 @@ embeddings_returns_vector(Cfg) ->
 %% SSE streams: the stub backend never produces eog so the stream
 %% finishes when response_target is hit.
 http_collect(Url, Body) ->
+    %% httpc default is too tight for slow CI runners; bump both
+    %% the connect and the total request timeout so a stub-backed
+    %% stream that takes a few seconds to fully drain doesn't
+    %% time out before we read the closing chunk.
+    HttpOpts = [{timeout, 20000}, {connect_timeout, 5000}],
     {ok, {{_, 200, _}, _Headers, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        httpc:request(post, {Url, [], "application/json", Body}, HttpOpts, []),
     list_to_binary(RespBody).
 
 code_of({ok, {{_, Code, _}, _, _}}) -> Code;
