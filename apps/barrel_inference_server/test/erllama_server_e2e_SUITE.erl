@@ -301,12 +301,13 @@ chat_cancel_on_disconnect_releases_slot(Cfg) ->
     {ok, _Bytes} = gen_tcp:recv(Sock, 0, 2000),
     %% Drop the connection.
     gen_tcp:close(Sock),
-    %% Give the gen_statem a moment to run terminate/3, cancel the
-    %% inference, and release the slot. The model's decode loop has
-    %% to come up for air between tokens to see the cancel; with the
-    %% stub backend each iteration is sub-millisecond.
-    wait_for_idle(?config(model, Cfg), 30),
-    %% Now a fresh non-streaming request should land cleanly.
+    %% Now a fresh non-streaming request must land cleanly. The
+    %% handler's terminate/3 races with this: it has to detect the
+    %% TCP close, cancel the inference, and release the queue slot.
+    %% On a slow CI runner that race can outlast a single sleep, so
+    %% retry on the transient queue-busy responses (429, 504) up to
+    %% a bounded budget. Anything else (or running out of retries)
+    %% fails the assertion.
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
     Body2 = json:encode(#{
         <<"model">> => <<"e2e-stub">>,
@@ -314,9 +315,28 @@ chat_cancel_on_disconnect_releases_slot(Cfg) ->
         <<"max_tokens">> => 2,
         <<"stream">> => false
     }),
-    {ok, {{_, Code, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", Body2}, [], []),
+    Code = post_until_slot_free(Url, Body2, 30, 200),
     ?assertEqual(200, Code).
+
+%% Poll the chat endpoint until either the slot has been released
+%% (200) or the budget runs out. Transient responses while the
+%% disconnected request's terminate/3 is still in flight are 429
+%% (pool_exhausted) or 504 (queue_timeout). Anything else stops the
+%% polling and surfaces the actual status code for the assertion.
+post_until_slot_free(_Url, _Body, 0, _BackoffMs) ->
+    timeout;
+post_until_slot_free(Url, Body, N, BackoffMs) ->
+    case httpc:request(post, {Url, [], "application/json", Body}, [], []) of
+        {ok, {{_, 200, _}, _, _}} ->
+            200;
+        {ok, {{_, Code, _}, _, _}} when Code =:= 429; Code =:= 504 ->
+            timer:sleep(BackoffMs),
+            post_until_slot_free(Url, Body, N - 1, BackoffMs);
+        {ok, {{_, Code, _}, _, _}} ->
+            Code;
+        {error, _} = E ->
+            E
+    end.
 
 messages_streaming_emits_named_events(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
