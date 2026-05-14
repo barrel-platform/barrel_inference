@@ -32,10 +32,17 @@ all() ->
     [
         chat_streaming_emits_done_sentinel,
         chat_non_streaming_returns_full_response,
-        chat_busy_returns_429,
+        %% chat_cancel + messages_streaming + embeddings all need a
+        %% clean queue slot. chat_busy_returns_429 deliberately
+        %% saturates the queue by spawning a Holder process and then
+        %% `exit(Holder, kill)`-ing it; killing the Erlang process
+        %% does NOT close the httpc-internal TCP socket, so the
+        %% server-side handler keeps holding the slot until cowboy's
+        %% idle_timeout fires. Running it last localises the damage.
         chat_cancel_on_disconnect_releases_slot,
         messages_streaming_emits_named_events,
-        embeddings_returns_vector
+        embeddings_returns_vector,
+        chat_busy_returns_429
     ].
 
 %%====================================================================
