@@ -37,6 +37,8 @@
     anthropic_tool_choice_any_maps_required/1,
     anthropic_tool_choice_none/1,
     anthropic_thinking_enabled/1,
+    anthropic_thinking_display_and_budget/1,
+    anthropic_thinking_invalid_falls_back/1,
     anthropic_stop_sequences_parsed/1,
     anthropic_metadata_user_id_captured/1,
     anthropic_metadata_user_id_absent_or_bad/1,
@@ -115,6 +117,8 @@ all() ->
         anthropic_tool_choice_any_maps_required,
         anthropic_tool_choice_none,
         anthropic_thinking_enabled,
+        anthropic_thinking_display_and_budget,
+        anthropic_thinking_invalid_falls_back,
         anthropic_stop_sequences_parsed,
         anthropic_metadata_user_id_captured,
         anthropic_metadata_user_id_absent_or_bad,
@@ -435,7 +439,45 @@ anthropic_thinking_enabled(_Cfg) ->
         <<"thinking">> => #{<<"type">> => <<"enabled">>}
     },
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
-    ?assertEqual(enabled, R#erllama_request.thinking).
+    ?assertEqual(enabled, R#erllama_request.thinking),
+    ?assertEqual(visible, R#erllama_request.thinking_display),
+    ?assertEqual(undefined, R#erllama_request.thinking_budget).
+
+%% thinking.display = "omitted" suppresses wire visibility of thinking
+%% blocks; thinking.budget_tokens is captured for forward compat.
+anthropic_thinking_display_and_budget(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"thinking">> => #{
+            <<"type">> => <<"enabled">>,
+            <<"display">> => <<"omitted">>,
+            <<"budget_tokens">> => 512
+        }
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual(enabled, R#erllama_request.thinking),
+    ?assertEqual(omitted, R#erllama_request.thinking_display),
+    ?assertEqual(512, R#erllama_request.thinking_budget).
+
+%% Bad / missing values fall back to defaults rather than crashing.
+anthropic_thinking_invalid_falls_back(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"thinking">> => #{
+            <<"type">> => <<"enabled">>,
+            <<"display">> => <<"weird">>,
+            <<"budget_tokens">> => -3
+        }
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual(visible, R#erllama_request.thinking_display),
+    ?assertEqual(undefined, R#erllama_request.thinking_budget).
 
 %% Anthropic uses `stop_sequences` (plural). Previously the translator
 %% read only `stop` (OpenAI naming) so Anthropic clients lost their

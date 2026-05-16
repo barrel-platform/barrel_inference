@@ -175,7 +175,9 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
             %% only reads `stop` (OpenAI/Ollama naming). Override here
             %% so Anthropic clients don't lose their stop tokens.
             stop = parse_stop_sequences(Body),
-            user_id = parse_metadata_user_id(Body)
+            user_id = parse_metadata_user_id(Body),
+            thinking_display = parse_anthropic_thinking_display(Body),
+            thinking_budget = parse_anthropic_thinking_budget(Body)
         }}
     catch
         throw:{error, _} = E -> E
@@ -1234,6 +1236,24 @@ parse_anthropic_thinking(Body) ->
         #{<<"type">> := <<"disabled">>} -> disabled;
         #{<<"type">> := <<"enabled">>} -> enabled;
         _ -> disabled
+    end.
+
+%% `thinking.display` defaults to "visible". "omitted" tells the server
+%% to keep producing thinking on the engine side but not surface it on
+%% the wire (no thinking_delta SSE, no thinking content block).
+parse_anthropic_thinking_display(Body) ->
+    case maps:get(<<"thinking">>, Body, undefined) of
+        #{<<"display">> := <<"omitted">>} -> omitted;
+        _ -> visible
+    end.
+
+%% `thinking.budget_tokens` is a hint for how many tokens the model is
+%% allowed to spend on thinking. Captured for forward compat; the
+%% engine has no budget surface yet.
+parse_anthropic_thinking_budget(Body) ->
+    case maps:get(<<"thinking">>, Body, undefined) of
+        #{<<"budget_tokens">> := N} when is_integer(N), N > 0 -> N;
+        _ -> undefined
     end.
 
 required_binary(Map, Key) ->
