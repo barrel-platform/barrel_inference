@@ -332,6 +332,76 @@ rewrite: `claude-sonnet-4-5` -> `Qwen/...:main` -> registry
 lookup. Unknown ids fall through to a registry lookup as-is, so
 the registry name itself always works.
 
+### Multiple Claude models on one server
+
+`model_aliases` is the mechanism for "Claude Code's model picker
+should route to N different local models." Aliases are an
+arbitrary `client-facing id -> registry id` map; nothing forces
+multiple aliases to point at the same backend. Map each Claude id
+your client knows about to whichever local model fits:
+
+```erlang
+{model_aliases, #{
+  %% Claude's flagship -> your largest local model.
+  <<"claude-opus-4-7">>            => <<"meta-llama/Llama-3.3-70B-Instruct-GGUF:q5_k_m">>,
+  <<"claude-opus-4">>              => <<"meta-llama/Llama-3.3-70B-Instruct-GGUF:q5_k_m">>,
+  %% Mid-tier -> a 7-14B coder.
+  <<"claude-sonnet-4-5">>          => <<"Qwen/Qwen2.5-Coder-14B-Instruct-GGUF:main">>,
+  <<"claude-3-5-sonnet-20241022">> => <<"Qwen/Qwen2.5-Coder-14B-Instruct-GGUF:main">>,
+  %% Fast -> a small model that loads quickly.
+  <<"claude-haiku-4-5">>           => <<"Qwen/Qwen2.5-3B-Instruct-GGUF:main">>,
+  <<"claude-3-5-haiku-20241022">>  => <<"Qwen/Qwen2.5-3B-Instruct-GGUF:main">>
+}}
+```
+
+Claude Code's UI then switches between these without code changes
+on either side. Same goes for the API: a client passing
+`"model": "claude-opus-4-7"` lands on the 70B; passing
+`"claude-haiku-4-5"` lands on the 3B. The handler reads the model
+from the body, runs `erllama_server_config:resolve_model/1`
+(persistent_term-backed, single map lookup), and the rest of the
+pipeline is identical regardless of which alias you matched.
+
+A few practical patterns:
+
+- **Pin Claude defaults to one model**: alias only the Claude ids
+  Claude Code sends out of the box (current defaults are
+  `claude-opus-4-7`, `claude-sonnet-4-5`, `claude-haiku-4-5`).
+  Then users never need `--model` on the CLI.
+- **Coding vs chat split**: alias `claude-sonnet-*` to a
+  code-specialised local model (Qwen Coder, DeepSeek Coder) and
+  `claude-opus-*` / `claude-haiku-*` to a general-purpose one.
+- **Test multiple models without restart**: call
+  `erllama_server_config:set_aliases/1` from a connected shell
+  with the new map. Hot-reloads instantly; in-flight requests
+  resolve against the snapshot they read at request time.
+- **Mixed local-id / Claude-id traffic**: aliases are
+  alias-or-identity. If the client sends a registry id directly
+  it bypasses the map and goes straight to the registry.
+
+The behaviour replaces what tools like `ds4` do (route Claude
+Code's Anthropic API requests to local models): `erllama_server`
+is that route, with the local registry + multi-tier KV cache
+underneath.
+
+### Optional API-key allowlist
+
+By default `/v1/messages` does not validate `x-api-key`, which
+matches the public Claude Code default of sending the literal
+string `not-used` (or `ANTHROPIC_AUTH_TOKEN` if set). For
+deployments behind a public address, set an allowlist:
+
+```erlang
+{anthropic_api_keys, [
+  <<"sk-erllama-alice-…">>,
+  <<"sk-erllama-bob-…">>
+]}
+```
+
+Requests with `x-api-key` not in the list get
+`401 authentication_error` in the standard Anthropic envelope.
+Leave empty (default) for trusted local use.
+
 ### Big requests and the 32 MB ceiling
 
 Claude Code's HTTP client refuses to send any request body larger

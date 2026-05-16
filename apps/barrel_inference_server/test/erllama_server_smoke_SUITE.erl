@@ -19,11 +19,12 @@
     chat_invalid_json_returns_400/1,
     messages_streaming_unknown_model_emits_event_error/1,
     anthropic_version_header_echoed/1,
-    count_tokens_unknown_model_returns_503/1,
+    count_tokens_unknown_model_returns_529/1,
     count_tokens_invalid_json_returns_400/1,
     accepts_body_above_one_mb/1,
     messages_413_returns_request_too_large_type/1,
     messages_emits_request_id_header/1,
+    messages_no_allowlist_accepts_any_key/1,
     messages_error_body_carries_request_id/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
@@ -48,11 +49,12 @@ all() ->
         chat_invalid_json_returns_400,
         messages_streaming_unknown_model_emits_event_error,
         anthropic_version_header_echoed,
-        count_tokens_unknown_model_returns_503,
+        count_tokens_unknown_model_returns_529,
         count_tokens_invalid_json_returns_400,
         accepts_body_above_one_mb,
         messages_413_returns_request_too_large_type,
         messages_emits_request_id_header,
+        messages_no_allowlist_accepts_any_key,
         messages_error_body_carries_request_id,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
@@ -221,19 +223,28 @@ messages_streaming_unknown_model_emits_event_error(Cfg) ->
     %% a freeform string like the pre-fix \"server_error\".
     ?assert(binary:match(Bin, <<"\"type\":\"not_found_error\"">>) =/= nomatch).
 
-%% /v1/messages/count_tokens with no loaded model returns 503
-%% rather than try to load on demand. Anthropic's count_tokens is
-%% meant to be cheap; loading a multi-GB model just to count
-%% tokens defeats the purpose.
-count_tokens_unknown_model_returns_503(Cfg) ->
+%% /v1/messages/count_tokens with no loaded model surfaces as 529
+%% overloaded_error (remapped from internal 503 not_loaded) with a
+%% retry-after header. Anthropic SDKs honour this as the backoff
+%% delay; rather than load a multi-GB model on every count_tokens
+%% probe we ask the caller to retry once the model has loaded
+%% through a real /v1/messages request.
+count_tokens_unknown_model_returns_529(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
     Body = json:encode(#{
         <<"model">> => <<"no-such-model">>,
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
     }),
-    {ok, {{_, Status, _}, _, _}} =
+    {ok, {{_, Status, _}, Headers, RespBody}} =
         httpc:request(post, {Url, [], "application/json", Body}, [], []),
-    ?assertEqual(503, Status).
+    ?assertEqual(529, Status),
+    {value, {_, Retry}} = lists:keysearch("retry-after", 1, Headers),
+    ?assert(list_to_integer(Retry) >= 1),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(
+        #{<<"error">> := #{<<"type">> := <<"overloaded_error">>}},
+        Decoded
+    ).
 
 count_tokens_invalid_json_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
@@ -292,6 +303,27 @@ messages_emits_request_id_header(Cfg) ->
     {value, {_, XReqId}} = lists:keysearch("x-request-id", 1, Headers),
     ?assertEqual(XReqId, AnthrId),
     ?assert(string:prefix(AnthrId, "req_") =/= nomatch).
+
+%% No api-key allowlist configured: Claude Code can send any x-api-key
+%% value (even its placeholder `not-used`) and the request flows
+%% through. Same as no x-api-key at all.
+messages_no_allowlist_accepts_any_key(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 4,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(
+            post,
+            {Url, [{"x-api-key", "not-used"}], "application/json", Body},
+            [],
+            []
+        ),
+    %% Hits model resolution (404 because the model isn't real); the
+    %% point is the auth gate did not 401.
+    ?assertEqual(404, Status).
 
 %% Anthropic error envelope spec includes `request_id` inside the body
 %% alongside type and message. SDKs read it for support diagnostics

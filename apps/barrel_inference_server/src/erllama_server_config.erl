@@ -21,6 +21,8 @@
     prefill_ms/0,
     total_ms/0,
     generation_ping_ms/0,
+    anthropic_api_keys/0,
+    anthropic_retry_after_seconds/0,
     pool_policy_for/1,
     tracing_config/0,
     cors/0,
@@ -108,6 +110,21 @@ total_ms() ->
 -spec generation_ping_ms() -> pos_integer().
 generation_ping_ms() ->
     persistent_term:get({?MODULE, generation_ping_ms}, 15000).
+
+%% Optional allowlist of accepted x-api-key values for the Anthropic
+%% Messages routes. Empty list (default) disables authentication so
+%% Claude Code can hit the endpoint with any value out of the box.
+%% Set to a non-empty list to enforce.
+-spec anthropic_api_keys() -> [binary()].
+anthropic_api_keys() ->
+    persistent_term:get({?MODULE, anthropic_api_keys}, []).
+
+%% Seconds advertised in the `retry-after` header on Anthropic 529
+%% responses (engine overloaded / model not ready). SDKs honour this
+%% as the next backoff delay.
+-spec anthropic_retry_after_seconds() -> pos_integer().
+anthropic_retry_after_seconds() ->
+    persistent_term:get({?MODULE, anthropic_retry_after_seconds}, 5).
 
 -spec tracing_config() -> off | {otlp, binary()}.
 tracing_config() ->
@@ -209,6 +226,13 @@ init([]) ->
     persistent_term:put(
         {?MODULE, keep_alive_default_ms},
         app_env(keep_alive_default_ms, 300000)
+    ),
+    persistent_term:put(
+        {?MODULE, anthropic_api_keys}, app_env(anthropic_api_keys, [])
+    ),
+    persistent_term:put(
+        {?MODULE, anthropic_retry_after_seconds},
+        app_env(anthropic_retry_after_seconds, 5)
     ),
     {ok, #state{
         aliases = Aliases,

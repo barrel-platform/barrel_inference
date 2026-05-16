@@ -98,12 +98,38 @@ init(Req0, Opts) ->
     %% default); alias the literal request-id name with the same value
     %% so SDK callers see a populated _request_id.
     Req2 = mirror_request_id(Req1),
-    case cowboy_req:method(Req2) of
-        <<"POST">> ->
-            handle_post(Req2, Opts);
-        _ ->
-            Req3 = cowboy_req:reply(405, #{}, <<>>, Req2),
-            {ok, Req3, Opts}
+    case check_api_key(Req2) of
+        ok ->
+            case cowboy_req:method(Req2) of
+                <<"POST">> ->
+                    handle_post(Req2, Opts);
+                _ ->
+                    Req3 = cowboy_req:reply(405, #{}, <<>>, Req2),
+                    {ok, Req3, Opts}
+            end;
+        unauthorized ->
+            reply_json_error(401, authentication_error, Req2)
+    end.
+
+%% When `anthropic_api_keys` is configured (non-empty list), the
+%% x-api-key header must match one of the entries. When unset (default)
+%% the endpoint is open so Claude Code with any literal API key value
+%% (including its placeholder `not-used`) hits the model without
+%% friction. Tighten via app env for public deployments.
+check_api_key(Req) ->
+    case erllama_server_config:anthropic_api_keys() of
+        [] ->
+            ok;
+        Allowed ->
+            case cowboy_req:header(<<"x-api-key">>, Req, undefined) of
+                undefined ->
+                    unauthorized;
+                Key ->
+                    case lists:member(Key, Allowed) of
+                        true -> ok;
+                        false -> unauthorized
+                    end
+            end
     end.
 
 mirror_request_id(Req) ->
@@ -860,12 +886,33 @@ reply_json_error(Status, Reason, Req0) ->
     Req1 = json_error(Status, Reason, Req0),
     {ok, Req1, undefined}.
 
-json_error(Status, Reason, Req0) ->
+json_error(Status0, Reason, Req0) ->
+    {Status, ErrorBodyStatus, Req1} = anthropic_overload_remap(Status0, Req0),
     cowboy_req:reply(
         Status,
         #{<<"content-type">> => <<"application/json">>},
-        json:encode(anthropic_error_body(Status, Reason, Req0)),
-        Req0
+        json:encode(anthropic_error_body(ErrorBodyStatus, Reason, Req1)),
+        Req1
+    ).
+
+%% Anthropic prefers HTTP 529 (overloaded_error) over 503 for retryable
+%% server-side failures; the SDK gives 529 a longer back-off than the
+%% generic 503 path. Translate on the wire and stamp `retry-after` so
+%% Claude Code's retry loop lands on the right delay. Cowlib's status
+%% table has no 529 entry so we pass the binary form
+%% `<<"529 Too Busy">>`; the error-body lookup still wants the
+%% integer for anthropic_error_type.
+anthropic_overload_remap(503, Req) ->
+    {<<"529 Too Busy">>, 529, set_retry_after(Req)};
+anthropic_overload_remap(529, Req) ->
+    {<<"529 Too Busy">>, 529, set_retry_after(Req)};
+anthropic_overload_remap(Status, Req) ->
+    {Status, Status, Req}.
+
+set_retry_after(Req) ->
+    Seconds = erllama_server_config:anthropic_retry_after_seconds(),
+    cowboy_req:set_resp_header(
+        <<"retry-after">>, integer_to_binary(Seconds), Req
     ).
 
 %% Shared Anthropic error envelope used by both the JSON pre-stream
