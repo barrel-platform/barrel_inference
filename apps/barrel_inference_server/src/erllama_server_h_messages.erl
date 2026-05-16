@@ -47,10 +47,13 @@
     buf_reason :: iodata(),
     mode :: text | tool_buffer,
     grammar_set :: boolean(),
-    %% Anthropic-specific stream state.
+    %% Anthropic-specific stream state. text/thinking block fields
+    %% carry the assigned content-block index when the block is open
+    %% (Anthropic spec requires monotonically increasing per-block
+    %% indices), or undefined when no block of that kind is open.
     total_tref :: reference() | undefined,
-    text_block_started :: boolean(),
-    thinking_block_started :: boolean(),
+    text_block_started :: undefined | non_neg_integer(),
+    thinking_block_started :: undefined | non_neg_integer(),
     message_started :: boolean(),
     %% true once stream_reply/3 has fired (separate from
     %% message_started, which guards the Anthropic message_start
@@ -192,8 +195,8 @@ init_state(R, Requested, Worker, Mon) ->
         buf_reason = [],
         mode = text,
         grammar_set = grammar_active(R),
-        text_block_started = false,
-        thinking_block_started = false,
+        text_block_started = undefined,
+        thinking_block_started = undefined,
         message_started = false
     }.
 
@@ -376,7 +379,7 @@ handle_token(Tok, Req, S = #st{mode = text}) ->
 emit_text(Tok, Req, S = #st{stream = true}) ->
     S1 = ensure_text_block_started(Req, S),
     Iolist = erllama_server_translate:internal_to_anthropic_event(
-        {text_delta, Tok}, #{}, S#st.req_id, S#st.requested
+        {text_delta, Tok, S1#st.text_block_started}, #{}, S#st.req_id, S#st.requested
     ),
     cowboy_req:stream_body(Iolist, nofin, Req),
     {ok, Req, rearm_idle(S1#st{out_tokens = S1#st.out_tokens + 1}), hibernate};
@@ -390,7 +393,10 @@ emit_text(Tok, Req, S = #st{stream = false}) ->
 handle_reasoning(Tok, Req, S = #st{stream = true}) ->
     S1 = ensure_thinking_block_started(Req, S),
     Iolist = erllama_server_translate:internal_to_anthropic_event(
-        {thinking_delta, Tok}, #{}, S#st.req_id, S#st.requested
+        {thinking_delta, Tok, S1#st.thinking_block_started},
+        #{},
+        S#st.req_id,
+        S#st.requested
     ),
     cowboy_req:stream_body(Iolist, nofin, Req),
     {ok, Req, rearm_idle(S1), hibernate};
@@ -410,28 +416,25 @@ emit_message_start(Req, S) ->
     cowboy_req:stream_body(Iolist, nofin, Req),
     S#st{message_started = true}.
 
-ensure_text_block_started(_Req, S = #st{text_block_started = true}) ->
+ensure_text_block_started(_Req, S = #st{text_block_started = I}) when is_integer(I) ->
     S;
 ensure_text_block_started(Req, S) ->
     %% Close a thinking block first if one is open.
     S1 = maybe_close_thinking(Req, S),
+    Index = next_block_index(S1),
     Iolist = erllama_server_translate:internal_to_anthropic_event(
-        content_block_start_text, #{}, S1#st.req_id, S1#st.requested
+        {content_block_start_text, Index}, #{}, S1#st.req_id, S1#st.requested
     ),
     cowboy_req:stream_body(Iolist, nofin, Req),
-    S1#st{text_block_started = true}.
+    S1#st{text_block_started = Index}.
 
-ensure_thinking_block_started(_Req, S = #st{thinking_block_started = true}) ->
+ensure_thinking_block_started(_Req, S = #st{thinking_block_started = I}) when is_integer(I) ->
     S;
 ensure_thinking_block_started(Req, S) ->
-    %% Open a `thinking` content block. We currently send the same
-    %% content_block_start payload as for text but with a thinking
-    %% type; the Anthropic SDK accepts either. Since the translate
-    %% module's content_block_start_text emits text-shaped, we render
-    %% the thinking-shaped one inline here.
+    Index = next_block_index(S),
     Payload = #{
         <<"type">> => <<"content_block_start">>,
-        <<"index">> => 0,
+        <<"index">> => Index,
         <<"content_block">> =>
             #{<<"type">> => <<"thinking">>, <<"thinking">> => <<>>}
     },
@@ -444,32 +447,52 @@ ensure_thinking_block_started(Req, S) ->
         nofin,
         Req
     ),
-    S#st{thinking_block_started = true}.
+    S#st{thinking_block_started = Index}.
 
-maybe_close_thinking(_Req, S = #st{thinking_block_started = false}) ->
+maybe_close_thinking(_Req, S = #st{thinking_block_started = undefined}) ->
     S;
-maybe_close_thinking(Req, S) ->
+maybe_close_thinking(Req, S = #st{thinking_block_started = Index}) ->
     Iolist = erllama_server_translate:internal_to_anthropic_event(
-        content_block_stop, #{}, S#st.req_id, S#st.requested
+        {content_block_stop, Index}, #{}, S#st.req_id, S#st.requested
     ),
     cowboy_req:stream_body(Iolist, nofin, Req),
-    S#st{thinking_block_started = false}.
+    S#st{thinking_block_started = undefined}.
+
+%% Next monotonic content-block index. The Anthropic spec requires
+%% indices to be unique and increasing within a single message; SDK
+%% stream accumulators slot-fill `message.content[index]` so reusing
+%% an index across distinct blocks corrupts the assembled message.
+next_block_index(#st{text_block_started = T, thinking_block_started = K}) ->
+    Indices = [I || I <- [T, K], is_integer(I)],
+    case Indices of
+        [] -> 0;
+        _ -> lists:max(Indices) + 1
+    end.
+
+%% The index of the currently open content block (text or thinking).
+%% Only one of the two is ever open at finish-of-stream time because
+%% ensure_text_block_started closes any open thinking block first.
+open_block_index(#st{text_block_started = I}) when is_integer(I) -> I;
+open_block_index(#st{thinking_block_started = I}) when is_integer(I) -> I;
+open_block_index(_) -> undefined.
 
 %%====================================================================
 %% Finish
 %%====================================================================
 
 finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
-    %% Close any open content blocks, then message_delta + message_stop.
+    %% Close any open content block at its assigned index, then
+    %% message_delta + message_stop.
+    OpenIdx = open_block_index(S),
     Req1 =
-        case S#st.thinking_block_started orelse S#st.text_block_started of
-            true ->
+        case OpenIdx of
+            undefined ->
+                Req0;
+            I ->
                 StopBlock = erllama_server_translate:internal_to_anthropic_event(
-                    content_block_stop, #{}, S#st.req_id, S#st.requested
+                    {content_block_stop, I}, #{}, S#st.req_id, S#st.requested
                 ),
                 cowboy_req:stream_body(StopBlock, nofin, Req0),
-                Req0;
-            false ->
                 Req0
         end,
     Delta = erllama_server_translate:internal_to_anthropic_event(
@@ -481,13 +504,17 @@ finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
     cowboy_req:stream_body([Delta, Stop], fin, Req1),
     record_success(S, Stats),
     {stop, Req1, S};
-finish_ok(Req0, S = #st{stream = true, mode = tool_buffer}, Stats) ->
+finish_ok(Req0, S0 = #st{stream = true, mode = tool_buffer}, Stats) ->
+    %% Close any open thinking block before opening the tool_use block,
+    %% so the tool_use index follows the thinking index monotonically.
+    S = maybe_close_thinking(Req0, S0),
+    Idx = next_block_index(S),
     Json = iolist_to_binary(S#st.buf_text),
     {Name, Input} = parse_tool_call(Json),
     ToolId = make_tool_id(),
     Start = #{
         <<"type">> => <<"content_block_start">>,
-        <<"index">> => 0,
+        <<"index">> => Idx,
         <<"content_block">> => #{
             <<"type">> => <<"tool_use">>,
             <<"id">> => ToolId,
@@ -497,14 +524,14 @@ finish_ok(Req0, S = #st{stream = true, mode = tool_buffer}, Stats) ->
     },
     DeltaInput = #{
         <<"type">> => <<"content_block_delta">>,
-        <<"index">> => 0,
+        <<"index">> => Idx,
         <<"delta">> => #{
             <<"type">> => <<"input_json_delta">>,
             <<"partial_json">> => json:encode(Input)
         }
     },
     Stop = erllama_server_translate:internal_to_anthropic_event(
-        content_block_stop, #{}, S#st.req_id, S#st.requested
+        {content_block_stop, Idx}, #{}, S#st.req_id, S#st.requested
     ),
     StatsToolCall = maps:put(finish_reason, tool_call, Stats),
     MsgDelta = erllama_server_translate:internal_to_anthropic_event(

@@ -19,10 +19,10 @@
 
 -type anthropic_event_kind() ::
     {message_start, non_neg_integer()}
-    | content_block_start_text
-    | {text_delta, binary()}
-    | {thinking_delta, binary()}
-    | content_block_stop
+    | {content_block_start_text, non_neg_integer()}
+    | {text_delta, binary(), non_neg_integer()}
+    | {thinking_delta, binary(), non_neg_integer()}
+    | {content_block_stop, non_neg_integer()}
     | {message_delta, map()}
     | message_stop.
 
@@ -376,37 +376,37 @@ internal_to_anthropic_event({message_start, PromptTokens}, _Acc, ReqId, Model) w
         }
     },
     sse(<<"message_start">>, Payload);
-internal_to_anthropic_event(content_block_start_text, _Acc, _ReqId, _Model) ->
+internal_to_anthropic_event({content_block_start_text, Index}, _Acc, _ReqId, _Model) ->
     sse(
         <<"content_block_start">>,
         #{
             <<"type">> => <<"content_block_start">>,
-            <<"index">> => 0,
+            <<"index">> => Index,
             <<"content_block">> => #{<<"type">> => <<"text">>, <<"text">> => <<>>}
         }
     );
-internal_to_anthropic_event({text_delta, Bin}, _Acc, _ReqId, _Model) ->
+internal_to_anthropic_event({text_delta, Bin, Index}, _Acc, _ReqId, _Model) ->
     sse(
         <<"content_block_delta">>,
         #{
             <<"type">> => <<"content_block_delta">>,
-            <<"index">> => 0,
+            <<"index">> => Index,
             <<"delta">> => #{<<"type">> => <<"text_delta">>, <<"text">> => Bin}
         }
     );
-internal_to_anthropic_event({thinking_delta, Bin}, _Acc, _ReqId, _Model) ->
+internal_to_anthropic_event({thinking_delta, Bin, Index}, _Acc, _ReqId, _Model) ->
     sse(
         <<"content_block_delta">>,
         #{
             <<"type">> => <<"content_block_delta">>,
-            <<"index">> => 0,
+            <<"index">> => Index,
             <<"delta">> => #{<<"type">> => <<"thinking_delta">>, <<"thinking">> => Bin}
         }
     );
-internal_to_anthropic_event(content_block_stop, _Acc, _ReqId, _Model) ->
+internal_to_anthropic_event({content_block_stop, Index}, _Acc, _ReqId, _Model) ->
     sse(
         <<"content_block_stop">>,
-        #{<<"type">> => <<"content_block_stop">>, <<"index">> => 0}
+        #{<<"type">> => <<"content_block_stop">>, <<"index">> => Index}
     );
 internal_to_anthropic_event({message_delta, Stats}, _Acc, _ReqId, _Model) ->
     sse(

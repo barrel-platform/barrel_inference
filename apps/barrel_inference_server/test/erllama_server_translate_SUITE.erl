@@ -61,6 +61,7 @@
     anthropic_response_shape/1,
     anthropic_event_message_start/1,
     anthropic_event_text_delta/1,
+    anthropic_event_content_block_index_threads_through/1,
     anthropic_event_message_delta/1,
     anthropic_event_message_delta_emits_cache_read_on_exact_hit/1,
     anthropic_event_message_delta_emits_cache_creation_on_cold/1
@@ -124,6 +125,7 @@ all() ->
         anthropic_response_shape,
         anthropic_event_message_start,
         anthropic_event_text_delta,
+        anthropic_event_content_block_index_threads_through,
         anthropic_event_message_delta,
         anthropic_event_message_delta_emits_cache_read_on_exact_hit,
         anthropic_event_message_delta_emits_cache_creation_on_cold
@@ -834,11 +836,41 @@ anthropic_event_message_start(_Cfg) ->
 
 anthropic_event_text_delta(_Cfg) ->
     Iolist = erllama_server_translate:internal_to_anthropic_event(
-        {text_delta, <<"hello">>}, #{}, <<"msg_1">>, <<"claude">>
+        {text_delta, <<"hello">>, 0}, #{}, <<"msg_1">>, <<"claude">>
     ),
     Bin = iolist_to_binary(Iolist),
     ?assert(binary:match(Bin, <<"event: content_block_delta">>) =/= nomatch),
-    ?assert(binary:match(Bin, <<"\"text\":\"hello\"">>) =/= nomatch).
+    ?assert(binary:match(Bin, <<"\"text\":\"hello\"">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"index\":0">>) =/= nomatch).
+
+%% Anthropic SDK stream accumulators slot-fill `message.content[index]`,
+%% so consecutive blocks must carry distinct indices. The emitter must
+%% honour whatever index the handler supplies.
+anthropic_event_content_block_index_threads_through(_Cfg) ->
+    Start = iolist_to_binary(
+        erllama_server_translate:internal_to_anthropic_event(
+            {content_block_start_text, 3}, #{}, <<"msg_1">>, <<"claude">>
+        )
+    ),
+    Delta = iolist_to_binary(
+        erllama_server_translate:internal_to_anthropic_event(
+            {text_delta, <<"t">>, 3}, #{}, <<"msg_1">>, <<"claude">>
+        )
+    ),
+    Thinking = iolist_to_binary(
+        erllama_server_translate:internal_to_anthropic_event(
+            {thinking_delta, <<"r">>, 2}, #{}, <<"msg_1">>, <<"claude">>
+        )
+    ),
+    Stop = iolist_to_binary(
+        erllama_server_translate:internal_to_anthropic_event(
+            {content_block_stop, 3}, #{}, <<"msg_1">>, <<"claude">>
+        )
+    ),
+    ?assert(binary:match(Start, <<"\"index\":3">>) =/= nomatch),
+    ?assert(binary:match(Delta, <<"\"index\":3">>) =/= nomatch),
+    ?assert(binary:match(Thinking, <<"\"index\":2">>) =/= nomatch),
+    ?assert(binary:match(Stop, <<"\"index\":3">>) =/= nomatch).
 
 anthropic_event_message_delta(_Cfg) ->
     Stats = #{completion_tokens => 4, finish_reason => length},
