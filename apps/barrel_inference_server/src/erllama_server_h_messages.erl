@@ -59,6 +59,13 @@
     %% time. Carried forward into Stats so the response/SSE usage
     %% frame can emit the nested cache_creation TTL split.
     cache_hints :: list(),
+    %% Integrity signature for the (currently open or just-closed)
+    %% thinking block, captured from the engine's
+    %% {erllama_thinking_end, Ref, Sig} message. Forwarded to the
+    %% response builder so non-streaming clients see it on the
+    %% thinking content block; the streaming path emits it as a
+    %% signature_delta SSE event before content_block_stop.
+    thinking_signature = undefined :: undefined | binary(),
     %% true once stream_reply/3 has fired (separate from
     %% message_started, which guards the Anthropic message_start
     %% event). Loading-phase pings can open the stream before the
@@ -285,12 +292,27 @@ info(
     end;
 %% Token messages may arrive before {pipeline, admitted, ...} (see
 %% the matching comment in erllama_server_h_chat).
-info({erllama_token, Ref, Tok}, Req0, S0) ->
+%% erllama 0.3.0 carries extended-thinking deltas inside the same
+%% `erllama_token` tag using a {thinking_delta, Bin} payload (the
+%% engine's `thinking => enabled` Params hook); plain binary payloads
+%% are text fragments.
+info({erllama_token, Ref, {thinking_delta, Bin}}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    handle_reasoning(Bin, Req, S);
+info({erllama_token, Ref, Tok}, Req0, S0) when is_binary(Tok) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     handle_token(Tok, Req, S);
+%% Legacy reasoning-token tag for backends that emit reasoning out of
+%% band; harmless if never fired.
 info({erllama_reasoning_token, Ref, Tok}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     handle_reasoning(Tok, Req, S);
+%% erllama 0.3.0 emits exactly one close marker per thinking block,
+%% carrying an opaque integrity signature. The Anthropic spec requires
+%% a `signature_delta` SSE event before the matching `content_block_stop`.
+info({erllama_thinking_end, Ref, Sig}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    handle_thinking_end(Sig, Req, S);
 info({erllama_done, Ref, Stats}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     finish_ok(Req, S, Stats);
@@ -373,7 +395,7 @@ handle_token(Tok, Req, S = #st{out_tokens = 0, mode = text, grammar_set = true})
 handle_token(Tok, Req, S = #st{mode = tool_buffer}) ->
     {ok, Req,
         rearm_idle(S#st{
-            buf_text = [S#st.buf_text | Tok],
+            buf_text = [S#st.buf_text, Tok],
             out_tokens = S#st.out_tokens + 1
         }), hibernate};
 handle_token(Tok, Req, S = #st{mode = text, out_tokens = 0}) ->
@@ -391,7 +413,7 @@ emit_text(Tok, Req, S = #st{stream = true}) ->
 emit_text(Tok, Req, S = #st{stream = false}) ->
     {ok, Req,
         rearm_idle(S#st{
-            buf_text = [S#st.buf_text | Tok],
+            buf_text = [S#st.buf_text, Tok],
             out_tokens = S#st.out_tokens + 1
         }), hibernate}.
 
@@ -407,6 +429,42 @@ handle_reasoning(Tok, Req, S = #st{stream = true}) ->
     {ok, Req, rearm_idle(S1), hibernate};
 handle_reasoning(Tok, Req, S = #st{stream = false}) ->
     {ok, Req, rearm_idle(S#st{buf_reason = [S#st.buf_reason | Tok]}), hibernate}.
+
+%% Streaming: emit `signature_delta` (if a signature was supplied) then
+%% close the thinking block. Non-streaming: stash the signature so the
+%% response builder can include it on the thinking content block.
+handle_thinking_end(Sig, Req, S = #st{stream = true, thinking_block_started = Index}) when
+    is_integer(Index)
+->
+    case Sig of
+        <<>> ->
+            ok;
+        _ ->
+            Delta = #{
+                <<"type">> => <<"content_block_delta">>,
+                <<"index">> => Index,
+                <<"delta">> => #{
+                    <<"type">> => <<"signature_delta">>,
+                    <<"signature">> => Sig
+                }
+            },
+            cowboy_req:stream_body(
+                [
+                    <<"event: content_block_delta\ndata: ">>,
+                    json:encode(Delta),
+                    <<"\n\n">>
+                ],
+                nofin,
+                Req
+            )
+    end,
+    S1 = maybe_close_thinking(Req, S),
+    {ok, Req, rearm_idle(S1#st{thinking_signature = Sig}), hibernate};
+handle_thinking_end(Sig, Req, S) ->
+    %% No thinking block currently open in streaming mode, or
+    %% non-streaming mode. Stash the signature for the response
+    %% builder.
+    {ok, Req, rearm_idle(S#st{thinking_signature = Sig}), hibernate}.
 
 %%====================================================================
 %% Stream block management
@@ -594,7 +652,15 @@ nonstream_content(#st{mode = tool_buffer, buf_text = Buf}, Stats) ->
         <<"input">> => Input
     },
     {[ToolUse], maps:put(finish_reason, tool_call, Stats)};
-nonstream_content(#st{mode = text, buf_text = TextBuf, buf_reason = ReasonBuf}, Stats) ->
+nonstream_content(
+    #st{
+        mode = text,
+        buf_text = TextBuf,
+        buf_reason = ReasonBuf,
+        thinking_signature = Sig
+    },
+    Stats
+) ->
     Text = iolist_to_binary(TextBuf),
     Reason = iolist_to_binary(ReasonBuf),
     TextBlock = #{<<"type">> => <<"text">>, <<"text">> => Text},
@@ -603,12 +669,22 @@ nonstream_content(#st{mode = text, buf_text = TextBuf, buf_reason = ReasonBuf}, 
             <<>> ->
                 [TextBlock];
             _ ->
-                [
-                    #{<<"type">> => <<"thinking">>, <<"thinking">> => Reason},
-                    TextBlock
-                ]
+                [thinking_block(Reason, Sig), TextBlock]
         end,
     {Blocks, Stats}.
+
+%% Per Anthropic spec, the thinking block carries a `signature` field
+%% when one is available (round-tripped by SDKs on the next turn).
+thinking_block(Text, undefined) ->
+    #{<<"type">> => <<"thinking">>, <<"thinking">> => Text};
+thinking_block(Text, <<>>) ->
+    #{<<"type">> => <<"thinking">>, <<"thinking">> => Text};
+thinking_block(Text, Sig) when is_binary(Sig) ->
+    #{
+        <<"type">> => <<"thinking">>,
+        <<"thinking">> => Text,
+        <<"signature">> => Sig
+    }.
 
 finish_err(Req0, S = #st{stream = true}, Reason) ->
     Status = http_status(Reason),

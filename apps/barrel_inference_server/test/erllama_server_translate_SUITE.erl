@@ -63,6 +63,10 @@
     openai_embedding_response_shape/1,
     anthropic_response_shape/1,
     anthropic_response_tool_use_block/1,
+    anthropic_response_emits_stop_sequence_when_matched/1,
+    anthropic_response_omits_stop_sequence_on_natural_stop/1,
+    anthropic_event_message_delta_emits_stop_sequence/1,
+    anthropic_response_thinking_block_with_signature/1,
     anthropic_response_thinking_then_text_blocks/1,
     anthropic_event_message_start/1,
     anthropic_event_text_delta/1,
@@ -134,6 +138,10 @@ all() ->
         openai_embedding_response_shape,
         anthropic_response_shape,
         anthropic_response_tool_use_block,
+        anthropic_response_emits_stop_sequence_when_matched,
+        anthropic_response_omits_stop_sequence_on_natural_stop,
+        anthropic_event_message_delta_emits_stop_sequence,
+        anthropic_response_thinking_block_with_signature,
         anthropic_response_thinking_then_text_blocks,
         anthropic_event_message_start,
         anthropic_event_text_delta,
@@ -931,6 +939,67 @@ anthropic_response_tool_use_block(_Cfg) ->
     ?assertEqual(<<"toolu_1">>, maps:get(<<"id">>, Block)),
     ?assertEqual(<<"search">>, maps:get(<<"name">>, Block)),
     ?assertEqual(#{<<"q">> => <<"hi">>}, maps:get(<<"input">>, Block)).
+
+%% erllama 0.3.0 reports the matched caller-supplied stop string in
+%% Stats.stop_sequence when generation halted on a stop_sequences match.
+%% Anthropic clients expect stop_reason: "stop_sequence" + a non-null
+%% stop_sequence field in that case.
+anthropic_response_emits_stop_sequence_when_matched(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 5,
+        completion_tokens => 3,
+        finish_reason => stop,
+        stop_sequence => <<"END">>
+    },
+    R = erllama_server_translate:internal_to_anthropic_messages_response(
+        [text_block(<<"hi">>)], Stats, <<"claude">>
+    ),
+    ?assertEqual(<<"stop_sequence">>, maps:get(<<"stop_reason">>, R)),
+    ?assertEqual(<<"END">>, maps:get(<<"stop_sequence">>, R)).
+
+%% Without stop_sequence in Stats, natural-stop maps to end_turn and
+%% the response.stop_sequence field is null.
+anthropic_response_omits_stop_sequence_on_natural_stop(_Cfg) ->
+    Stats = #{prompt_tokens => 5, completion_tokens => 3, finish_reason => stop},
+    R = erllama_server_translate:internal_to_anthropic_messages_response(
+        [text_block(<<"hi">>)], Stats, <<"claude">>
+    ),
+    ?assertEqual(<<"end_turn">>, maps:get(<<"stop_reason">>, R)),
+    ?assertEqual(null, maps:get(<<"stop_sequence">>, R)).
+
+%% Streaming message_delta carries the same stop_sequence/stop_reason
+%% pairing.
+anthropic_event_message_delta_emits_stop_sequence(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 5,
+        completion_tokens => 3,
+        finish_reason => stop,
+        stop_sequence => <<"END">>
+    },
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
+    ),
+    Bin = iolist_to_binary(Iolist),
+    ?assert(binary:match(Bin, <<"\"stop_reason\":\"stop_sequence\"">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"stop_sequence\":\"END\"">>) =/= nomatch).
+
+%% Non-streaming response can carry the signature on a thinking block.
+%% Anthropic SDKs round-trip this on the next turn.
+anthropic_response_thinking_block_with_signature(_Cfg) ->
+    Stats = #{prompt_tokens => 5, completion_tokens => 3, finish_reason => stop},
+    Blocks = [
+        #{
+            <<"type">> => <<"thinking">>,
+            <<"thinking">> => <<"hmm">>,
+            <<"signature">> => <<"sig-abc">>
+        },
+        text_block(<<"answer">>)
+    ],
+    R = erllama_server_translate:internal_to_anthropic_messages_response(
+        Blocks, Stats, <<"claude">>
+    ),
+    [B1, _] = maps:get(<<"content">>, R),
+    ?assertEqual(<<"sig-abc">>, maps:get(<<"signature">>, B1)).
 
 %% Non-streaming response can carry both a thinking and a text block.
 anthropic_response_thinking_then_text_blocks(_Cfg) ->

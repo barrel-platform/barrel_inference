@@ -385,7 +385,11 @@ build_params(R) ->
         top_p => R#erllama_request.top_p,
         top_k => R#erllama_request.top_k,
         min_p => R#erllama_request.min_p,
-        stop => R#erllama_request.stop,
+        %% erllama 0.3.0 renamed the placeholder `stop` to
+        %% `stop_sequences` and wired it up: generation halts on the
+        %% first match in the accumulated detokenised output and the
+        %% matched binary comes back in Stats.
+        stop_sequences => R#erllama_request.stop,
         thinking => R#erllama_request.thinking
     },
     Maybe1 = maybe_put(Base, seed, R#erllama_request.seed),
