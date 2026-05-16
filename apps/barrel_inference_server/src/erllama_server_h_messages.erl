@@ -886,12 +886,33 @@ reply_json_error(Status, Reason, Req0) ->
     Req1 = json_error(Status, Reason, Req0),
     {ok, Req1, undefined}.
 
-json_error(Status, Reason, Req0) ->
+json_error(Status0, Reason, Req0) ->
+    {Status, ErrorBodyStatus, Req1} = anthropic_overload_remap(Status0, Req0),
     cowboy_req:reply(
         Status,
         #{<<"content-type">> => <<"application/json">>},
-        json:encode(anthropic_error_body(Status, Reason, Req0)),
-        Req0
+        json:encode(anthropic_error_body(ErrorBodyStatus, Reason, Req1)),
+        Req1
+    ).
+
+%% Anthropic prefers HTTP 529 (overloaded_error) over 503 for retryable
+%% server-side failures; the SDK gives 529 a longer back-off than the
+%% generic 503 path. Translate on the wire and stamp `retry-after` so
+%% Claude Code's retry loop lands on the right delay. Cowlib's status
+%% table has no 529 entry so we pass the binary form
+%% `<<"529 Too Busy">>`; the error-body lookup still wants the
+%% integer for anthropic_error_type.
+anthropic_overload_remap(503, Req) ->
+    {<<"529 Too Busy">>, 529, set_retry_after(Req)};
+anthropic_overload_remap(529, Req) ->
+    {<<"529 Too Busy">>, 529, set_retry_after(Req)};
+anthropic_overload_remap(Status, Req) ->
+    {Status, Status, Req}.
+
+set_retry_after(Req) ->
+    Seconds = erllama_server_config:anthropic_retry_after_seconds(),
+    cowboy_req:set_resp_header(
+        <<"retry-after">>, integer_to_binary(Seconds), Req
     ).
 
 %% Shared Anthropic error envelope used by both the JSON pre-stream

@@ -19,7 +19,7 @@
     chat_invalid_json_returns_400/1,
     messages_streaming_unknown_model_emits_event_error/1,
     anthropic_version_header_echoed/1,
-    count_tokens_unknown_model_returns_503/1,
+    count_tokens_unknown_model_returns_529/1,
     count_tokens_invalid_json_returns_400/1,
     accepts_body_above_one_mb/1,
     messages_413_returns_request_too_large_type/1,
@@ -49,7 +49,7 @@ all() ->
         chat_invalid_json_returns_400,
         messages_streaming_unknown_model_emits_event_error,
         anthropic_version_header_echoed,
-        count_tokens_unknown_model_returns_503,
+        count_tokens_unknown_model_returns_529,
         count_tokens_invalid_json_returns_400,
         accepts_body_above_one_mb,
         messages_413_returns_request_too_large_type,
@@ -223,19 +223,28 @@ messages_streaming_unknown_model_emits_event_error(Cfg) ->
     %% a freeform string like the pre-fix \"server_error\".
     ?assert(binary:match(Bin, <<"\"type\":\"not_found_error\"">>) =/= nomatch).
 
-%% /v1/messages/count_tokens with no loaded model returns 503
-%% rather than try to load on demand. Anthropic's count_tokens is
-%% meant to be cheap; loading a multi-GB model just to count
-%% tokens defeats the purpose.
-count_tokens_unknown_model_returns_503(Cfg) ->
+%% /v1/messages/count_tokens with no loaded model surfaces as 529
+%% overloaded_error (remapped from internal 503 not_loaded) with a
+%% retry-after header. Anthropic SDKs honour this as the backoff
+%% delay; rather than load a multi-GB model on every count_tokens
+%% probe we ask the caller to retry once the model has loaded
+%% through a real /v1/messages request.
+count_tokens_unknown_model_returns_529(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
     Body = json:encode(#{
         <<"model">> => <<"no-such-model">>,
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
     }),
-    {ok, {{_, Status, _}, _, _}} =
+    {ok, {{_, Status, _}, Headers, RespBody}} =
         httpc:request(post, {Url, [], "application/json", Body}, [], []),
-    ?assertEqual(503, Status).
+    ?assertEqual(529, Status),
+    {value, {_, Retry}} = lists:keysearch("retry-after", 1, Headers),
+    ?assert(list_to_integer(Retry) >= 1),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(
+        #{<<"error">> := #{<<"type">> := <<"overloaded_error">>}},
+        Decoded
+    ).
 
 count_tokens_invalid_json_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
