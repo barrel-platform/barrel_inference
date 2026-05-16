@@ -1133,6 +1133,10 @@ parse_anthropic_tool_choice(Body) ->
         #{<<"type">> := <<"auto">>} -> auto;
         #{<<"type">> := <<"any">>} -> required;
         #{<<"type">> := <<"tool">>, <<"name">> := N} -> {named, N};
+        %% Anthropic-specific opt-out. The catch-all keeps falling back
+        %% to auto, but explicit "none" must reach the grammar layer so
+        %% no GBNF is installed for this request.
+        #{<<"type">> := <<"none">>} -> none;
         _ -> auto
     end.
 

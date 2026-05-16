@@ -200,11 +200,11 @@ init_state(R, Requested, Worker, Mon) ->
         message_started = false
     }.
 
-%% Anthropic translator does not emit `tool_choice = none`, only auto,
-%% required, and {named, _}. So the empty/undefined tools branches
-%% are the only false cases.
+%% Mirrors erllama_server_grammar:from_tools/2: no grammar is installed
+%% when tools is empty/missing or tool_choice is the explicit `none`.
 grammar_active(#erllama_request{tools = undefined}) -> false;
 grammar_active(#erllama_request{tools = []}) -> false;
+grammar_active(#erllama_request{tool_choice = none}) -> false;
 grammar_active(_) -> true.
 
 %%====================================================================

@@ -35,6 +35,7 @@
     anthropic_system_blocks/1,
     anthropic_tools_normalise/1,
     anthropic_tool_choice_any_maps_required/1,
+    anthropic_tool_choice_none/1,
     anthropic_thinking_enabled/1,
     anthropic_stop_sequences_parsed/1,
     anthropic_content_string_passthrough/1,
@@ -99,6 +100,7 @@ all() ->
         anthropic_system_blocks,
         anthropic_tools_normalise,
         anthropic_tool_choice_any_maps_required,
+        anthropic_tool_choice_none,
         anthropic_thinking_enabled,
         anthropic_stop_sequences_parsed,
         anthropic_content_string_passthrough,
@@ -383,6 +385,20 @@ anthropic_tool_choice_any_maps_required(_Cfg) ->
     },
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
     ?assertEqual(required, R#erllama_request.tool_choice).
+
+%% `tool_choice: "none"` must round-trip to the `none` atom so the
+%% grammar layer skips installing a GBNF. The pre-fix catch-all
+%% silently downgraded it to `auto`.
+anthropic_tool_choice_none(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"tool_choice">> => #{<<"type">> => <<"none">>}
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual(none, R#erllama_request.tool_choice).
 
 anthropic_thinking_enabled(_Cfg) ->
     Body = #{
