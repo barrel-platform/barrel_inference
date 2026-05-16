@@ -174,7 +174,8 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
             %% Anthropic uses `stop_sequences` (plural); base_request
             %% only reads `stop` (OpenAI/Ollama naming). Override here
             %% so Anthropic clients don't lose their stop tokens.
-            stop = parse_stop_sequences(Body)
+            stop = parse_stop_sequences(Body),
+            user_id = parse_metadata_user_id(Body)
         }}
     catch
         throw:{error, _} = E -> E
@@ -1212,6 +1213,15 @@ parse_anthropic_tool_choice(Body) ->
         %% no GBNF is installed for this request.
         #{<<"type">> := <<"none">>} -> none;
         _ -> auto
+    end.
+
+%% Anthropic's optional `metadata.user_id` is a free-form opaque
+%% identifier the client sends for support diagnostics. We capture it
+%% on the request record for observability.
+parse_metadata_user_id(Body) ->
+    case maps:get(<<"metadata">>, Body, undefined) of
+        #{<<"user_id">> := U} when is_binary(U) -> U;
+        _ -> undefined
     end.
 
 parse_anthropic_thinking(Body) ->

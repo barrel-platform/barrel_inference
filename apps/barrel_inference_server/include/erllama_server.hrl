@@ -77,7 +77,12 @@
             hash := binary(),
             ttl := binary()
         }
-    ]
+    ],
+    %% Optional metadata.user_id from Anthropic /v1/messages requests
+    %% and the anthropic-beta header. Captured for observability; not
+    %% currently passed to the engine. `undefined` when absent.
+    user_id = undefined :: undefined | binary(),
+    anthropic_beta = undefined :: undefined | binary()
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

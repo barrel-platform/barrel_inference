@@ -38,6 +38,8 @@
     anthropic_tool_choice_none/1,
     anthropic_thinking_enabled/1,
     anthropic_stop_sequences_parsed/1,
+    anthropic_metadata_user_id_captured/1,
+    anthropic_metadata_user_id_absent_or_bad/1,
     anthropic_content_string_passthrough/1,
     anthropic_content_blocks_flatten/1,
     anthropic_content_blocks_multiple_join/1,
@@ -113,6 +115,8 @@ all() ->
         anthropic_tool_choice_none,
         anthropic_thinking_enabled,
         anthropic_stop_sequences_parsed,
+        anthropic_metadata_user_id_captured,
+        anthropic_metadata_user_id_absent_or_bad,
         anthropic_content_string_passthrough,
         anthropic_content_blocks_flatten,
         anthropic_content_blocks_multiple_join,
@@ -444,6 +448,35 @@ anthropic_stop_sequences_parsed(_Cfg) ->
     },
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
     ?assertEqual([<<"\n\nHuman:">>, <<"END">>], R#erllama_request.stop).
+
+%% Anthropic clients may pass metadata.user_id for support
+%% diagnostics. We capture it on the request record so downstream
+%% observability hooks can read it; no engine pass-through yet.
+anthropic_metadata_user_id_captured(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"metadata">> => #{<<"user_id">> => <<"u-42">>}
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual(<<"u-42">>, R#erllama_request.user_id).
+
+%% Absent metadata leaves the field undefined; non-binary user_id is
+%% ignored rather than crashing.
+anthropic_metadata_user_id_absent_or_bad(_Cfg) ->
+    Body0 = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ]
+    },
+    {ok, R0} = erllama_server_translate:anthropic_messages_to_internal(Body0),
+    ?assertEqual(undefined, R0#erllama_request.user_id),
+    Body1 = Body0#{<<"metadata">> => #{<<"user_id">> => 42}},
+    {ok, R1} = erllama_server_translate:anthropic_messages_to_internal(Body1),
+    ?assertEqual(undefined, R1#erllama_request.user_id).
 
 %% Bare-string content is the simple Anthropic shape; must survive
 %% the flattening helper unchanged so OpenAI Python / curl examples

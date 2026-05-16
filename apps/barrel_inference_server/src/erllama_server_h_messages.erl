@@ -119,8 +119,18 @@ fast_phase(Body, Req0, Opts) ->
 
 translate(Map, Req0, Opts) ->
     case erllama_server_translate:anthropic_messages_to_internal(Map) of
-        {ok, R} -> dispatch(R, Req0, Opts);
-        {error, Reason} -> reply_json_error(400, Reason, Req0)
+        {ok, R} ->
+            %% Capture the optional anthropic-beta request header for
+            %% observability (CORS already allows it). Not currently
+            %% acted on; the engine has no beta-feature pass-through.
+            R1 = R#erllama_request{
+                anthropic_beta = cowboy_req:header(
+                    <<"anthropic-beta">>, Req0, undefined
+                )
+            },
+            dispatch(R1, Req0, Opts);
+        {error, Reason} ->
+            reply_json_error(400, Reason, Req0)
     end.
 
 dispatch(R, Req0, #{op := count_tokens}) ->
