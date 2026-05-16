@@ -38,6 +38,8 @@
     anthropic_tool_choice_none/1,
     anthropic_thinking_enabled/1,
     anthropic_stop_sequences_parsed/1,
+    anthropic_metadata_user_id_captured/1,
+    anthropic_metadata_user_id_absent_or_bad/1,
     anthropic_content_string_passthrough/1,
     anthropic_content_blocks_flatten/1,
     anthropic_content_blocks_multiple_join/1,
@@ -53,6 +55,7 @@
     anthropic_no_cache_hints_when_unmarked/1,
     anthropic_cache_hints_hash_is_stable/1,
     anthropic_usage_emits_cache_read_on_exact_hit/1,
+    anthropic_usage_emits_service_tier/1,
     anthropic_usage_emits_cache_creation_on_cold/1,
     openai_usage_emits_cached_tokens_on_exact_hit/1,
     %% response shapes
@@ -113,6 +116,8 @@ all() ->
         anthropic_tool_choice_none,
         anthropic_thinking_enabled,
         anthropic_stop_sequences_parsed,
+        anthropic_metadata_user_id_captured,
+        anthropic_metadata_user_id_absent_or_bad,
         anthropic_content_string_passthrough,
         anthropic_content_blocks_flatten,
         anthropic_content_blocks_multiple_join,
@@ -128,6 +133,7 @@ all() ->
         anthropic_no_cache_hints_when_unmarked,
         anthropic_cache_hints_hash_is_stable,
         anthropic_usage_emits_cache_read_on_exact_hit,
+        anthropic_usage_emits_service_tier,
         anthropic_usage_emits_cache_creation_on_cold,
         openai_usage_emits_cached_tokens_on_exact_hit,
         %% responses out
@@ -444,6 +450,35 @@ anthropic_stop_sequences_parsed(_Cfg) ->
     },
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
     ?assertEqual([<<"\n\nHuman:">>, <<"END">>], R#erllama_request.stop).
+
+%% Anthropic clients may pass metadata.user_id for support
+%% diagnostics. We capture it on the request record so downstream
+%% observability hooks can read it; no engine pass-through yet.
+anthropic_metadata_user_id_captured(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"metadata">> => #{<<"user_id">> => <<"u-42">>}
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual(<<"u-42">>, R#erllama_request.user_id).
+
+%% Absent metadata leaves the field undefined; non-binary user_id is
+%% ignored rather than crashing.
+anthropic_metadata_user_id_absent_or_bad(_Cfg) ->
+    Body0 = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ]
+    },
+    {ok, R0} = erllama_server_translate:anthropic_messages_to_internal(Body0),
+    ?assertEqual(undefined, R0#erllama_request.user_id),
+    Body1 = Body0#{<<"metadata">> => #{<<"user_id">> => 42}},
+    {ok, R1} = erllama_server_translate:anthropic_messages_to_internal(Body1),
+    ?assertEqual(undefined, R1#erllama_request.user_id).
 
 %% Bare-string content is the simple Anthropic shape; must survive
 %% the flattening helper unchanged so OpenAI Python / curl examples
@@ -793,6 +828,16 @@ anthropic_usage_emits_cache_read_on_exact_hit(_Cfg) ->
     Usage = maps:get(<<"usage">>, Resp),
     ?assertEqual(128, maps:get(<<"cache_read_input_tokens">>, Usage)),
     ?assertNot(maps:is_key(<<"cache_creation_input_tokens">>, Usage)).
+
+%% Anthropic responses carry usage.service_tier; we have no tier
+%% scheduling so always answer "standard".
+anthropic_usage_emits_service_tier(_Cfg) ->
+    Stats = #{prompt_tokens => 5, completion_tokens => 3, finish_reason => stop},
+    Resp = erllama_server_translate:internal_to_anthropic_messages_response(
+        [text_block(<<"hi">>)], Stats, <<"m">>
+    ),
+    Usage = maps:get(<<"usage">>, Resp),
+    ?assertEqual(<<"standard">>, maps:get(<<"service_tier">>, Usage)).
 
 anthropic_usage_emits_cache_creation_on_cold(_Cfg) ->
     Stats = #{

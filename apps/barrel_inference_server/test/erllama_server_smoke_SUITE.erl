@@ -24,6 +24,7 @@
     accepts_body_above_one_mb/1,
     messages_413_returns_request_too_large_type/1,
     messages_emits_request_id_header/1,
+    messages_error_body_carries_request_id/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
     request_id_minted_when_absent/1,
@@ -52,6 +53,7 @@ all() ->
         accepts_body_above_one_mb,
         messages_413_returns_request_too_large_type,
         messages_emits_request_id_header,
+        messages_error_body_carries_request_id,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
         request_id_minted_when_absent,
@@ -290,6 +292,21 @@ messages_emits_request_id_header(Cfg) ->
     {value, {_, XReqId}} = lists:keysearch("x-request-id", 1, Headers),
     ?assertEqual(XReqId, AnthrId),
     ?assert(string:prefix(AnthrId, "req_") =/= nomatch).
+
+%% Anthropic error envelope spec includes `request_id` inside the body
+%% alongside type and message. SDKs read it for support diagnostics
+%% (separate from the response header of the same name).
+messages_error_body_carries_request_id(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 4,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, 404, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(#{<<"request_id">> := <<"req_", _/binary>>}, Decoded).
 
 %% 413 response must carry Anthropic's `request_too_large` error type,
 %% not the catch-all `api_error`. SDKs match on the type to decide

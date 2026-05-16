@@ -119,8 +119,18 @@ fast_phase(Body, Req0, Opts) ->
 
 translate(Map, Req0, Opts) ->
     case erllama_server_translate:anthropic_messages_to_internal(Map) of
-        {ok, R} -> dispatch(R, Req0, Opts);
-        {error, Reason} -> reply_json_error(400, Reason, Req0)
+        {ok, R} ->
+            %% Capture the optional anthropic-beta request header for
+            %% observability (CORS already allows it). Not currently
+            %% acted on; the engine has no beta-feature pass-through.
+            R1 = R#erllama_request{
+                anthropic_beta = cowboy_req:header(
+                    <<"anthropic-beta">>, Req0, undefined
+                )
+            },
+            dispatch(R1, Req0, Opts);
+        {error, Reason} ->
+            reply_json_error(400, Reason, Req0)
     end.
 
 dispatch(R, Req0, #{op := count_tokens}) ->
@@ -261,7 +271,7 @@ info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
 info({pipeline, error, Status, Reason}, Req0, S = #st{stream_started = true}) ->
     %% Post-stream: emit an Anthropic error event, close the body.
     record_metrics(S, Status),
-    anthropic_event(Req0, <<"error">>, anthropic_error_body(Status, Reason)),
+    anthropic_event(Req0, <<"error">>, anthropic_error_body(Status, Reason, Req0)),
     cowboy_req:stream_body(<<>>, fin, Req0),
     {stop, Req0, S};
 info({pipeline, error, Status, Reason}, Req0, S = #st{stream = true}) ->
@@ -271,7 +281,7 @@ info({pipeline, error, Status, Reason}, Req0, S = #st{stream = true}) ->
     %% can't decode as SSE.
     record_metrics(S, Status),
     {Req1, S1} = ensure_stream(Req0, S),
-    anthropic_event(Req1, <<"error">>, anthropic_error_body(Status, Reason)),
+    anthropic_event(Req1, <<"error">>, anthropic_error_body(Status, Reason, Req1)),
     cowboy_req:stream_body(<<>>, fin, Req1),
     {stop, Req1, S1};
 info({pipeline, error, Status, Reason}, Req0, S) ->
@@ -688,7 +698,7 @@ thinking_block(Text, Sig) when is_binary(Sig) ->
 
 finish_err(Req0, S = #st{stream = true}, Reason) ->
     Status = http_status(Reason),
-    Err = anthropic_error_body(Status, Reason),
+    Err = anthropic_error_body(Status, Reason, Req0),
     cowboy_req:stream_body(
         [<<"event: error\ndata: ">>, json:encode(Err), <<"\n\n">>],
         fin,
@@ -818,20 +828,26 @@ json_error(Status, Reason, Req0) ->
     cowboy_req:reply(
         Status,
         #{<<"content-type">> => <<"application/json">>},
-        json:encode(anthropic_error_body(Status, Reason)),
+        json:encode(anthropic_error_body(Status, Reason, Req0)),
         Req0
     ).
 
 %% Shared Anthropic error envelope used by both the JSON pre-stream
-%% reply and the SSE `event: error` frame.
-anthropic_error_body(Status, Reason) ->
-    #{
+%% reply and the SSE `event: error` frame. The spec includes
+%% `request_id` in the body alongside the response header; SDKs read
+%% both for support diagnostics.
+anthropic_error_body(Status, Reason, Req) ->
+    Base = #{
         <<"type">> => <<"error">>,
         <<"error">> => #{
             <<"type">> => anthropic_error_type(Status),
             <<"message">> => to_bin(Reason)
         }
-    }.
+    },
+    case cowboy_req:resp_header(<<"x-request-id">>, Req, undefined) of
+        undefined -> Base;
+        Id -> Base#{<<"request_id">> => Id}
+    end.
 
 anthropic_error_type(400) -> <<"invalid_request_error">>;
 anthropic_error_type(401) -> <<"authentication_error">>;
