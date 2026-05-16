@@ -24,6 +24,7 @@
     accepts_body_above_one_mb/1,
     messages_413_returns_request_too_large_type/1,
     messages_emits_request_id_header/1,
+    messages_no_allowlist_accepts_any_key/1,
     messages_error_body_carries_request_id/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
@@ -53,6 +54,7 @@ all() ->
         accepts_body_above_one_mb,
         messages_413_returns_request_too_large_type,
         messages_emits_request_id_header,
+        messages_no_allowlist_accepts_any_key,
         messages_error_body_carries_request_id,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
@@ -292,6 +294,27 @@ messages_emits_request_id_header(Cfg) ->
     {value, {_, XReqId}} = lists:keysearch("x-request-id", 1, Headers),
     ?assertEqual(XReqId, AnthrId),
     ?assert(string:prefix(AnthrId, "req_") =/= nomatch).
+
+%% No api-key allowlist configured: Claude Code can send any x-api-key
+%% value (even its placeholder `not-used`) and the request flows
+%% through. Same as no x-api-key at all.
+messages_no_allowlist_accepts_any_key(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 4,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(
+            post,
+            {Url, [{"x-api-key", "not-used"}], "application/json", Body},
+            [],
+            []
+        ),
+    %% Hits model resolution (404 because the model isn't real); the
+    %% point is the auth gate did not 401.
+    ?assertEqual(404, Status).
 
 %% Anthropic error envelope spec includes `request_id` inside the body
 %% alongside type and message. SDKs read it for support diagnostics

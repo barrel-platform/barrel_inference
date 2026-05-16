@@ -98,12 +98,38 @@ init(Req0, Opts) ->
     %% default); alias the literal request-id name with the same value
     %% so SDK callers see a populated _request_id.
     Req2 = mirror_request_id(Req1),
-    case cowboy_req:method(Req2) of
-        <<"POST">> ->
-            handle_post(Req2, Opts);
-        _ ->
-            Req3 = cowboy_req:reply(405, #{}, <<>>, Req2),
-            {ok, Req3, Opts}
+    case check_api_key(Req2) of
+        ok ->
+            case cowboy_req:method(Req2) of
+                <<"POST">> ->
+                    handle_post(Req2, Opts);
+                _ ->
+                    Req3 = cowboy_req:reply(405, #{}, <<>>, Req2),
+                    {ok, Req3, Opts}
+            end;
+        unauthorized ->
+            reply_json_error(401, authentication_error, Req2)
+    end.
+
+%% When `anthropic_api_keys` is configured (non-empty list), the
+%% x-api-key header must match one of the entries. When unset (default)
+%% the endpoint is open so Claude Code with any literal API key value
+%% (including its placeholder `not-used`) hits the model without
+%% friction. Tighten via app env for public deployments.
+check_api_key(Req) ->
+    case erllama_server_config:anthropic_api_keys() of
+        [] ->
+            ok;
+        Allowed ->
+            case cowboy_req:header(<<"x-api-key">>, Req, undefined) of
+                undefined ->
+                    unauthorized;
+                Key ->
+                    case lists:member(Key, Allowed) of
+                        true -> ok;
+                        false -> unauthorized
+                    end
+            end
     end.
 
 mirror_request_id(Req) ->
