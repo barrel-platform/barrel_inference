@@ -63,6 +63,10 @@
     %% time. Carried forward into Stats so the response/SSE usage
     %% frame can emit the nested cache_creation TTL split.
     cache_hints :: list(),
+    %% Optional metadata.user_id from the request body; propagated
+    %% from `#erllama_request.user_id` so the per-request structured
+    %% log can include it without re-reading the original record.
+    user_id = undefined :: undefined | binary(),
     %% Integrity signature for the (currently open or just-closed)
     %% thinking block, captured from the engine's
     %% {erllama_thinking_end, Ref, Sig} message. Forwarded to the
@@ -267,7 +271,8 @@ init_state(R, Requested, Worker, Mon) ->
         thinking_block_started = undefined,
         message_started = false,
         cache_hints = R#erllama_request.cache_hints,
-        thinking_display = R#erllama_request.thinking_display
+        thinking_display = R#erllama_request.thinking_display,
+        user_id = R#erllama_request.user_id
     }.
 
 %% Mirrors erllama_server_grammar:from_tools/2: no grammar is installed
@@ -925,7 +930,23 @@ record_metrics(S, Status) ->
         S#st.requested,
         integer_to_binary(Status),
         Duration
-    ).
+    ),
+    %% Structured per-request log line for observability sinks. user_id
+    %% comes from the request's metadata.user_id (undefined when not
+    %% set); request_id is the Anthropic-shaped msg_<int> the SDK
+    %% surfaces as message._request_id. Emitted at notice level (the
+    %% same level as the access log) so the default OTP logger config
+    %% picks it up. Kept out of metric labels to avoid Prometheus
+    %% cardinality blow-up.
+    logger:notice(#{
+        event => anthropic_request,
+        endpoint => <<"/v1/messages">>,
+        model => S#st.requested,
+        status => Status,
+        duration_ms => round(Duration * 1000),
+        request_id => S#st.req_id,
+        user_id => S#st.user_id
+    }).
 
 reply_json_error(Status, Reason, Req0) ->
     Req1 = json_error(Status, Reason, Req0),
