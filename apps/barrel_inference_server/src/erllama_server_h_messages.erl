@@ -290,6 +290,10 @@ info(total_request_timeout, Req0, S) ->
     Req1 = json_error(504, total_timeout, Req0),
     record_metrics(S, 504),
     {stop, Req1, S};
+%% erllama 0.2.0 emits a token-id message alongside every token text
+%% message. We do not consume it.
+info({erllama_token_id, _Ref, _Id}, Req, S) ->
+    {ok, Req, S, hibernate};
 info(_Msg, Req, S) ->
     {ok, Req, S, hibernate}.
 
