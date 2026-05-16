@@ -360,7 +360,8 @@ manifest_to_config(Manifest) ->
         },
         model_opts => model_opts_from(Loader, Params)
     },
-    maybe_put_thinking_markers(Config0, Loader).
+    Config1 = maybe_put_thinking_markers(Config0, Loader),
+    maybe_put_tool_call_markers(Config1, Loader).
 
 %% erllama 0.4.0 takes per-model extended-thinking markers via
 %% `thinking_markers => #{start := Bin, end := Bin}` on load_model/2.
@@ -377,6 +378,33 @@ maybe_put_thinking_markers(Config, Loader) ->
         _ ->
             Config
     end.
+
+%% erllama 0.5.0 takes per-model tool-call markers via
+%% `tool_call_markers => #{start := Bin, end := Bin, ...}` on
+%% load_model/2. Operators declare them in the manifest's loader
+%% section per model family (qwen-xml uses <tool_call>/</tool_call>,
+%% etc.). With markers set, the engine builds a deterministic
+%% greedy-on-syntax sampler and emits `tool_call_delta` /
+%% `erllama_tool_call_end` wire messages. Optional payload_start /
+%% payload_end mark string regions inside the span that flip back
+%% to the request's normal sampler for caller-supplied content.
+maybe_put_tool_call_markers(Config, Loader) ->
+    case maps:get(<<"tool_call_markers">>, Loader, undefined) of
+        #{<<"start">> := Start, <<"end">> := End} = M when
+            is_binary(Start), is_binary(End), Start =/= <<>>, End =/= <<>>
+        ->
+            Base = #{start => Start, 'end' => End},
+            Config#{tool_call_markers => add_payload_markers(Base, M)};
+        _ ->
+            Config
+    end.
+
+add_payload_markers(Base, #{<<"payload_start">> := PS, <<"payload_end">> := PE}) when
+    is_binary(PS), is_binary(PE), PS =/= <<>>, PE =/= <<>>
+->
+    Base#{payload_start => PS, payload_end => PE};
+add_payload_markers(Base, _) ->
+    Base.
 
 %% Build the model_opts map. Only set keys the manifest actually
 %% supplies; let llama.cpp pick its own platform-appropriate default
