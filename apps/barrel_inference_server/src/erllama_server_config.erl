@@ -141,6 +141,9 @@ default_tool_call_formats() ->
         <<"dsml">> => #{module => erllama_server_tool_format_dsml},
         <<"llama-python-tag">> => #{
             module => erllama_server_tool_format_llama_python_tag
+        },
+        <<"mistral-tool-calls">> => #{
+            module => erllama_server_tool_format_mistral_tool_calls
         }
     }.
 
