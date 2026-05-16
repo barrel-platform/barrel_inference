@@ -262,13 +262,15 @@ app_env(Key, Default) ->
 
 fast_check(ModelId) ->
     %% erllama:model_info/1 returns the map directly when loaded and
-    %% crashes (noproc) when the model is not registered. Any of the
-    %% gen_statem states (idle, prefilling, generating) means the
-    %% model is up; a noproc means we still need to load.
+    %% crashes (noproc) when the model is not registered. Any status
+    %% value means the model is up; a noproc means we still need to
+    %% load. We match on `status` presence rather than a closed enum
+    %% so future engine state additions (0.2.0 already runs with
+    %% `running` alongside idle/prefilling/generating) flow through.
+    %% Off-spec returns raise try_clause and are caught alongside
+    %% noproc.
     try erllama:model_info(ModelId) of
-        #{status := idle} -> ready;
-        #{status := generating} -> ready;
-        #{status := prefilling} -> ready
+        #{status := _} -> ready
     catch
         _:_ -> not_ready
     end.
