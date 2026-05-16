@@ -55,6 +55,7 @@
     anthropic_no_cache_hints_when_unmarked/1,
     anthropic_cache_hints_hash_is_stable/1,
     anthropic_usage_emits_cache_read_on_exact_hit/1,
+    anthropic_usage_emits_service_tier/1,
     anthropic_usage_emits_cache_creation_on_cold/1,
     openai_usage_emits_cached_tokens_on_exact_hit/1,
     %% response shapes
@@ -132,6 +133,7 @@ all() ->
         anthropic_no_cache_hints_when_unmarked,
         anthropic_cache_hints_hash_is_stable,
         anthropic_usage_emits_cache_read_on_exact_hit,
+        anthropic_usage_emits_service_tier,
         anthropic_usage_emits_cache_creation_on_cold,
         openai_usage_emits_cached_tokens_on_exact_hit,
         %% responses out
@@ -826,6 +828,16 @@ anthropic_usage_emits_cache_read_on_exact_hit(_Cfg) ->
     Usage = maps:get(<<"usage">>, Resp),
     ?assertEqual(128, maps:get(<<"cache_read_input_tokens">>, Usage)),
     ?assertNot(maps:is_key(<<"cache_creation_input_tokens">>, Usage)).
+
+%% Anthropic responses carry usage.service_tier; we have no tier
+%% scheduling so always answer "standard".
+anthropic_usage_emits_service_tier(_Cfg) ->
+    Stats = #{prompt_tokens => 5, completion_tokens => 3, finish_reason => stop},
+    Resp = erllama_server_translate:internal_to_anthropic_messages_response(
+        [text_block(<<"hi">>)], Stats, <<"m">>
+    ),
+    Usage = maps:get(<<"usage">>, Resp),
+    ?assertEqual(<<"standard">>, maps:get(<<"service_tier">>, Usage)).
 
 anthropic_usage_emits_cache_creation_on_cold(_Cfg) ->
     Stats = #{

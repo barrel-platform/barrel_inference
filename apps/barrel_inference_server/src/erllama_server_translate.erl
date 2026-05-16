@@ -338,9 +338,13 @@ internal_to_anthropic_messages_response(Content, Stats, Model) when is_list(Cont
 %% them based on erllama's `cache_hit_kind`; the same coarse mapping
 %% as the OpenAI `cached_tokens` field.
 anthropic_usage_map(Stats) ->
+    %% `service_tier` is part of the response usage shape; we have no
+    %% tier scheduling, so always answer "standard". Future work could
+    %% expose batch/priority if the engine grows them.
     Base = #{
         <<"input_tokens">> => maps:get(prompt_tokens, Stats, 0),
-        <<"output_tokens">> => maps:get(completion_tokens, Stats, 0)
+        <<"output_tokens">> => maps:get(completion_tokens, Stats, 0),
+        <<"service_tier">> => <<"standard">>
     },
     Read = cached_tokens(Stats),
     Create = cache_creation_tokens(Stats),
