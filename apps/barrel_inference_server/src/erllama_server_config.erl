@@ -138,7 +138,10 @@ tool_call_formats() ->
 default_tool_call_formats() ->
     #{
         <<"qwen-xml">> => #{module => erllama_server_tool_format_qwen_xml},
-        <<"dsml">> => #{module => erllama_server_tool_format_dsml}
+        <<"dsml">> => #{module => erllama_server_tool_format_dsml},
+        <<"llama-python-tag">> => #{
+            module => erllama_server_tool_format_llama_python_tag
+        }
     }.
 
 -spec tracing_config() -> off | {otlp, binary()}.
