@@ -37,6 +37,8 @@
     anthropic_tool_choice_any_maps_required/1,
     anthropic_tool_choice_none/1,
     anthropic_thinking_enabled/1,
+    anthropic_thinking_display_and_budget/1,
+    anthropic_thinking_invalid_falls_back/1,
     anthropic_stop_sequences_parsed/1,
     anthropic_metadata_user_id_captured/1,
     anthropic_metadata_user_id_absent_or_bad/1,
@@ -45,6 +47,7 @@
     anthropic_content_blocks_multiple_join/1,
     anthropic_content_blocks_drop_non_text/1,
     anthropic_content_blocks_tool_result/1,
+    anthropic_content_blocks_tool_result_is_error/1,
     anthropic_content_blocks_assistant_tool_use_marker/1,
     anthropic_content_blocks_drop_engine_unsupported/1,
     anthropic_content_blocks_empty/1,
@@ -115,6 +118,8 @@ all() ->
         anthropic_tool_choice_any_maps_required,
         anthropic_tool_choice_none,
         anthropic_thinking_enabled,
+        anthropic_thinking_display_and_budget,
+        anthropic_thinking_invalid_falls_back,
         anthropic_stop_sequences_parsed,
         anthropic_metadata_user_id_captured,
         anthropic_metadata_user_id_absent_or_bad,
@@ -123,6 +128,7 @@ all() ->
         anthropic_content_blocks_multiple_join,
         anthropic_content_blocks_drop_non_text,
         anthropic_content_blocks_tool_result,
+        anthropic_content_blocks_tool_result_is_error,
         anthropic_content_blocks_assistant_tool_use_marker,
         anthropic_content_blocks_drop_engine_unsupported,
         anthropic_content_blocks_empty,
@@ -435,7 +441,45 @@ anthropic_thinking_enabled(_Cfg) ->
         <<"thinking">> => #{<<"type">> => <<"enabled">>}
     },
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
-    ?assertEqual(enabled, R#erllama_request.thinking).
+    ?assertEqual(enabled, R#erllama_request.thinking),
+    ?assertEqual(visible, R#erllama_request.thinking_display),
+    ?assertEqual(undefined, R#erllama_request.thinking_budget).
+
+%% thinking.display = "omitted" suppresses wire visibility of thinking
+%% blocks; thinking.budget_tokens is captured for forward compat.
+anthropic_thinking_display_and_budget(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"thinking">> => #{
+            <<"type">> => <<"enabled">>,
+            <<"display">> => <<"omitted">>,
+            <<"budget_tokens">> => 512
+        }
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual(enabled, R#erllama_request.thinking),
+    ?assertEqual(omitted, R#erllama_request.thinking_display),
+    ?assertEqual(512, R#erllama_request.thinking_budget).
+
+%% Bad / missing values fall back to defaults rather than crashing.
+anthropic_thinking_invalid_falls_back(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"thinking">> => #{
+            <<"type">> => <<"enabled">>,
+            <<"display">> => <<"weird">>,
+            <<"budget_tokens">> => -3
+        }
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual(visible, R#erllama_request.thinking_display),
+    ?assertEqual(undefined, R#erllama_request.thinking_budget).
 
 %% Anthropic uses `stop_sequences` (plural). Previously the translator
 %% read only `stop` (OpenAI naming) so Anthropic clients lost their
@@ -567,8 +611,10 @@ anthropic_content_blocks_drop_non_text(_Cfg) ->
     ).
 
 %% tool_result is a wrapping block whose `content` is itself either
-%% a binary or a nested block list. Both shapes flatten to plain text
-%% so the assistant turn can be rendered by the template.
+%% a binary or a nested block list. We render it with a stable marker
+%% that preserves tool_use_id (so the model can pair it with the
+%% matching tool_use call) and is_error so the model knows when a
+%% tool failed.
 anthropic_content_blocks_tool_result(_Cfg) ->
     BodyA = #{
         <<"model">> => <<"c">>,
@@ -586,10 +632,8 @@ anthropic_content_blocks_tool_result(_Cfg) ->
         ]
     },
     {ok, RA} = erllama_server_translate:anthropic_messages_to_internal(BodyA),
-    ?assertMatch(
-        [#{role := <<"user">>, content := <<"ok">>}],
-        RA#erllama_request.messages
-    ),
+    [#{content := CA}] = RA#erllama_request.messages,
+    ?assertEqual(<<"[tool_result id=tool-1]: ok">>, CA),
     BodyB = #{
         <<"model">> => <<"c">>,
         <<"messages">> => [
@@ -608,10 +652,32 @@ anthropic_content_blocks_tool_result(_Cfg) ->
         ]
     },
     {ok, RB} = erllama_server_translate:anthropic_messages_to_internal(BodyB),
-    ?assertMatch(
-        [#{role := <<"user">>, content := <<"ok">>}],
-        RB#erllama_request.messages
-    ).
+    [#{content := CB}] = RB#erllama_request.messages,
+    ?assertEqual(<<"[tool_result id=tool-1]: ok">>, CB).
+
+%% is_error must surface so the model can react differently to a
+%% tool that errored. We do not propagate the boolean to the engine
+%% but we encode it in the text marker.
+anthropic_content_blocks_tool_result_is_error(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{
+                        <<"type">> => <<"tool_result">>,
+                        <<"tool_use_id">> => <<"tool-2">>,
+                        <<"is_error">> => true,
+                        <<"content">> => <<"boom">>
+                    }
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    [#{content := C}] = R#erllama_request.messages,
+    ?assertEqual(<<"[tool_result id=tool-2 error=true]: boom">>, C).
 
 %% Assistant turn with a tool_use block (from a prior round) should
 %% serialise to a stable marker, not be silently dropped, so the

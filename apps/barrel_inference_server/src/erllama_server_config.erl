@@ -20,6 +20,7 @@
     generation_idle_ms/0,
     prefill_ms/0,
     total_ms/0,
+    generation_ping_ms/0,
     pool_policy_for/1,
     tracing_config/0,
     cors/0,
@@ -100,6 +101,13 @@ prefill_ms() ->
 -spec total_ms() -> pos_integer().
 total_ms() ->
     persistent_term:get({?MODULE, max_total_ms}, 1800000).
+
+%% Cadence for the Anthropic-style ping SSE frame during active
+%% generation. Keeps SDK idle timers and proxy connections alive when
+%% the model is slow between tokens.
+-spec generation_ping_ms() -> pos_integer().
+generation_ping_ms() ->
+    persistent_term:get({?MODULE, generation_ping_ms}, 15000).
 
 -spec tracing_config() -> off | {otlp, binary()}.
 tracing_config() ->

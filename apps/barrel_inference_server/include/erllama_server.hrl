@@ -82,7 +82,17 @@
     %% and the anthropic-beta header. Captured for observability; not
     %% currently passed to the engine. `undefined` when absent.
     user_id = undefined :: undefined | binary(),
-    anthropic_beta = undefined :: undefined | binary()
+    anthropic_beta = undefined :: undefined | binary(),
+    %% Anthropic extended-thinking display preference. `visible`
+    %% (default) emits thinking_delta SSE frames and a thinking
+    %% content block on non-streaming responses; `omitted` suppresses
+    %% both (the engine still produces thinking, the client just
+    %% doesn't see it).
+    thinking_display = visible :: visible | omitted,
+    %% Anthropic thinking.budget_tokens hint. erllama 0.3.0 does not
+    %% accept a thinking budget yet; we capture the value for
+    %% forward compatibility and observability.
+    thinking_budget = undefined :: undefined | pos_integer()
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

@@ -40,6 +40,10 @@
     started_mono :: integer(),
     first_token_at :: integer() | undefined,
     prefill_tref :: reference() | undefined,
+    %% Periodic ping during active generation. Anthropic SDKs read the
+    %% ping event to reset their idle timer; without this slow models
+    %% trip proxy / SDK idle timeouts on long generations.
+    gen_ping_tref :: reference() | undefined,
     idle_tref :: reference() | undefined,
     out_tokens :: non_neg_integer(),
     prompt_tokens :: non_neg_integer(),
@@ -66,6 +70,10 @@
     %% thinking content block; the streaming path emits it as a
     %% signature_delta SSE event before content_block_stop.
     thinking_signature = undefined :: undefined | binary(),
+    %% When `omitted`, thinking_delta SSE frames are not emitted and
+    %% the non-streaming response omits the thinking content block
+    %% (engine still produces thinking; the wire just hides it).
+    thinking_display = visible :: visible | omitted,
     %% true once stream_reply/3 has fired (separate from
     %% message_started, which guards the Anthropic message_start
     %% event). Loading-phase pings can open the stream before the
@@ -208,6 +216,7 @@ init_state(R, Requested, Worker, Mon) ->
         started_mono = mono_ms(),
         first_token_at = undefined,
         prefill_tref = undefined,
+        gen_ping_tref = undefined,
         idle_tref = undefined,
         total_tref = undefined,
         out_tokens = 0,
@@ -219,7 +228,8 @@ init_state(R, Requested, Worker, Mon) ->
         text_block_started = undefined,
         thinking_block_started = undefined,
         message_started = false,
-        cache_hints = R#erllama_request.cache_hints
+        cache_hints = R#erllama_request.cache_hints,
+        thinking_display = R#erllama_request.thinking_display
     }.
 
 %% Mirrors erllama_server_grammar:from_tools/2: no grammar is installed
@@ -335,6 +345,13 @@ info({prefill_timeout, Ref}, Req, S = #st{ref = Ref}) ->
 info({idle_timeout, Ref}, Req, S = #st{ref = Ref}) ->
     erllama:cancel(Ref),
     finish_err(Req, S, generation_idle_timeout);
+info({gen_ping, Ref}, Req, S = #st{ref = Ref, stream_started = true}) ->
+    %% Cadence keepalive while generation is active. Re-arm and emit
+    %% only when the stream is open; ignore stale messages.
+    ok = anthropic_ping(Req),
+    {ok, Req, arm_gen_ping(S), hibernate};
+info({gen_ping, _}, Req, S) ->
+    {ok, Req, S, hibernate};
 info(total_request_timeout, Req, S = #st{phase = running, ref = Ref}) when is_reference(Ref) ->
     erllama:cancel(Ref),
     finish_err(Req, S, total_timeout);
@@ -363,6 +380,7 @@ cleanup(S) ->
     cancel_timer(S#st.prefill_tref),
     cancel_timer(S#st.idle_tref),
     cancel_timer(S#st.total_tref),
+    cancel_timer(S#st.gen_ping_tref),
     case is_pid(S#st.worker) of
         true -> erllama_server_pipeline:abort(S#st.worker);
         false -> ok
@@ -427,6 +445,12 @@ emit_text(Tok, Req, S = #st{stream = false}) ->
             out_tokens = S#st.out_tokens + 1
         }), hibernate}.
 
+%% `thinking_display = omitted` keeps the engine producing thinking
+%% but hides it on the wire: no thinking_delta SSE frames, no thinking
+%% content block, no signature_delta. The engine still pays the
+%% generation cost; only the visible output is suppressed.
+handle_reasoning(_Tok, Req, S = #st{thinking_display = omitted}) ->
+    {ok, Req, rearm_idle(S), hibernate};
 handle_reasoning(Tok, Req, S = #st{stream = true}) ->
     S1 = ensure_thinking_block_started(Req, S),
     Iolist = erllama_server_translate:internal_to_anthropic_event(
@@ -443,6 +467,10 @@ handle_reasoning(Tok, Req, S = #st{stream = false}) ->
 %% Streaming: emit `signature_delta` (if a signature was supplied) then
 %% close the thinking block. Non-streaming: stash the signature so the
 %% response builder can include it on the thinking content block.
+handle_thinking_end(_Sig, Req, S = #st{thinking_display = omitted}) ->
+    %% Display omitted: thinking block was never opened on the wire,
+    %% so there's nothing to close and the signature is discarded.
+    {ok, Req, rearm_idle(S), hibernate};
 handle_thinking_end(Sig, Req, S = #st{stream = true, thinking_block_started = Index}) when
     is_integer(Index)
 ->
@@ -667,7 +695,8 @@ nonstream_content(
         mode = text,
         buf_text = TextBuf,
         buf_reason = ReasonBuf,
-        thinking_signature = Sig
+        thinking_signature = Sig,
+        thinking_display = Display
     },
     Stats
 ) ->
@@ -675,11 +704,10 @@ nonstream_content(
     Reason = iolist_to_binary(ReasonBuf),
     TextBlock = #{<<"type">> => <<"text">>, <<"text">> => Text},
     Blocks =
-        case Reason of
-            <<>> ->
-                [TextBlock];
-            _ ->
-                [thinking_block(Reason, Sig), TextBlock]
+        case {Reason, Display} of
+            {<<>>, _} -> [TextBlock];
+            {_, omitted} -> [TextBlock];
+            {_, visible} -> [thinking_block(Reason, Sig), TextBlock]
         end,
     {Blocks, Stats}.
 
@@ -732,7 +760,8 @@ learn_ref(S = #st{ref = undefined, stream = true}, Req0, Ref) ->
     {Req1, S1} = ensure_stream(Req0, S),
     S2 = arm_prefill(S1#st{phase = running, ref = Ref}),
     S3 = emit_message_start(Req1, S2),
-    {S3, Req1};
+    S4 = arm_gen_ping(S3),
+    {S4, Req1};
 learn_ref(S = #st{ref = undefined}, Req0, Ref) ->
     {arm_prefill(S#st{phase = running, ref = Ref}), Req0};
 learn_ref(S, Req, _Ref) ->
@@ -747,6 +776,13 @@ ensure_stream(Req0, S) ->
 
 anthropic_ping(Req) ->
     anthropic_event(Req, <<"ping">>, #{<<"type">> => <<"ping">>}).
+
+arm_gen_ping(S = #st{ref = Ref}) when is_reference(Ref) ->
+    cancel_timer(S#st.gen_ping_tref),
+    Ms = erllama_server_config:generation_ping_ms(),
+    S#st{gen_ping_tref = erlang:send_after(Ms, self(), {gen_ping, Ref})};
+arm_gen_ping(S) ->
+    S.
 
 anthropic_event(Req, EventName, JsonMap) ->
     Frame = [
