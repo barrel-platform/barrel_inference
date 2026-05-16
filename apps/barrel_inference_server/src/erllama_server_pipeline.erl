@@ -393,7 +393,12 @@ build_params(R) ->
         thinking => R#erllama_request.thinking
     },
     Maybe1 = maybe_put(Base, seed, R#erllama_request.seed),
-    maybe_put(Maybe1, grammar, R#erllama_request.grammar).
+    Maybe2 = maybe_put(Maybe1, grammar, R#erllama_request.grammar),
+    %% erllama 0.4.0 accepts thinking_budget_tokens as a caller-side cap
+    %% on extended-thinking length. Forward Anthropic's
+    %% thinking.budget_tokens through when set and positive; the engine
+    %% treats absent / non-positive as "no cap".
+    maybe_put(Maybe2, thinking_budget_tokens, R#erllama_request.thinking_budget).
 
 maybe_put(Map, _Key, undefined) -> Map;
 maybe_put(Map, Key, Value) -> Map#{Key => Value}.
