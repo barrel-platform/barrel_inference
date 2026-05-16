@@ -194,6 +194,18 @@ between profiles reuses already-pulled blobs.
 For production behind a reverse proxy, set `{ip, {127,0,0,1}}` and
 terminate TLS at the proxy.
 
+### NIF crash containment
+
+llama.cpp is in-VM via the `erllama` NIF. The chosen hardening
+path is input validation at the NIF boundary, not subprocess
+isolation. erllama 0.1.1+ refuses oversized prompts, classifies
+malformed GGUFs, and rejects non-binary content with clean
+`{error, _}` tuples. Future NIF-safety work follows the prompt at
+[`docs/erllama_nif_hardening_prompt.md`](https://github.com/erllama/erllama_server/blob/main/docs/erllama_nif_hardening_prompt.md).
+Subprocess isolation is deliberately out of scope: it would cost
+the zero-copy token streaming, OTP cancel-on-disconnect cascade,
+and in-process KV cache that make erllama valuable.
+
 ## Observability
 
 Scrape `/metrics`:

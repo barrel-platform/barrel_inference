@@ -18,7 +18,7 @@
 -include("erllama_server.hrl").
 
 -type anthropic_event_kind() ::
-    message_start
+    {message_start, non_neg_integer()}
     | content_block_start_text
     | {text_delta, binary()}
     | {thinking_delta, binary()}
@@ -352,7 +352,9 @@ anthropic_usage_map(Stats) ->
 -spec internal_to_anthropic_event(
     anthropic_event_kind(), map(), binary(), binary()
 ) -> iodata().
-internal_to_anthropic_event(message_start, _Acc, ReqId, Model) ->
+internal_to_anthropic_event({message_start, PromptTokens}, _Acc, ReqId, Model) when
+    is_integer(PromptTokens)
+->
     Payload = #{
         <<"type">> => <<"message_start">>,
         <<"message">> => #{
@@ -363,7 +365,10 @@ internal_to_anthropic_event(message_start, _Acc, ReqId, Model) ->
             <<"content">> => [],
             <<"stop_reason">> => null,
             <<"stop_sequence">> => null,
-            <<"usage">> => #{<<"input_tokens">> => 0, <<"output_tokens">> => 0}
+            <<"usage">> => #{
+                <<"input_tokens">> => PromptTokens,
+                <<"output_tokens">> => 0
+            }
         }
     },
     sse(<<"message_start">>, Payload);
@@ -408,9 +413,11 @@ internal_to_anthropic_event({message_delta, Stats}, _Acc, _ReqId, _Model) ->
                 <<"stop_reason">> => anthropic_stop_reason(Stats),
                 <<"stop_sequence">> => null
             },
-            <<"usage">> => #{
-                <<"output_tokens">> => maps:get(completion_tokens, Stats, 0)
-            }
+            %% Final usage frame: carry cache_creation_input_tokens
+            %% / cache_read_input_tokens so streaming Anthropic
+            %% clients (Claude Code) see the same prompt-caching
+            %% counters as non-streaming.
+            <<"usage">> => anthropic_usage_map(Stats)
         }
     );
 internal_to_anthropic_event(message_stop, _Acc, _ReqId, _Model) ->
