@@ -43,6 +43,8 @@
     anthropic_content_blocks_multiple_join/1,
     anthropic_content_blocks_drop_non_text/1,
     anthropic_content_blocks_tool_result/1,
+    anthropic_content_blocks_assistant_tool_use_marker/1,
+    anthropic_content_blocks_drop_engine_unsupported/1,
     anthropic_content_blocks_empty/1,
     openai_content_blocks_flatten/1,
     anthropic_cache_control_captured_on_system/1,
@@ -108,6 +110,8 @@ all() ->
         anthropic_content_blocks_multiple_join,
         anthropic_content_blocks_drop_non_text,
         anthropic_content_blocks_tool_result,
+        anthropic_content_blocks_assistant_tool_use_marker,
+        anthropic_content_blocks_drop_engine_unsupported,
         anthropic_content_blocks_empty,
         openai_content_blocks_flatten,
         anthropic_cache_control_captured_on_system,
@@ -556,6 +560,63 @@ anthropic_content_blocks_tool_result(_Cfg) ->
     ?assertMatch(
         [#{role := <<"user">>, content := <<"ok">>}],
         RB#erllama_request.messages
+    ).
+
+%% Assistant turn with a tool_use block (from a prior round) should
+%% serialise to a stable marker, not be silently dropped, so the
+%% template input preserves the fact that a tool was called.
+anthropic_content_blocks_assistant_tool_use_marker(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"assistant">>,
+                <<"content">> => [
+                    #{
+                        <<"type">> => <<"tool_use">>,
+                        <<"id">> => <<"toolu_42">>,
+                        <<"name">> => <<"search">>,
+                        <<"input">> => #{<<"q">> => <<"x">>}
+                    }
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    [#{content := C}] = R#erllama_request.messages,
+    ?assert(binary:match(C, <<"[tool_call">>) =/= nomatch),
+    ?assert(binary:match(C, <<"name=search">>) =/= nomatch),
+    ?assert(binary:match(C, <<"id=toolu_42">>) =/= nomatch).
+
+%% Blocks the engine cannot consume (document, thinking,
+%% redacted_thinking, server_tool_use, search_result,
+%% web_search_tool_result) drop with no text contribution. Explicit
+%% clauses, not catch-all silent drops.
+anthropic_content_blocks_drop_engine_unsupported(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{<<"type">> => <<"document">>, <<"source">> => #{}},
+                    #{<<"type">> => <<"thinking">>, <<"thinking">> => <<"…">>},
+                    #{
+                        <<"type">> => <<"redacted_thinking">>,
+                        <<"data">> => <<"x">>
+                    },
+                    #{<<"type">> => <<"server_tool_use">>},
+                    #{<<"type">> => <<"web_search_tool_result">>},
+                    #{<<"type">> => <<"search_result">>},
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"go">>}
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"go">>}],
+        R#erllama_request.messages
     ).
 
 anthropic_content_blocks_empty(_Cfg) ->

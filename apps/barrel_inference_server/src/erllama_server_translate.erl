@@ -951,8 +951,35 @@ flatten_content_blocks(L) ->
 block_text(#{<<"type">> := <<"text">>, <<"text">> := T}) when is_binary(T) -> T;
 block_text(#{<<"text">> := T}) when is_binary(T) -> T;
 block_text(#{<<"type">> := <<"tool_result">>, <<"content">> := C}) -> tool_result_text(C);
+%% Assistant turns carrying a prior tool call: serialise to a stable
+%% marker so the inference context preserves the fact that a tool was
+%% called on a previous turn. The tool_result that follows on the next
+%% turn pairs with this via the embedded id.
+block_text(#{<<"type">> := <<"tool_use">>} = Tu) -> tool_use_marker(Tu);
+%% Inputs we don't (yet) pipe to the model: image, document, thinking,
+%% redacted_thinking, server_tool_use, web_search_tool_result,
+%% search_result. The engine has no vision/audio path and thinking
+%% blocks are an assistant-only construct; drop with no text
+%% contribution. Explicit clauses (vs the catch-all) make this
+%% intentional rather than silent.
+block_text(#{<<"type">> := <<"image">>}) -> <<>>;
+block_text(#{<<"type">> := <<"document">>}) -> <<>>;
+block_text(#{<<"type">> := <<"thinking">>}) -> <<>>;
+block_text(#{<<"type">> := <<"redacted_thinking">>}) -> <<>>;
+block_text(#{<<"type">> := <<"server_tool_use">>}) -> <<>>;
+block_text(#{<<"type">> := <<"web_search_tool_result">>}) -> <<>>;
+block_text(#{<<"type">> := <<"search_result">>}) -> <<>>;
 block_text(B) when is_binary(B) -> B;
 block_text(_) -> <<>>.
+
+tool_use_marker(#{<<"name">> := Name, <<"id">> := Id}) when
+    is_binary(Name), is_binary(Id)
+->
+    <<"[tool_call name=", Name/binary, " id=", Id/binary, "]">>;
+tool_use_marker(#{<<"name">> := Name}) when is_binary(Name) ->
+    <<"[tool_call name=", Name/binary, "]">>;
+tool_use_marker(_) ->
+    <<"[tool_call]">>.
 
 tool_result_text(B) when is_binary(B) -> B;
 tool_result_text(L) when is_list(L) -> flatten_content_blocks(L);
