@@ -62,6 +62,8 @@
     openai_completion_response_shape/1,
     openai_embedding_response_shape/1,
     anthropic_response_shape/1,
+    anthropic_response_tool_use_block/1,
+    anthropic_response_thinking_then_text_blocks/1,
     anthropic_event_message_start/1,
     anthropic_event_text_delta/1,
     anthropic_event_content_block_index_threads_through/1,
@@ -131,6 +133,8 @@ all() ->
         openai_completion_response_shape,
         openai_embedding_response_shape,
         anthropic_response_shape,
+        anthropic_response_tool_use_block,
+        anthropic_response_thinking_then_text_blocks,
         anthropic_event_message_start,
         anthropic_event_text_delta,
         anthropic_event_content_block_index_threads_through,
@@ -776,7 +780,7 @@ anthropic_usage_emits_cache_read_on_exact_hit(_Cfg) ->
         finish_reason => stop
     },
     Resp = erllama_server_translate:internal_to_anthropic_messages_response(
-        <<"hi">>, Stats, <<"m">>
+        [text_block(<<"hi">>)], Stats, <<"m">>
     ),
     Usage = maps:get(<<"usage">>, Resp),
     ?assertEqual(128, maps:get(<<"cache_read_input_tokens">>, Usage)),
@@ -790,7 +794,7 @@ anthropic_usage_emits_cache_creation_on_cold(_Cfg) ->
         finish_reason => stop
     },
     Resp = erllama_server_translate:internal_to_anthropic_messages_response(
-        <<"hi">>, Stats, <<"m">>
+        [text_block(<<"hi">>)], Stats, <<"m">>
     ),
     Usage = maps:get(<<"usage">>, Resp),
     ?assertEqual(128, maps:get(<<"cache_creation_input_tokens">>, Usage)),
@@ -898,13 +902,51 @@ anthropic_response_shape(_Cfg) ->
         finish_reason => stop
     },
     R = erllama_server_translate:internal_to_anthropic_messages_response(
-        <<"hi">>, Stats, <<"claude">>
+        [text_block(<<"hi">>)], Stats, <<"claude">>
     ),
     ?assertEqual(<<"message">>, maps:get(<<"type">>, R)),
     ?assertEqual(<<"end_turn">>, maps:get(<<"stop_reason">>, R)),
     [Block] = maps:get(<<"content">>, R),
     ?assertEqual(<<"text">>, maps:get(<<"type">>, Block)),
     ?assertEqual(<<"hi">>, maps:get(<<"text">>, Block)).
+
+%% Non-streaming response now lets the handler choose the content
+%% shape. A tool_use block must round-trip with id, name, and parsed
+%% input, and the response carries stop_reason: "tool_use" when the
+%% caller marks Stats accordingly.
+anthropic_response_tool_use_block(_Cfg) ->
+    Stats = #{prompt_tokens => 5, completion_tokens => 3, finish_reason => tool_call},
+    ToolUse = #{
+        <<"type">> => <<"tool_use">>,
+        <<"id">> => <<"toolu_1">>,
+        <<"name">> => <<"search">>,
+        <<"input">> => #{<<"q">> => <<"hi">>}
+    },
+    R = erllama_server_translate:internal_to_anthropic_messages_response(
+        [ToolUse], Stats, <<"claude">>
+    ),
+    ?assertEqual(<<"tool_use">>, maps:get(<<"stop_reason">>, R)),
+    [Block] = maps:get(<<"content">>, R),
+    ?assertEqual(<<"tool_use">>, maps:get(<<"type">>, Block)),
+    ?assertEqual(<<"toolu_1">>, maps:get(<<"id">>, Block)),
+    ?assertEqual(<<"search">>, maps:get(<<"name">>, Block)),
+    ?assertEqual(#{<<"q">> => <<"hi">>}, maps:get(<<"input">>, Block)).
+
+%% Non-streaming response can carry both a thinking and a text block.
+anthropic_response_thinking_then_text_blocks(_Cfg) ->
+    Stats = #{prompt_tokens => 5, completion_tokens => 3, finish_reason => stop},
+    Blocks = [
+        #{<<"type">> => <<"thinking">>, <<"thinking">> => <<"hmm">>},
+        text_block(<<"answer">>)
+    ],
+    R = erllama_server_translate:internal_to_anthropic_messages_response(
+        Blocks, Stats, <<"claude">>
+    ),
+    [B1, B2] = maps:get(<<"content">>, R),
+    ?assertEqual(<<"thinking">>, maps:get(<<"type">>, B1)),
+    ?assertEqual(<<"hmm">>, maps:get(<<"thinking">>, B1)),
+    ?assertEqual(<<"text">>, maps:get(<<"type">>, B2)),
+    ?assertEqual(<<"answer">>, maps:get(<<"text">>, B2)).
 
 anthropic_event_message_start(_Cfg) ->
     Iolist = erllama_server_translate:internal_to_anthropic_event(
@@ -1037,3 +1079,6 @@ base_chat() ->
         <<"model">> => <<"x">>,
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
     }.
+
+text_block(Text) ->
+    #{<<"type">> => <<"text">>, <<"text">> => Text}.

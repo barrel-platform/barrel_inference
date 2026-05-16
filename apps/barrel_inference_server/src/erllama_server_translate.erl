@@ -316,15 +316,17 @@ internal_to_openai_embedding_response(Vectors, PromptTokens, Model) ->
         }
     }.
 
-%% Non-streaming Anthropic /v1/messages response.
--spec internal_to_anthropic_messages_response(binary(), map(), binary()) -> map().
-internal_to_anthropic_messages_response(Text, Stats, Model) ->
+%% Non-streaming Anthropic /v1/messages response. The caller assembles
+%% the Content list because only the handler knows whether to emit a
+%% text block, a tool_use block, or a thinking + text composite.
+-spec internal_to_anthropic_messages_response([map()], map(), binary()) -> map().
+internal_to_anthropic_messages_response(Content, Stats, Model) when is_list(Content) ->
     #{
         <<"id">> => make_id(<<"msg_">>),
         <<"type">> => <<"message">>,
         <<"role">> => <<"assistant">>,
         <<"model">> => Model,
-        <<"content">> => [#{<<"type">> => <<"text">>, <<"text">> => Text}],
+        <<"content">> => Content,
         <<"stop_reason">> => anthropic_stop_reason(Stats),
         <<"stop_sequence">> => null,
         <<"usage">> => anthropic_usage_map(Stats)
@@ -351,7 +353,8 @@ anthropic_usage_map(Stats) ->
             Maybe1;
         _ ->
             Nested = cache_creation_ttl_split(Create, Stats),
-            (Maybe1#{<<"cache_creation_input_tokens">> => Create})#{
+            Maybe1#{
+                <<"cache_creation_input_tokens">> => Create,
                 <<"cache_creation">> => Nested
             }
     end.

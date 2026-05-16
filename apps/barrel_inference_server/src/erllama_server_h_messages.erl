@@ -565,10 +565,10 @@ finish_ok(Req0, S0 = #st{stream = true, mode = tool_buffer}, Stats) ->
     cowboy_req:stream_body(Frames, fin, Req0),
     record_success(S, Stats),
     {stop, Req0, S};
-finish_ok(Req0, S = #st{stream = false}, Stats) ->
-    Text = iolist_to_binary(S#st.buf_text),
+finish_ok(Req0, S = #st{stream = false}, Stats0) ->
+    {Content, Stats} = nonstream_content(S, Stats0),
     Body = erllama_server_translate:internal_to_anthropic_messages_response(
-        Text, attach_cache_hints(Stats, S), S#st.requested
+        Content, attach_cache_hints(Stats, S), S#st.requested
     ),
     Req1 = cowboy_req:reply(
         200,
@@ -578,6 +578,37 @@ finish_ok(Req0, S = #st{stream = false}, Stats) ->
     ),
     record_success(S, Stats),
     {stop, Req1, S}.
+
+%% Build the non-streaming content list. Streaming-path callers
+%% already emit tool_use / thinking blocks separately; the
+%% non-streaming path used to flatten everything into a single text
+%% block, which lost tool calls and thinking entirely. Return the
+%% (possibly amended) Stats so the stop_reason picks up `tool_use`.
+nonstream_content(#st{mode = tool_buffer, buf_text = Buf}, Stats) ->
+    Json = iolist_to_binary(Buf),
+    {Name, Input} = parse_tool_call(Json),
+    ToolUse = #{
+        <<"type">> => <<"tool_use">>,
+        <<"id">> => make_tool_id(),
+        <<"name">> => Name,
+        <<"input">> => Input
+    },
+    {[ToolUse], maps:put(finish_reason, tool_call, Stats)};
+nonstream_content(#st{mode = text, buf_text = TextBuf, buf_reason = ReasonBuf}, Stats) ->
+    Text = iolist_to_binary(TextBuf),
+    Reason = iolist_to_binary(ReasonBuf),
+    TextBlock = #{<<"type">> => <<"text">>, <<"text">> => Text},
+    Blocks =
+        case Reason of
+            <<>> ->
+                [TextBlock];
+            _ ->
+                [
+                    #{<<"type">> => <<"thinking">>, <<"thinking">> => Reason},
+                    TextBlock
+                ]
+        end,
+    {Blocks, Stats}.
 
 finish_err(Req0, S = #st{stream = true}, Reason) ->
     Status = http_status(Reason),
