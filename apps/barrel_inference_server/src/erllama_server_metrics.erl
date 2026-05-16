@@ -25,7 +25,8 @@
     inc_active_streams/1,
     dec_active_streams/1,
     set_models_loaded/1,
-    update_cache_gauges/0
+    update_cache_gauges/0,
+    inc_tool_replay_lookup/2
 ]).
 
 -define(METER_NAME, <<"erllama_server">>).
@@ -176,6 +177,14 @@ init() ->
             #{description => <<"Models currently loaded">>}
         )
     ),
+    put_inst(
+        tool_replay_lookups,
+        instrument_meter:create_counter(
+            M,
+            <<"erllama_tool_replay_lookups_total">>,
+            #{description => <<"Exact-replay map lookups by result">>}
+        )
+    ),
     ok.
 
 %%====================================================================
@@ -246,6 +255,26 @@ dec_active_streams(Model) ->
 
 set_models_loaded(N) when is_integer(N), N >= 0 ->
     instrument_meter:record(inst(models_loaded), N, #{}).
+
+%% Bump the tool-replay lookup counter. `Result' is one of:
+%%   hit       - the tool id was found in the replay map; the
+%%               render path could splice the verbatim FullBin
+%%               (once erllama exposes a verbatim-content escape
+%%               in apply_chat_template/2, this is the case
+%%               where exact-replay actually fires)
+%%   miss      - the tool id was minted by a prior turn but is no
+%%               longer in the replay map (TTL eviction or
+%%               cross-host history); falls back to canonicaliser
+%%   no_format - the model has no `tool_call_format' configured
+%%               in its manifest, so we can't canonicalise either
+inc_tool_replay_lookup(Model, Result) when
+    Result =:= hit; Result =:= miss; Result =:= no_format
+->
+    instrument_meter:add(
+        inst(tool_replay_lookups),
+        1,
+        #{model => Model, result => Result}
+    ).
 
 %%====================================================================
 %% Cache stats projection

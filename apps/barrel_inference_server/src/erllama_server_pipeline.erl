@@ -177,7 +177,48 @@ apply_chat_template(W) ->
     Messages = R#erllama_request.messages,
     System = R#erllama_request.system,
     Tools = R#erllama_request.tools,
+    %% Walk the message history before rendering so the exact-replay
+    %% counters reflect what fraction of prior tool_use blocks land a
+    %% hit in the replay map. Once erllama exposes a verbatim-content
+    %% escape on apply_chat_template/2 the FullBin will also splice
+    %% into the rendered prompt here; today we ride the chat template's
+    %% own JSON formatting (which is byte-stable across turns for
+    %% well-aligned model families) and let cache_delta tell us how
+    %% often that's enough.
+    ok = note_tool_replay_lookups(model_id(W), Messages),
     apply_chat_template_with_truncate(W, System, Tools, Messages).
+
+note_tool_replay_lookups(Model, Messages) ->
+    lists:foreach(
+        fun(Msg) -> walk_message_for_tool_use(Model, Msg) end,
+        Messages
+    ),
+    ok.
+
+walk_message_for_tool_use(Model, #{content := Blocks}) when is_list(Blocks) ->
+    lists:foreach(
+        fun(Block) -> note_tool_use_block(Model, Block) end,
+        Blocks
+    );
+walk_message_for_tool_use(_Model, _) ->
+    ok.
+
+note_tool_use_block(Model, #{<<"type">> := <<"tool_use">>, <<"id">> := Id}) when
+    is_binary(Id)
+->
+    case erllama_server_tool_format:lookup(Model) of
+        not_found ->
+            erllama_server_metrics:inc_tool_replay_lookup(Model, no_format);
+        {ok, _Spec} ->
+            case erllama_server_tool_replay:get(Id) of
+                {ok, _} ->
+                    erllama_server_metrics:inc_tool_replay_lookup(Model, hit);
+                not_found ->
+                    erllama_server_metrics:inc_tool_replay_lookup(Model, miss)
+            end
+    end;
+note_tool_use_block(_Model, _) ->
+    ok.
 
 %% Render the chat template; if the resulting token count would
 %% overflow n_ctx, drop the oldest non-system message and retry.
