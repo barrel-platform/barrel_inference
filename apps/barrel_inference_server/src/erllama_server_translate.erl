@@ -59,7 +59,8 @@
     %% helpers
     parse_keep_alive/1,
     parse_response_format_openai/1,
-    parse_response_format_ollama/1
+    parse_response_format_ollama/1,
+    parse_anthropic_betas_body/1
 ]).
 
 %%====================================================================
@@ -1256,6 +1257,17 @@ parse_anthropic_thinking(Body) ->
         #{<<"type">> := <<"disabled">>} -> disabled;
         #{<<"type">> := <<"enabled">>} -> enabled;
         _ -> disabled
+    end.
+
+%% body.betas is the JSON-array equivalent of the anthropic-beta
+%% header. Both opt into beta features; the handler merges the two
+%% sources into one de-duplicated list on the request record.
+parse_anthropic_betas_body(Body) ->
+    case maps:get(<<"betas">>, Body, undefined) of
+        L when is_list(L) ->
+            [B || B <- L, is_binary(B), B =/= <<>>];
+        _ ->
+            []
     end.
 
 %% Anthropic structured-outputs hook. `output_config.json_schema` is

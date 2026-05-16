@@ -37,6 +37,7 @@
     anthropic_tool_choice_any_maps_required/1,
     anthropic_tool_choice_none/1,
     anthropic_thinking_enabled/1,
+    anthropic_betas_body_parsed/1,
     anthropic_output_config_json_schema/1,
     anthropic_output_config_absent_or_bad/1,
     anthropic_thinking_display_and_budget/1,
@@ -120,6 +121,7 @@ all() ->
         anthropic_tool_choice_any_maps_required,
         anthropic_tool_choice_none,
         anthropic_thinking_enabled,
+        anthropic_betas_body_parsed,
         anthropic_output_config_json_schema,
         anthropic_output_config_absent_or_bad,
         anthropic_thinking_display_and_budget,
@@ -470,6 +472,28 @@ anthropic_output_config_absent_or_bad(_Cfg) ->
     Body1 = Body0#{<<"output_config">> => #{<<"json_schema">> => <<"not a map">>}},
     {ok, R1} = erllama_server_translate:anthropic_messages_to_internal(Body1),
     ?assertEqual(text, R1#erllama_request.response_format).
+
+%% body.betas is one source of Anthropic beta opt-ins; the other is
+%% the anthropic-beta header (handler-side). Parser keeps the body
+%% side; the handler merges with the header.
+anthropic_betas_body_parsed(_Cfg) ->
+    ?assertEqual(
+        [<<"a">>, <<"b">>],
+        erllama_server_translate:parse_anthropic_betas_body(
+            #{<<"betas">> => [<<"a">>, <<"b">>]}
+        )
+    ),
+    ?assertEqual(
+        [],
+        erllama_server_translate:parse_anthropic_betas_body(#{})
+    ),
+    %% Non-binary entries are dropped.
+    ?assertEqual(
+        [<<"ok">>],
+        erllama_server_translate:parse_anthropic_betas_body(
+            #{<<"betas">> => [<<"ok">>, 42, <<>>]}
+        )
+    ).
 
 anthropic_thinking_enabled(_Cfg) ->
     Body = #{

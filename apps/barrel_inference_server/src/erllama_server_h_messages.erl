@@ -154,18 +154,30 @@ fast_phase(Body, Req0, Opts) ->
 translate(Map, Req0, Opts) ->
     case erllama_server_translate:anthropic_messages_to_internal(Map) of
         {ok, R} ->
-            %% Capture the optional anthropic-beta request header for
-            %% observability (CORS already allows it). Not currently
-            %% acted on; the engine has no beta-feature pass-through.
+            %% Anthropic surfaces beta opt-ins on both the
+            %% `anthropic-beta` header (comma-separated) and the body
+            %% `betas` array. Merge both into one de-duplicated list
+            %% on the request record. Observability-only for now; the
+            %% engine has no beta-feature pass-through.
             R1 = R#erllama_request{
-                anthropic_beta = cowboy_req:header(
-                    <<"anthropic-beta">>, Req0, undefined
-                )
+                anthropic_betas = collect_betas(Req0, Map)
             },
             dispatch(R1, Req0, Opts);
         {error, Reason} ->
             reply_json_error(400, Reason, Req0)
     end.
+
+collect_betas(Req, Body) ->
+    Header = cowboy_req:header(<<"anthropic-beta">>, Req, <<>>),
+    FromHeader = [
+        trim(B)
+     || B <- binary:split(Header, <<",">>, [global]), trim(B) =/= <<>>
+    ],
+    FromBody = erllama_server_translate:parse_anthropic_betas_body(Body),
+    lists:usort(FromHeader ++ FromBody).
+
+trim(Bin) when is_binary(Bin) ->
+    list_to_binary(string:trim(binary_to_list(Bin))).
 
 dispatch(R, Req0, #{op := count_tokens}) ->
     count_tokens(R, Req0);
