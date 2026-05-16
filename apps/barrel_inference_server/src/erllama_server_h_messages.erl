@@ -70,12 +70,24 @@ init(Req0, Opts) ->
     %% baseline 2023-06-01 if the client omitted it.
     Version = cowboy_req:header(<<"anthropic-version">>, Req0, <<"2023-06-01">>),
     Req1 = cowboy_req:set_resp_header(<<"anthropic-version">>, Version, Req0),
-    case cowboy_req:method(Req1) of
+    %% Anthropic SDKs read `request-id` (no x- prefix) into
+    %% message._request_id for support diagnostics. The global middleware
+    %% has already stamped the configured header (x-request-id by
+    %% default); alias the literal request-id name with the same value
+    %% so SDK callers see a populated _request_id.
+    Req2 = mirror_request_id(Req1),
+    case cowboy_req:method(Req2) of
         <<"POST">> ->
-            handle_post(Req1, Opts);
+            handle_post(Req2, Opts);
         _ ->
-            Req2 = cowboy_req:reply(405, #{}, <<>>, Req1),
-            {ok, Req2, Opts}
+            Req3 = cowboy_req:reply(405, #{}, <<>>, Req2),
+            {ok, Req3, Opts}
+    end.
+
+mirror_request_id(Req) ->
+    case cowboy_req:resp_header(<<"x-request-id">>, Req, undefined) of
+        undefined -> Req;
+        Id -> cowboy_req:set_resp_header(<<"request-id">>, Id, Req)
     end.
 
 handle_post(Req0, Opts) ->

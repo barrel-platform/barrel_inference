@@ -23,6 +23,7 @@
     count_tokens_invalid_json_returns_400/1,
     accepts_body_above_one_mb/1,
     messages_413_returns_request_too_large_type/1,
+    messages_emits_request_id_header/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
     request_id_minted_when_absent/1,
@@ -50,6 +51,7 @@ all() ->
         count_tokens_invalid_json_returns_400,
         accepts_body_above_one_mb,
         messages_413_returns_request_too_large_type,
+        messages_emits_request_id_header,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
         request_id_minted_when_absent,
@@ -270,6 +272,24 @@ accepts_body_above_one_mb(Cfg) ->
     {ok, {{_, Status, _}, _, _}} =
         httpc:request(post, {Url, [], "application/json", Big}, [], []),
     ?assertEqual(400, Status).
+
+%% Anthropic SDKs read `request-id` (no x- prefix) into
+%% message._request_id; the existing middleware stamps `x-request-id`.
+%% The /v1/messages handler must alias the literal name with the same
+%% value so SDK consumers see a populated _request_id.
+messages_emits_request_id_header(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 4,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, _, _}, Headers, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    {value, {_, AnthrId}} = lists:keysearch("request-id", 1, Headers),
+    {value, {_, XReqId}} = lists:keysearch("x-request-id", 1, Headers),
+    ?assertEqual(XReqId, AnthrId),
+    ?assert(string:prefix(AnthrId, "req_") =/= nomatch).
 
 %% 413 response must carry Anthropic's `request_too_large` error type,
 %% not the catch-all `api_error`. SDKs match on the type to decide
