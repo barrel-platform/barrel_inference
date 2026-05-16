@@ -17,6 +17,10 @@
     embeddings_unknown_model_returns_404/1,
     embeddings_invalid_json_returns_400/1,
     chat_invalid_json_returns_400/1,
+    messages_streaming_unknown_model_emits_event_error/1,
+    anthropic_version_header_echoed/1,
+    count_tokens_unknown_model_returns_503/1,
+    count_tokens_invalid_json_returns_400/1,
     accepts_body_above_one_mb/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
@@ -39,6 +43,10 @@ all() ->
         embeddings_unknown_model_returns_404,
         embeddings_invalid_json_returns_400,
         chat_invalid_json_returns_400,
+        messages_streaming_unknown_model_emits_event_error,
+        anthropic_version_header_echoed,
+        count_tokens_unknown_model_returns_503,
+        count_tokens_invalid_json_returns_400,
         accepts_body_above_one_mb,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
@@ -182,10 +190,75 @@ chat_invalid_json_returns_400(Cfg) ->
             []
         ).
 
+%% Pre-stream errors on a streaming /v1/messages request must surface
+%% as an Anthropic SSE `event: error` frame, not a JSON envelope.
+%% Anthropic SDKs read the streaming body as SSE; a JSON response
+%% decodes as a transport error rather than a proper error event.
+messages_streaming_unknown_model_emits_event_error(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 8,
+        <<"stream">> => true,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, Status, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Bin = list_to_binary(RespBody),
+    %% Cowboy streams with HTTP 200; the error is conveyed via the
+    %% SSE error event rather than an HTTP status. (200 is what
+    %% Anthropic itself returns for the streaming-error path.)
+    ?assertEqual(200, Status),
+    ?assert(binary:match(Bin, <<"event: error">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"type\":\"error\"">>) =/= nomatch).
+
+%% /v1/messages/count_tokens with no loaded model returns 503
+%% rather than try to load on demand. Anthropic's count_tokens is
+%% meant to be cheap; loading a multi-GB model just to count
+%% tokens defeats the purpose.
+count_tokens_unknown_model_returns_503(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
+    }),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    ?assertEqual(503, Status).
+
+count_tokens_invalid_json_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(
+            post,
+            {Url, [], "application/json", "{not json"},
+            [],
+            []
+        ).
+
+%% Anthropic SDKs always send `anthropic-version` and read it back
+%% from the response. Echo whatever the client sent (or our default).
+anthropic_version_header_echoed(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 4,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, _, _}, Headers, _}} =
+        httpc:request(
+            post,
+            {Url, [{"anthropic-version", "2024-12-01"}], "application/json", Body},
+            [],
+            []
+        ),
+    {value, {_, Version}} = lists:keysearch("anthropic-version", 1, Headers),
+    ?assertEqual("2024-12-01", Version).
+
 %% Pre-c70004d the body cap was 1 MB; SDK clients shipping multi-KB
 %% tool definitions tripped 413. Send a 5 MB garbage body and assert
 %% we reach the JSON decoder (400) rather than being rejected at the
-%% size boundary. Fast-phase — no model load involved.
+%% size boundary. Fast-phase, no model load involved.
 accepts_body_above_one_mb(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
     Big = binary:copy(<<"x">>, 5 * 1024 * 1024),

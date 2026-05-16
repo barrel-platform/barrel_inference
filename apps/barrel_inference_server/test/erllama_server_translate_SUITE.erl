@@ -36,6 +36,7 @@
     anthropic_tools_normalise/1,
     anthropic_tool_choice_any_maps_required/1,
     anthropic_thinking_enabled/1,
+    anthropic_stop_sequences_parsed/1,
     anthropic_content_string_passthrough/1,
     anthropic_content_blocks_flatten/1,
     anthropic_content_blocks_multiple_join/1,
@@ -98,6 +99,7 @@ all() ->
         anthropic_tools_normalise,
         anthropic_tool_choice_any_maps_required,
         anthropic_thinking_enabled,
+        anthropic_stop_sequences_parsed,
         anthropic_content_string_passthrough,
         anthropic_content_blocks_flatten,
         anthropic_content_blocks_multiple_join,
@@ -390,6 +392,20 @@ anthropic_thinking_enabled(_Cfg) ->
     },
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
     ?assertEqual(enabled, R#erllama_request.thinking).
+
+%% Anthropic uses `stop_sequences` (plural). Previously the translator
+%% read only `stop` (OpenAI naming) so Anthropic clients lost their
+%% stop tokens silently.
+anthropic_stop_sequences_parsed(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"stop_sequences">> => [<<"\n\nHuman:">>, <<"END">>]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual([<<"\n\nHuman:">>, <<"END">>], R#erllama_request.stop).
 
 %% Bare-string content is the simple Anthropic shape; must survive
 %% the flattening helper unchanged so OpenAI Python / curl examples
