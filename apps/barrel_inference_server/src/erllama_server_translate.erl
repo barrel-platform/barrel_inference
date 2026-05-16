@@ -987,7 +987,7 @@ flatten_content_blocks(L) ->
 
 block_text(#{<<"type">> := <<"text">>, <<"text">> := T}) when is_binary(T) -> T;
 block_text(#{<<"text">> := T}) when is_binary(T) -> T;
-block_text(#{<<"type">> := <<"tool_result">>, <<"content">> := C}) -> tool_result_text(C);
+block_text(#{<<"type">> := <<"tool_result">>} = Tr) -> tool_result_marker(Tr);
 %% Assistant turns carrying a prior tool call: serialise to a stable
 %% marker so the inference context preserves the fact that a tool was
 %% called on a previous turn. The tool_result that follows on the next
@@ -1021,6 +1021,24 @@ tool_use_marker(_) ->
 tool_result_text(B) when is_binary(B) -> B;
 tool_result_text(L) when is_list(L) -> flatten_content_blocks(L);
 tool_result_text(_) -> <<>>.
+
+%% Wrap the tool_result content in a stable marker carrying the
+%% tool_use_id (so the model can pair it with the matching tool_use
+%% call) and an error flag when the caller marked the result as
+%% errored. The content itself is flattened by tool_result_text.
+tool_result_marker(Tr) ->
+    Content = tool_result_text(maps:get(<<"content">>, Tr, <<>>)),
+    IdPart =
+        case maps:get(<<"tool_use_id">>, Tr, undefined) of
+            Id when is_binary(Id) -> <<" id=", Id/binary>>;
+            _ -> <<>>
+        end,
+    ErrorPart =
+        case maps:get(<<"is_error">>, Tr, false) of
+            true -> <<" error=true">>;
+            _ -> <<>>
+        end,
+    <<"[tool_result", IdPart/binary, ErrorPart/binary, "]: ", Content/binary>>.
 
 content_to_text(M) ->
     case maps:get(<<"content">>, M, <<>>) of

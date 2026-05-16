@@ -47,6 +47,7 @@
     anthropic_content_blocks_multiple_join/1,
     anthropic_content_blocks_drop_non_text/1,
     anthropic_content_blocks_tool_result/1,
+    anthropic_content_blocks_tool_result_is_error/1,
     anthropic_content_blocks_assistant_tool_use_marker/1,
     anthropic_content_blocks_drop_engine_unsupported/1,
     anthropic_content_blocks_empty/1,
@@ -127,6 +128,7 @@ all() ->
         anthropic_content_blocks_multiple_join,
         anthropic_content_blocks_drop_non_text,
         anthropic_content_blocks_tool_result,
+        anthropic_content_blocks_tool_result_is_error,
         anthropic_content_blocks_assistant_tool_use_marker,
         anthropic_content_blocks_drop_engine_unsupported,
         anthropic_content_blocks_empty,
@@ -609,8 +611,10 @@ anthropic_content_blocks_drop_non_text(_Cfg) ->
     ).
 
 %% tool_result is a wrapping block whose `content` is itself either
-%% a binary or a nested block list. Both shapes flatten to plain text
-%% so the assistant turn can be rendered by the template.
+%% a binary or a nested block list. We render it with a stable marker
+%% that preserves tool_use_id (so the model can pair it with the
+%% matching tool_use call) and is_error so the model knows when a
+%% tool failed.
 anthropic_content_blocks_tool_result(_Cfg) ->
     BodyA = #{
         <<"model">> => <<"c">>,
@@ -628,10 +632,8 @@ anthropic_content_blocks_tool_result(_Cfg) ->
         ]
     },
     {ok, RA} = erllama_server_translate:anthropic_messages_to_internal(BodyA),
-    ?assertMatch(
-        [#{role := <<"user">>, content := <<"ok">>}],
-        RA#erllama_request.messages
-    ),
+    [#{content := CA}] = RA#erllama_request.messages,
+    ?assertEqual(<<"[tool_result id=tool-1]: ok">>, CA),
     BodyB = #{
         <<"model">> => <<"c">>,
         <<"messages">> => [
@@ -650,10 +652,32 @@ anthropic_content_blocks_tool_result(_Cfg) ->
         ]
     },
     {ok, RB} = erllama_server_translate:anthropic_messages_to_internal(BodyB),
-    ?assertMatch(
-        [#{role := <<"user">>, content := <<"ok">>}],
-        RB#erllama_request.messages
-    ).
+    [#{content := CB}] = RB#erllama_request.messages,
+    ?assertEqual(<<"[tool_result id=tool-1]: ok">>, CB).
+
+%% is_error must surface so the model can react differently to a
+%% tool that errored. We do not propagate the boolean to the engine
+%% but we encode it in the text marker.
+anthropic_content_blocks_tool_result_is_error(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{
+                        <<"type">> => <<"tool_result">>,
+                        <<"tool_use_id">> => <<"tool-2">>,
+                        <<"is_error">> => true,
+                        <<"content">> => <<"boom">>
+                    }
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    [#{content := C}] = R#erllama_request.messages,
+    ?assertEqual(<<"[tool_result id=tool-2 error=true]: boom">>, C).
 
 %% Assistant turn with a tool_use block (from a prior round) should
 %% serialise to a stable marker, not be silently dropped, so the
