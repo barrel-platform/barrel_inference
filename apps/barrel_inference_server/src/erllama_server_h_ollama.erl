@@ -276,6 +276,10 @@ info({erllama_error, Ref, Reason}, Req0, S0) ->
 info({'DOWN', Mon, process, _Pid, _Reason}, Req, S = #st{worker_mon = Mon}) ->
     %% Pipeline worker exited after admit; ignore.
     {ok, Req, S#st{worker = undefined, worker_mon = undefined}, hibernate};
+%% erllama 0.2.0 emits a token-id message alongside every token text
+%% message. We do not consume it.
+info({erllama_token_id, _Ref, _Id}, Req, S) ->
+    {ok, Req, S, hibernate};
 info(_Msg, Req, S) ->
     {ok, Req, S, hibernate}.
 
