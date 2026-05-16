@@ -42,6 +42,7 @@
     prefill_tref :: reference() | undefined,
     idle_tref :: reference() | undefined,
     out_tokens :: non_neg_integer(),
+    prompt_tokens :: non_neg_integer(),
     buf_text :: iodata(),
     buf_reason :: iodata(),
     mode :: text | tool_buffer,
@@ -174,6 +175,7 @@ init_state(R, Requested, Worker, Mon) ->
         idle_tref = undefined,
         total_tref = undefined,
         out_tokens = 0,
+        prompt_tokens = 0,
         buf_text = [],
         buf_reason = [],
         mode = text,
@@ -205,8 +207,11 @@ info({pipeline, loading, _ModelId}, Req, S) ->
 info({pipeline, loaded}, Req, S) ->
     ok = erllama_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template}, hibernate};
-info({pipeline, templated, _}, Req, S) ->
-    {ok, Req, S#st{phase = waiting_queue}, hibernate};
+info({pipeline, templated, Tokens}, Req, S) ->
+    %% Capture the prompt token count for the message_start frame's
+    %% `usage.input_tokens`. Without this, streaming clients see 0
+    %% in message_start while non-streaming reports the real value.
+    {ok, Req, S#st{phase = waiting_queue, prompt_tokens = length(Tokens)}, hibernate};
 info({pipeline, queued}, Req, S) ->
     {ok, Req, S#st{phase = waiting_admit}, hibernate};
 info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
@@ -384,7 +389,7 @@ emit_message_start(_Req, S = #st{message_started = true}) ->
     S;
 emit_message_start(Req, S) ->
     Iolist = erllama_server_translate:internal_to_anthropic_event(
-        message_start, #{}, S#st.req_id, S#st.requested
+        {message_start, S#st.prompt_tokens}, #{}, S#st.req_id, S#st.requested
     ),
     cowboy_req:stream_body(Iolist, nofin, Req),
     S#st{message_started = true}.

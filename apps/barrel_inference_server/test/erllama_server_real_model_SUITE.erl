@@ -30,6 +30,8 @@
 ]).
 -export([
     models_lists_real_model/1,
+    load_and_decode_round_trip/1,
+    messages_with_many_tools_does_not_crash/1,
     chat_streaming_runs/1,
     chat_non_streaming_runs/1,
     messages_streaming_runs/1,
@@ -44,6 +46,8 @@ suite() -> [{timetrap, {minutes, 5}}].
 
 all() ->
     [
+        load_and_decode_round_trip,
+        messages_with_many_tools_does_not_crash,
         models_lists_real_model,
         chat_streaming_runs,
         chat_non_streaming_runs,
@@ -193,6 +197,136 @@ file_sha256(Path) ->
 %%====================================================================
 %% Tests
 %%====================================================================
+
+%% Regression for the SIGSEGV observed on Apple M4 Pro during Metal
+%% device init / first prefill. The model is already loaded in
+%% init_per_suite via erllama:load_model/2, so if the load itself
+%% crashes the suite errors out at setup. This case then proves the
+%% subsequent prefill + a single decode round-trip survives — the
+%% exact native paths that died on the user's machine (ggml-metal
+%% kernel compile, sched_reserve, first llama_decode). A SIGSEGV in
+%% any of those tears down the BEAM and CT records the suite as
+%% crashed rather than silently passing.
+load_and_decode_round_trip(Cfg) ->
+    Model = ?config(model, Cfg),
+    %% Sanity: the gen_statem registered by load_model is alive and
+    %% addressable. If Metal init segfaulted during load this fails
+    %% at the same instant.
+    Info = erllama:model_info(Model),
+    ?assert(is_map(Info)),
+    ?assert(maps:is_key(status, Info)),
+    %% Minimal end-to-end: tokenize a short prompt, run prefill via
+    %% the inference path, take exactly one generated token. Exercises
+    %% the prefill graph + Metal command-queue submission on the M-series
+    %% device. Cancel rather than letting it run to completion to keep
+    %% the test fast.
+    {ok, Tokens} = erllama:tokenize(Model, <<"hi">>),
+    ?assert(is_list(Tokens) andalso length(Tokens) > 0),
+    Self = self(),
+    {ok, Ref} = erllama:infer(
+        Model,
+        Tokens,
+        #{response_tokens => 1, temperature => 0.0},
+        Self
+    ),
+    %% Wait for at least one token OR a clean done — either proves
+    %% the native path didn't tip over. Hard 30s timeout caps a
+    %% wedged path.
+    Outcome =
+        receive
+            {erllama_token, Ref, _} -> token;
+            {erllama_done, Ref, _} -> done;
+            {erllama_error, Ref, Reason} -> {error, Reason}
+        after 30000 ->
+            timeout
+        end,
+    erllama:cancel(Ref),
+    %% Drain any pending messages so subsequent cases start clean.
+    drain_inference(Ref, 500),
+    ?assert(Outcome =:= token orelse Outcome =:= done).
+
+drain_inference(Ref, BudgetMs) ->
+    receive
+        {erllama_token, Ref, _} -> drain_inference(Ref, BudgetMs);
+        {erllama_done, Ref, _} -> ok;
+        {erllama_error, Ref, _} -> ok;
+        {erllama_cancelled, Ref} -> ok
+    after BudgetMs ->
+        ok
+    end.
+
+%% Regression for the daemon SIGSEGV when Claude Code points at the
+%% server. Mirrors Claude Code's actual request shape: ~30 tools,
+%% Anthropic content blocks, system prompt with cache_control. The
+%% three paths that minimal load+decode skipped — chat-template
+%% render with tools inlined, GBNF compile from a large tools
+%% array, prefill with the grammar installed — all run here.
+%%
+%% A BEAM SIGSEGV in any of those paths tears the cowboy connection
+%% before any response is written; httpc returns a transport-level
+%% error (`{error, _}`) rather than an HTTP status. The assertion
+%% `{ok, {{_, _, _}, ...}}` therefore catches the segfault: a
+%% clean 4xx / 5xx still passes (we want to know we did not
+%% silently corrupt state), only a torn connection fails.
+messages_with_many_tools_does_not_crash(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Tools = [synthetic_tool(I) || I <- lists:seq(1, 30)],
+    Body = json:encode(#{
+        <<"model">> => <<"real">>,
+        <<"system">> => [
+            #{
+                <<"type">> => <<"text">>,
+                <<"text">> => <<"You are a concise assistant.">>,
+                <<"cache_control">> => #{<<"type">> => <<"ephemeral">>}
+            }
+        ],
+        <<"tools">> => Tools,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"hi">>}
+                ]
+            }
+        ],
+        <<"max_tokens">> => 8,
+        <<"stream">> => false
+    }),
+    Result = httpc:request(
+        post, {Url, [], "application/json", Body}, [{timeout, 120000}], []
+    ),
+    %% Anything other than {ok, {Status, _, _}} means the connection
+    %% was torn — almost always a BEAM segfault on the server.
+    ?assertMatch({ok, {{_, _, _}, _, _}}, Result),
+    {ok, {{_, Status, _}, _, Resp}} = Result,
+    %% Either a real 200 inference or a clean error envelope. Both
+    %% prove the server stayed up through chat-template + grammar
+    %% + prefill. We do not assert content correctness — the model
+    %% is small and may refuse with a structured error.
+    ?assert(Status =:= 200 orelse Status >= 400),
+    ?assert(byte_size(list_to_binary(Resp)) > 0).
+
+%% A synthetic Anthropic tool with a non-trivial JSON Schema so the
+%% GBNF compiler has actual work to do. Keep arg names compact so
+%% repeated tools don't blow past llama_n_ctx alone.
+synthetic_tool(I) ->
+    Name = iolist_to_binary(io_lib:format("tool_~B", [I])),
+    #{
+        <<"name">> => Name,
+        <<"description">> => <<"Synthetic tool ", Name/binary>>,
+        <<"input_schema">> => #{
+            <<"type">> => <<"object">>,
+            <<"properties">> => #{
+                <<"q">> => #{<<"type">> => <<"string">>},
+                <<"limit">> => #{<<"type">> => <<"integer">>},
+                <<"mode">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"enum">> => [<<"a">>, <<"b">>, <<"c">>]
+                }
+            },
+            <<"required">> => [<<"q">>]
+        }
+    }.
 
 models_lists_real_model(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/models",

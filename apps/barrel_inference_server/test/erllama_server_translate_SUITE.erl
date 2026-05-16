@@ -61,7 +61,9 @@
     anthropic_response_shape/1,
     anthropic_event_message_start/1,
     anthropic_event_text_delta/1,
-    anthropic_event_message_delta/1
+    anthropic_event_message_delta/1,
+    anthropic_event_message_delta_emits_cache_read_on_exact_hit/1,
+    anthropic_event_message_delta_emits_cache_creation_on_cold/1
 ]).
 
 %%====================================================================
@@ -122,7 +124,9 @@ all() ->
         anthropic_response_shape,
         anthropic_event_message_start,
         anthropic_event_text_delta,
-        anthropic_event_message_delta
+        anthropic_event_message_delta,
+        anthropic_event_message_delta_emits_cache_read_on_exact_hit,
+        anthropic_event_message_delta_emits_cache_creation_on_cold
     ].
 
 %%====================================================================
@@ -821,11 +825,12 @@ anthropic_response_shape(_Cfg) ->
 
 anthropic_event_message_start(_Cfg) ->
     Iolist = erllama_server_translate:internal_to_anthropic_event(
-        message_start, #{}, <<"msg_1">>, <<"claude">>
+        {message_start, 42}, #{}, <<"msg_1">>, <<"claude">>
     ),
     Bin = iolist_to_binary(Iolist),
     ?assert(binary:match(Bin, <<"event: message_start">>) =/= nomatch),
-    ?assert(binary:match(Bin, <<"\"id\":\"msg_1\"">>) =/= nomatch).
+    ?assert(binary:match(Bin, <<"\"id\":\"msg_1\"">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"input_tokens\":42">>) =/= nomatch).
 
 anthropic_event_text_delta(_Cfg) ->
     Iolist = erllama_server_translate:internal_to_anthropic_event(
@@ -844,6 +849,37 @@ anthropic_event_message_delta(_Cfg) ->
     ?assert(binary:match(Bin, <<"event: message_delta">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"stop_reason\":\"max_tokens\"">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"output_tokens\":4">>) =/= nomatch).
+
+%% Streaming clients (Claude Code, Anthropic SDK) read cache stats
+%% from the final message_delta usage frame. Pre-fix this carried
+%% only output_tokens so cache hits were invisible.
+anthropic_event_message_delta_emits_cache_read_on_exact_hit(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 128,
+        completion_tokens => 4,
+        cache_hit_kind => exact,
+        finish_reason => stop
+    },
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
+    ),
+    Bin = iolist_to_binary(Iolist),
+    ?assert(binary:match(Bin, <<"\"cache_read_input_tokens\":128">>) =/= nomatch),
+    ?assertEqual(nomatch, binary:match(Bin, <<"\"cache_creation_input_tokens\"">>)).
+
+anthropic_event_message_delta_emits_cache_creation_on_cold(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 128,
+        completion_tokens => 4,
+        cache_hit_kind => cold,
+        finish_reason => stop
+    },
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
+    ),
+    Bin = iolist_to_binary(Iolist),
+    ?assert(binary:match(Bin, <<"\"cache_creation_input_tokens\":128">>) =/= nomatch),
+    ?assertEqual(nomatch, binary:match(Bin, <<"\"cache_read_input_tokens\"">>)).
 
 %%====================================================================
 %% Helpers
