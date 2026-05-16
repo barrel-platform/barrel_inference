@@ -14,7 +14,7 @@
 -module(erllama_server_queue).
 -behaviour(gen_server).
 
--export([start_link/1, acquire/2, release/2, depth/1]).
+-export([start_link/1, acquire/2, release/2, depth/1, stats/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -71,6 +71,29 @@ depth(ModelId) ->
     case erllama_server_registry:whereis_name({queue, ModelId}) of
         undefined -> 0;
         Pid -> gen_server:call(Pid, depth)
+    end.
+
+%% Snapshot view of the queue used by /v1/messages to populate
+%% `anthropic-ratelimit-requests-*` headers. Returns concurrency
+%% (the configured per-model parallelism), inflight (slots currently
+%% held), and depth (waiters in the queue). When the queue is not
+%% running we fall back to the configured pool policy so the headers
+%% still report a meaningful limit on the cold path.
+-spec stats(binary()) ->
+    #{
+        concurrency := pos_integer(),
+        inflight := non_neg_integer(),
+        depth := non_neg_integer()
+    }.
+stats(ModelId) ->
+    case erllama_server_registry:whereis_name({queue, ModelId}) of
+        undefined ->
+            {Concurrency, _Depth, _Timeout} = policy_to_params(
+                erllama_server_config:pool_policy_for(ModelId)
+            ),
+            #{concurrency => Concurrency, inflight => 0, depth => 0};
+        Pid ->
+            gen_server:call(Pid, stats)
     end.
 
 %%====================================================================
@@ -134,6 +157,14 @@ handle_call({acquire, HandlerPid, ReqTimeout}, From, S) ->
     end;
 handle_call(depth, _From, S) ->
     {reply, queue:len(S#state.waiters), S};
+handle_call(stats, _From, S) ->
+    {reply,
+        #{
+            concurrency => S#state.concurrency,
+            inflight => S#state.in_flight,
+            depth => queue:len(S#state.waiters)
+        },
+        S};
 handle_call(_, _, S) ->
     {reply, {error, unknown_call}, S}.
 

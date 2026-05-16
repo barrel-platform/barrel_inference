@@ -322,8 +322,9 @@ info({pipeline, error, Status, Reason}, Req0, S = #st{stream = true}) ->
     {stop, Req1, S1};
 info({pipeline, error, Status, Reason}, Req0, S) ->
     record_metrics(S, Status),
-    Req1 = json_error(Status, Reason, Req0),
-    {stop, Req1, S};
+    Req1 = stamp_ratelimit(Req0, S#st.model),
+    Req2 = json_error(Status, Reason, Req1),
+    {stop, Req2, S};
 info(
     {'DOWN', Mon, process, Worker, _Reason},
     Req0,
@@ -692,14 +693,15 @@ finish_ok(Req0, S = #st{stream = false}, Stats0) ->
     Body = erllama_server_translate:internal_to_anthropic_messages_response(
         Content, attach_cache_hints(Stats, S), S#st.requested
     ),
-    Req1 = cowboy_req:reply(
+    Req1 = stamp_ratelimit(Req0, S#st.model),
+    Req2 = cowboy_req:reply(
         200,
         #{<<"content-type">> => <<"application/json">>},
         json:encode(Body),
-        Req0
+        Req1
     ),
     record_success(S, Stats),
-    {stop, Req1, S}.
+    {stop, Req2, S}.
 
 %% Build the non-streaming content list. Streaming-path callers
 %% already emit tool_use / thinking blocks separately; the
@@ -797,8 +799,39 @@ learn_ref(S, Req, _Ref) ->
 ensure_stream(Req, S = #st{stream_started = true}) ->
     {Req, S};
 ensure_stream(Req0, S) ->
-    Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
-    {Req1, S#st{stream_started = true}}.
+    Req1 = stamp_ratelimit(Req0, S#st.model),
+    Req2 = cowboy_req:stream_reply(200, sse_headers(), Req1),
+    {Req2, S#st{stream_started = true}}.
+
+%% Anthropic SDKs read `anthropic-ratelimit-requests-{limit,remaining,reset}`
+%% to throttle their pre-emptive retries. We map the per-model queue
+%% snapshot onto these headers; token-bucket headers are omitted since
+%% we have no per-minute / per-day token accounting.
+stamp_ratelimit(Req, Model) ->
+    #{concurrency := Limit, inflight := Inflight} =
+        erllama_server_queue:stats(Model),
+    Remaining = max(0, Limit - Inflight),
+    Reset = ratelimit_reset(),
+    Req1 = cowboy_req:set_resp_header(
+        <<"anthropic-ratelimit-requests-limit">>, integer_to_binary(Limit), Req
+    ),
+    Req2 = cowboy_req:set_resp_header(
+        <<"anthropic-ratelimit-requests-remaining">>,
+        integer_to_binary(Remaining),
+        Req1
+    ),
+    cowboy_req:set_resp_header(
+        <<"anthropic-ratelimit-requests-reset">>, Reset, Req2
+    ).
+
+ratelimit_reset() ->
+    Seconds = erllama_server_config:anthropic_retry_after_seconds(),
+    Bin = list_to_binary(
+        calendar:system_time_to_rfc3339(erlang:system_time(second) + Seconds, [
+            {offset, "Z"}
+        ])
+    ),
+    Bin.
 
 anthropic_ping(Req) ->
     anthropic_event(Req, <<"ping">>, #{<<"type">> => <<"ping">>}).
