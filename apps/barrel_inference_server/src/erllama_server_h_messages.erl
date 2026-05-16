@@ -63,6 +63,10 @@
     %% time. Carried forward into Stats so the response/SSE usage
     %% frame can emit the nested cache_creation TTL split.
     cache_hints :: list(),
+    %% Optional metadata.user_id from the request body; propagated
+    %% from `#erllama_request.user_id` so the per-request structured
+    %% log can include it without re-reading the original record.
+    user_id = undefined :: undefined | binary(),
     %% Integrity signature for the (currently open or just-closed)
     %% thinking block, captured from the engine's
     %% {erllama_thinking_end, Ref, Sig} message. Forwarded to the
@@ -154,18 +158,30 @@ fast_phase(Body, Req0, Opts) ->
 translate(Map, Req0, Opts) ->
     case erllama_server_translate:anthropic_messages_to_internal(Map) of
         {ok, R} ->
-            %% Capture the optional anthropic-beta request header for
-            %% observability (CORS already allows it). Not currently
-            %% acted on; the engine has no beta-feature pass-through.
+            %% Anthropic surfaces beta opt-ins on both the
+            %% `anthropic-beta` header (comma-separated) and the body
+            %% `betas` array. Merge both into one de-duplicated list
+            %% on the request record. Observability-only for now; the
+            %% engine has no beta-feature pass-through.
             R1 = R#erllama_request{
-                anthropic_beta = cowboy_req:header(
-                    <<"anthropic-beta">>, Req0, undefined
-                )
+                anthropic_betas = collect_betas(Req0, Map)
             },
             dispatch(R1, Req0, Opts);
         {error, Reason} ->
             reply_json_error(400, Reason, Req0)
     end.
+
+collect_betas(Req, Body) ->
+    Header = cowboy_req:header(<<"anthropic-beta">>, Req, <<>>),
+    FromHeader = [
+        trim(B)
+     || B <- binary:split(Header, <<",">>, [global]), trim(B) =/= <<>>
+    ],
+    FromBody = erllama_server_translate:parse_anthropic_betas_body(Body),
+    lists:usort(FromHeader ++ FromBody).
+
+trim(Bin) when is_binary(Bin) ->
+    list_to_binary(string:trim(binary_to_list(Bin))).
 
 dispatch(R, Req0, #{op := count_tokens}) ->
     count_tokens(R, Req0);
@@ -255,7 +271,8 @@ init_state(R, Requested, Worker, Mon) ->
         thinking_block_started = undefined,
         message_started = false,
         cache_hints = R#erllama_request.cache_hints,
-        thinking_display = R#erllama_request.thinking_display
+        thinking_display = R#erllama_request.thinking_display,
+        user_id = R#erllama_request.user_id
     }.
 
 %% Mirrors erllama_server_grammar:from_tools/2: no grammar is installed
@@ -322,8 +339,9 @@ info({pipeline, error, Status, Reason}, Req0, S = #st{stream = true}) ->
     {stop, Req1, S1};
 info({pipeline, error, Status, Reason}, Req0, S) ->
     record_metrics(S, Status),
-    Req1 = json_error(Status, Reason, Req0),
-    {stop, Req1, S};
+    Req1 = stamp_ratelimit(Req0, S#st.model),
+    Req2 = json_error(Status, Reason, Req1),
+    {stop, Req2, S};
 info(
     {'DOWN', Mon, process, Worker, _Reason},
     Req0,
@@ -692,14 +710,15 @@ finish_ok(Req0, S = #st{stream = false}, Stats0) ->
     Body = erllama_server_translate:internal_to_anthropic_messages_response(
         Content, attach_cache_hints(Stats, S), S#st.requested
     ),
-    Req1 = cowboy_req:reply(
+    Req1 = stamp_ratelimit(Req0, S#st.model),
+    Req2 = cowboy_req:reply(
         200,
         #{<<"content-type">> => <<"application/json">>},
         json:encode(Body),
-        Req0
+        Req1
     ),
     record_success(S, Stats),
-    {stop, Req1, S}.
+    {stop, Req2, S}.
 
 %% Build the non-streaming content list. Streaming-path callers
 %% already emit tool_use / thinking blocks separately; the
@@ -797,8 +816,39 @@ learn_ref(S, Req, _Ref) ->
 ensure_stream(Req, S = #st{stream_started = true}) ->
     {Req, S};
 ensure_stream(Req0, S) ->
-    Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
-    {Req1, S#st{stream_started = true}}.
+    Req1 = stamp_ratelimit(Req0, S#st.model),
+    Req2 = cowboy_req:stream_reply(200, sse_headers(), Req1),
+    {Req2, S#st{stream_started = true}}.
+
+%% Anthropic SDKs read `anthropic-ratelimit-requests-{limit,remaining,reset}`
+%% to throttle their pre-emptive retries. We map the per-model queue
+%% snapshot onto these headers; token-bucket headers are omitted since
+%% we have no per-minute / per-day token accounting.
+stamp_ratelimit(Req, Model) ->
+    #{concurrency := Limit, inflight := Inflight} =
+        erllama_server_queue:stats(Model),
+    Remaining = max(0, Limit - Inflight),
+    Reset = ratelimit_reset(),
+    Req1 = cowboy_req:set_resp_header(
+        <<"anthropic-ratelimit-requests-limit">>, integer_to_binary(Limit), Req
+    ),
+    Req2 = cowboy_req:set_resp_header(
+        <<"anthropic-ratelimit-requests-remaining">>,
+        integer_to_binary(Remaining),
+        Req1
+    ),
+    cowboy_req:set_resp_header(
+        <<"anthropic-ratelimit-requests-reset">>, Reset, Req2
+    ).
+
+ratelimit_reset() ->
+    Seconds = erllama_server_config:anthropic_retry_after_seconds(),
+    Bin = list_to_binary(
+        calendar:system_time_to_rfc3339(erlang:system_time(second) + Seconds, [
+            {offset, "Z"}
+        ])
+    ),
+    Bin.
 
 anthropic_ping(Req) ->
     anthropic_event(Req, <<"ping">>, #{<<"type">> => <<"ping">>}).
@@ -880,7 +930,23 @@ record_metrics(S, Status) ->
         S#st.requested,
         integer_to_binary(Status),
         Duration
-    ).
+    ),
+    %% Structured per-request log line for observability sinks. user_id
+    %% comes from the request's metadata.user_id (undefined when not
+    %% set); request_id is the Anthropic-shaped msg_<int> the SDK
+    %% surfaces as message._request_id. Emitted at notice level (the
+    %% same level as the access log) so the default OTP logger config
+    %% picks it up. Kept out of metric labels to avoid Prometheus
+    %% cardinality blow-up.
+    logger:notice(#{
+        event => anthropic_request,
+        endpoint => <<"/v1/messages">>,
+        model => S#st.requested,
+        status => Status,
+        duration_ms => round(Duration * 1000),
+        request_id => S#st.req_id,
+        user_id => S#st.user_id
+    }).
 
 reply_json_error(Status, Reason, Req0) ->
     Req1 = json_error(Status, Reason, Req0),

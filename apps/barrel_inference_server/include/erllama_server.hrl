@@ -78,11 +78,14 @@
             ttl := binary()
         }
     ],
-    %% Optional metadata.user_id from Anthropic /v1/messages requests
-    %% and the anthropic-beta header. Captured for observability; not
-    %% currently passed to the engine. `undefined` when absent.
+    %% Optional metadata.user_id from Anthropic /v1/messages requests.
+    %% Captured for observability; not passed to the engine.
     user_id = undefined :: undefined | binary(),
-    anthropic_beta = undefined :: undefined | binary(),
+    %% Anthropic beta-feature opt-ins. The Anthropic API surfaces these
+    %% in two places: the `anthropic-beta` HTTP header (comma-separated
+    %% list) and the body field `betas` (JSON array). We merge both
+    %% into a single de-duplicated list; sources are equivalent.
+    anthropic_betas = [] :: [binary()],
     %% Anthropic extended-thinking display preference. `visible`
     %% (default) emits thinking_delta SSE frames and a thinking
     %% content block on non-streaming responses; `omitted` suppresses

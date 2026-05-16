@@ -37,6 +37,9 @@
     anthropic_tool_choice_any_maps_required/1,
     anthropic_tool_choice_none/1,
     anthropic_thinking_enabled/1,
+    anthropic_betas_body_parsed/1,
+    anthropic_output_config_json_schema/1,
+    anthropic_output_config_absent_or_bad/1,
     anthropic_thinking_display_and_budget/1,
     anthropic_thinking_invalid_falls_back/1,
     anthropic_stop_sequences_parsed/1,
@@ -118,6 +121,9 @@ all() ->
         anthropic_tool_choice_any_maps_required,
         anthropic_tool_choice_none,
         anthropic_thinking_enabled,
+        anthropic_betas_body_parsed,
+        anthropic_output_config_json_schema,
+        anthropic_output_config_absent_or_bad,
         anthropic_thinking_display_and_budget,
         anthropic_thinking_invalid_falls_back,
         anthropic_stop_sequences_parsed,
@@ -431,6 +437,63 @@ anthropic_tool_choice_none(_Cfg) ->
     },
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
     ?assertEqual(none, R#erllama_request.tool_choice).
+
+%% Anthropic's structured-output knob lives at body.output_config.
+%% json_schema is the schema map directly (no `schema` indirection like
+%% OpenAI). Maps onto the internal {json_schema, Schema} response_format
+%% which the existing pipeline grammar build understands.
+anthropic_output_config_json_schema(_Cfg) ->
+    Schema = #{
+        <<"type">> => <<"object">>,
+        <<"properties">> => #{
+            <<"answer">> => #{<<"type">> => <<"string">>}
+        }
+    },
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"output_config">> => #{<<"json_schema">> => Schema}
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual({json_schema, Schema}, R#erllama_request.response_format).
+
+%% Missing or malformed output_config falls back to text (free-form).
+anthropic_output_config_absent_or_bad(_Cfg) ->
+    Body0 = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ]
+    },
+    {ok, R0} = erllama_server_translate:anthropic_messages_to_internal(Body0),
+    ?assertEqual(text, R0#erllama_request.response_format),
+    Body1 = Body0#{<<"output_config">> => #{<<"json_schema">> => <<"not a map">>}},
+    {ok, R1} = erllama_server_translate:anthropic_messages_to_internal(Body1),
+    ?assertEqual(text, R1#erllama_request.response_format).
+
+%% body.betas is one source of Anthropic beta opt-ins; the other is
+%% the anthropic-beta header (handler-side). Parser keeps the body
+%% side; the handler merges with the header.
+anthropic_betas_body_parsed(_Cfg) ->
+    ?assertEqual(
+        [<<"a">>, <<"b">>],
+        erllama_server_translate:parse_anthropic_betas_body(
+            #{<<"betas">> => [<<"a">>, <<"b">>]}
+        )
+    ),
+    ?assertEqual(
+        [],
+        erllama_server_translate:parse_anthropic_betas_body(#{})
+    ),
+    %% Non-binary entries are dropped.
+    ?assertEqual(
+        [<<"ok">>],
+        erllama_server_translate:parse_anthropic_betas_body(
+            #{<<"betas">> => [<<"ok">>, 42, <<>>]}
+        )
+    ).
 
 anthropic_thinking_enabled(_Cfg) ->
     Body = #{

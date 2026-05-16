@@ -59,7 +59,8 @@
     %% helpers
     parse_keep_alive/1,
     parse_response_format_openai/1,
-    parse_response_format_ollama/1
+    parse_response_format_ollama/1,
+    parse_anthropic_betas_body/1
 ]).
 
 %%====================================================================
@@ -161,6 +162,7 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
         ToolChoice = parse_anthropic_tool_choice(Body),
         Thinking = parse_anthropic_thinking(Body),
         CacheHints = collect_cache_hints(SystemRaw, MessagesIn, Body),
+        RF = parse_anthropic_output_config(Body),
         Base = base_request(Body, anthropic),
         {ok, Base#erllama_request{
             model_id = Model,
@@ -171,6 +173,7 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
             tool_choice = ToolChoice,
             thinking = Thinking,
             cache_hints = CacheHints,
+            response_format = RF,
             %% Anthropic uses `stop_sequences` (plural); base_request
             %% only reads `stop` (OpenAI/Ollama naming). Override here
             %% so Anthropic clients don't lose their stop tokens.
@@ -1254,6 +1257,30 @@ parse_anthropic_thinking(Body) ->
         #{<<"type">> := <<"disabled">>} -> disabled;
         #{<<"type">> := <<"enabled">>} -> enabled;
         _ -> disabled
+    end.
+
+%% body.betas is the JSON-array equivalent of the anthropic-beta
+%% header. Both opt into beta features; the handler merges the two
+%% sources into one de-duplicated list on the request record.
+parse_anthropic_betas_body(Body) ->
+    case maps:get(<<"betas">>, Body, undefined) of
+        L when is_list(L) ->
+            [B || B <- L, is_binary(B), B =/= <<>>];
+        _ ->
+            []
+    end.
+
+%% Anthropic structured-outputs hook. `output_config.json_schema` is
+%% the schema map directly (one level shallower than OpenAI's
+%% `response_format.json_schema.schema`). Maps onto the same internal
+%% `response_format` value the pipeline already feeds into
+%% `erllama_server_grammar:from_response_format/1`.
+parse_anthropic_output_config(Body) ->
+    case maps:get(<<"output_config">>, Body, undefined) of
+        #{<<"json_schema">> := Schema} when is_map(Schema) ->
+            {json_schema, Schema};
+        _ ->
+            text
     end.
 
 %% `thinking.display` defaults to "visible". "omitted" tells the server

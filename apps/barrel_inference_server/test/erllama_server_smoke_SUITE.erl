@@ -7,6 +7,8 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([all/0, suite/0, init_per_suite/1, end_per_suite/1]).
+%% Logger handler callback used by messages_logs_user_id_in_event/1.
+-export([log/2]).
 -export([
     health_returns_200/1,
     health_ready_returns_503_with_no_models/1,
@@ -25,6 +27,8 @@
     messages_413_returns_request_too_large_type/1,
     messages_emits_request_id_header/1,
     messages_no_allowlist_accepts_any_key/1,
+    messages_emits_ratelimit_headers/1,
+    messages_logs_user_id_in_event/1,
     messages_error_body_carries_request_id/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
@@ -55,6 +59,8 @@ all() ->
         messages_413_returns_request_too_large_type,
         messages_emits_request_id_header,
         messages_no_allowlist_accepts_any_key,
+        messages_emits_ratelimit_headers,
+        messages_logs_user_id_in_event,
         messages_error_body_carries_request_id,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
@@ -324,6 +330,74 @@ messages_no_allowlist_accepts_any_key(Cfg) ->
     %% Hits model resolution (404 because the model isn't real); the
     %% point is the auth gate did not 401.
     ?assertEqual(404, Status).
+
+%% record_metrics/2 emits a structured logger:info event including
+%% metadata.user_id and the message id so observability sinks can
+%% slice request traffic by user. The event is keyed `anthropic_request`.
+messages_logs_user_id_in_event(Cfg) ->
+    persistent_term:put({?MODULE, log_pid}, self()),
+    HandlerId = anthropic_log_capture,
+    ok = logger:add_handler(HandlerId, ?MODULE, #{level => notice}),
+    try
+        Url = ?config(base, Cfg) ++ "/v1/messages",
+        Body = json:encode(#{
+            <<"model">> => <<"no-such-model">>,
+            <<"max_tokens">> => 4,
+            <<"metadata">> => #{<<"user_id">> => <<"u-test">>},
+            <<"messages">> => [
+                #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+            ]
+        }),
+        {ok, _} = httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        receive
+            {log_event, Report} ->
+                ?assertEqual(<<"u-test">>, maps:get(user_id, Report)),
+                ?assertEqual(anthropic_request, maps:get(event, Report)),
+                ?assertEqual(<<"/v1/messages">>, maps:get(endpoint, Report))
+        after 2000 ->
+            ct:fail(no_anthropic_request_log_seen)
+        end
+    after
+        logger:remove_handler(HandlerId),
+        persistent_term:erase({?MODULE, log_pid})
+    end.
+
+%% Logger handler callback. Forwards the anthropic_request event
+%% report to the test process; ignores everything else.
+log(#{msg := {report, #{event := anthropic_request} = Report}}, _Config) ->
+    case persistent_term:get({?MODULE, log_pid}, undefined) of
+        undefined -> ok;
+        Pid -> Pid ! {log_event, Report}
+    end,
+    ok;
+log(_, _) ->
+    ok.
+
+%% Anthropic SDKs read anthropic-ratelimit-requests-{limit,remaining,reset}
+%% to pace their own retry behaviour. The limit comes from the per-model
+%% queue concurrency; remaining is concurrency-inflight; reset is an
+%% RFC 3339 timestamp of when the next slot is expected to free up.
+%% Token-bucket headers are intentionally omitted (we have no per-minute
+%% / per-day token accounting).
+messages_emits_ratelimit_headers(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 4,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, _, _}, Headers, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    {value, {_, Limit}} =
+        lists:keysearch("anthropic-ratelimit-requests-limit", 1, Headers),
+    {value, {_, Remaining}} =
+        lists:keysearch("anthropic-ratelimit-requests-remaining", 1, Headers),
+    {value, {_, Reset}} =
+        lists:keysearch("anthropic-ratelimit-requests-reset", 1, Headers),
+    ?assert(list_to_integer(Limit) >= 1),
+    ?assert(list_to_integer(Remaining) >= 0),
+    %% Format check: RFC 3339 ends with a Z (we set offset to "Z").
+    ?assert(lists:suffix("Z", Reset)).
 
 %% Anthropic error envelope spec includes `request_id` inside the body
 %% alongside type and message. SDKs read it for support diagnostics
