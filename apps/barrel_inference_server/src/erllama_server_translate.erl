@@ -328,7 +328,7 @@ internal_to_anthropic_messages_response(Content, Stats, Model) when is_list(Cont
         <<"model">> => Model,
         <<"content">> => Content,
         <<"stop_reason">> => anthropic_stop_reason(Stats),
-        <<"stop_sequence">> => null,
+        <<"stop_sequence">> => anthropic_stop_sequence(Stats),
         <<"usage">> => anthropic_usage_map(Stats)
     }.
 
@@ -445,7 +445,7 @@ internal_to_anthropic_event({message_delta, Stats}, _Acc, _ReqId, _Model) ->
             <<"type">> => <<"message_delta">>,
             <<"delta">> => #{
                 <<"stop_reason">> => anthropic_stop_reason(Stats),
-                <<"stop_sequence">> => null
+                <<"stop_sequence">> => anthropic_stop_sequence(Stats)
             },
             %% Final usage frame: carry cache_creation_input_tokens
             %% / cache_read_input_tokens so streaming Anthropic
@@ -1309,11 +1309,32 @@ finish_reason_atom(Stats) ->
 
 anthropic_stop_reason(Stats) ->
     case maps:get(finish_reason, Stats, stop) of
-        stop -> <<"end_turn">>;
-        length -> <<"max_tokens">>;
-        cancelled -> <<"end_turn">>;
-        tool_call -> <<"tool_use">>;
-        _ -> <<"end_turn">>
+        stop ->
+            %% erllama 0.3.0 reports the matched stop string in
+            %% `stop_sequence` when generation halted on a caller-supplied
+            %% stop. Map to Anthropic's distinct `stop_sequence` reason in
+            %% that case; otherwise it's a natural end-of-generation.
+            case maps:is_key(stop_sequence, Stats) of
+                true -> <<"stop_sequence">>;
+                false -> <<"end_turn">>
+            end;
+        length ->
+            <<"max_tokens">>;
+        cancelled ->
+            <<"end_turn">>;
+        tool_call ->
+            <<"tool_use">>;
+        _ ->
+            <<"end_turn">>
+    end.
+
+%% `stop_sequence` value as required by Anthropic when the matching
+%% reason is `stop_sequence`; absent in Stats otherwise (engine reports
+%% the matched binary only when a caller-supplied stop fired).
+anthropic_stop_sequence(Stats) ->
+    case maps:get(stop_sequence, Stats, undefined) of
+        undefined -> null;
+        Bin when is_binary(Bin) -> Bin
     end.
 
 usage_map(Stats) ->
