@@ -144,7 +144,8 @@ default_tool_call_formats() ->
         },
         <<"mistral-tool-calls">> => #{
             module => erllama_server_tool_format_mistral_tool_calls
-        }
+        },
+        <<"bare-json">> => #{module => erllama_server_tool_format_bare_json}
     }.
 
 -spec tracing_config() -> off | {otlp, binary()}.
