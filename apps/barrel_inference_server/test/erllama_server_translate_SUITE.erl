@@ -938,17 +938,14 @@ anthropic_cache_hints_hash_is_stable(_Cfg) ->
     [#{hash := HashB}] = RB#erllama_request.cache_hints,
     ?assertEqual(HashA, HashB).
 
-%% usage.cache_read_input_tokens is populated when erllama reports an
-%% exact KV-cache hit. The cache_creation_input_tokens counter is
-%% credited on cold / partial misses. Coarse: we don't yet split
-%% partial-hit prefix-tokens from the new tail, so partial is
-%% reported as a full creation. Real users with an exact prefix hit
-%% see the cache_read counter; cold first turns see cache_creation.
+%% usage.cache_read_input_tokens and cache_creation_input_tokens come
+%% straight from Stats.cache_delta = #{read, created} in erllama 0.4.0.
+%% Either field is omitted when its counter is zero.
 anthropic_usage_emits_cache_read_on_exact_hit(_Cfg) ->
     Stats = #{
         prompt_tokens => 128,
         completion_tokens => 16,
-        cache_hit_kind => exact,
+        cache_delta => #{read => 128, created => 0},
         finish_reason => stop
     },
     Resp = erllama_server_translate:internal_to_anthropic_messages_response(
@@ -972,7 +969,7 @@ anthropic_usage_emits_cache_creation_on_cold(_Cfg) ->
     Stats = #{
         prompt_tokens => 128,
         completion_tokens => 16,
-        cache_hit_kind => cold,
+        cache_delta => #{read => 0, created => 128},
         finish_reason => stop
     },
     Resp = erllama_server_translate:internal_to_anthropic_messages_response(
@@ -987,7 +984,7 @@ openai_usage_emits_cached_tokens_on_exact_hit(_Cfg) ->
     Stats = #{
         prompt_tokens => 64,
         completion_tokens => 4,
-        cache_hit_kind => exact,
+        cache_delta => #{read => 64, created => 0},
         finish_reason => stop
     },
     Resp = erllama_server_translate:internal_to_openai_chat_response(
@@ -1255,7 +1252,7 @@ anthropic_event_message_delta_emits_cache_read_on_exact_hit(_Cfg) ->
     Stats = #{
         prompt_tokens => 128,
         completion_tokens => 4,
-        cache_hit_kind => exact,
+        cache_delta => #{read => 128, created => 0},
         finish_reason => stop
     },
     Iolist = erllama_server_translate:internal_to_anthropic_event(
@@ -1269,7 +1266,7 @@ anthropic_event_message_delta_emits_cache_creation_on_cold(_Cfg) ->
     Stats = #{
         prompt_tokens => 128,
         completion_tokens => 4,
-        cache_hit_kind => cold,
+        cache_delta => #{read => 0, created => 128},
         finish_reason => stop
     },
     Iolist = erllama_server_translate:internal_to_anthropic_event(
@@ -1287,7 +1284,7 @@ anthropic_event_message_delta_emits_cache_creation_nested_5m(_Cfg) ->
     Stats = #{
         prompt_tokens => 64,
         completion_tokens => 1,
-        cache_hit_kind => cold,
+        cache_delta => #{read => 0, created => 64},
         finish_reason => stop,
         cache_hints => [#{kind => system, hash => <<"h">>, ttl => <<"5m">>}]
     },
@@ -1302,7 +1299,7 @@ anthropic_event_message_delta_emits_cache_creation_nested_1h(_Cfg) ->
     Stats = #{
         prompt_tokens => 64,
         completion_tokens => 1,
-        cache_hit_kind => cold,
+        cache_delta => #{read => 0, created => 64},
         finish_reason => stop,
         cache_hints => [#{kind => system, hash => <<"h">>, ttl => <<"1h">>}]
     },

@@ -1433,24 +1433,18 @@ usage_map(Stats) ->
         N -> Base#{<<"prompt_tokens_details">> => #{<<"cached_tokens">> => N}}
     end.
 
-%% Coarse approximation: erllama exposes `cache_hit_kind` but not the
-%% exact prefix-length, so we report all prompt tokens as cached on
-%% an exact hit, none on partial / cold. Once erllama surfaces a
-%% prefix-tokens count we can promote `partial` to the real number.
+%% erllama 0.4.0 surfaces accurate per-request cache token deltas
+%% under `Stats.cache_delta = #{read, created}`. Read maps to
+%% Anthropic's cache_read_input_tokens, created to
+%% cache_creation_input_tokens. The whole-prompt approximation we
+%% used before is gone.
 cached_tokens(Stats) ->
-    case maps:get(cache_hit_kind, Stats, undefined) of
-        exact -> maps:get(prompt_tokens, Stats, 0);
-        _ -> 0
-    end.
+    Delta = maps:get(cache_delta, Stats, #{}),
+    maps:get(read, Delta, 0).
 
 cache_creation_tokens(Stats) ->
-    %% Anthropic's protocol counts tokens added to the cache on this
-    %% request. cold / partial both add the whole prompt (or its tail);
-    %% under our coarse model we treat them as a full-prompt addition.
-    case maps:get(cache_hit_kind, Stats, undefined) of
-        exact -> 0;
-        _ -> maps:get(prompt_tokens, Stats, 0)
-    end.
+    Delta = maps:get(cache_delta, Stats, #{}),
+    maps:get(created, Delta, 0).
 
 unix_seconds() -> erlang:system_time(second).
 

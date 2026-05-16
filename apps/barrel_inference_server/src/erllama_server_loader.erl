@@ -346,7 +346,7 @@ manifest_to_config(Manifest) ->
     %% CUDA / ROCm) with the manifest's 0 placeholder and force CPU
     %% inference, which is slow and breaks the compute-buffer sizing
     %% for the larger contexts SDK clients send.
-    BaseOpts#{
+    Config0 = BaseOpts#{
         backend => application:get_env(?APP, model_backend, erllama_model_llama),
         model_path => path_string(maps:get(<<"blob_path">>, Manifest)),
         fingerprint => fingerprint_from_digest(maps:get(<<"digest">>, Manifest, null)),
@@ -359,7 +359,24 @@ manifest_to_config(Manifest) ->
             n_batch => NBatch
         },
         model_opts => model_opts_from(Loader, Params)
-    }.
+    },
+    maybe_put_thinking_markers(Config0, Loader).
+
+%% erllama 0.4.0 takes per-model extended-thinking markers via
+%% `thinking_markers => #{start := Bin, end := Bin}` on load_model/2.
+%% Operators declare them in the manifest's loader section per
+%% model family (qwen3 uses <think>/</think>, deepseek-r1 different
+%% strings, etc.). Omitting the markers disables thinking for that
+%% model.
+maybe_put_thinking_markers(Config, Loader) ->
+    case maps:get(<<"thinking_markers">>, Loader, undefined) of
+        #{<<"start">> := Start, <<"end">> := End} when
+            is_binary(Start), is_binary(End), Start =/= <<>>, End =/= <<>>
+        ->
+            Config#{thinking_markers => #{start => Start, 'end' => End}};
+        _ ->
+            Config
+    end.
 
 %% Build the model_opts map. Only set keys the manifest actually
 %% supplies; let llama.cpp pick its own platform-appropriate default

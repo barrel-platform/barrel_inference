@@ -6,12 +6,36 @@
 start(_StartType, _StartArgs) ->
     ok = erllama_server_metrics:init(),
     ok = ensure_model_default_opts(),
+    ok = ensure_thinking_signing_key(),
     case erllama_server_sup:start_link() of
         {ok, _Sup} = OK ->
             ok = maybe_bootstrap_models(),
             OK;
         E ->
             E
+    end.
+
+%% erllama 0.4.0 reads `application:get_env(erllama, thinking_signing_key)`
+%% to HMAC-sign extended-thinking blocks. We accept the key on our
+%% own env (so operators configure one place) and forward it to the
+%% engine before any model load. Unset / empty disables signing;
+%% the engine then emits <<>> signatures and the SSE layer omits
+%% signature_delta entirely.
+ensure_thinking_signing_key() ->
+    case application:get_env(erllama_server, thinking_signing_key, undefined) of
+        undefined ->
+            ok;
+        <<>> ->
+            ok;
+        Key when is_binary(Key) ->
+            application:set_env(erllama, thinking_signing_key, Key),
+            ok;
+        _ ->
+            logger:warning(
+                "erllama_server: thinking_signing_key must be a non-empty"
+                " binary; signing disabled"
+            ),
+            ok
     end.
 
 %% On boot, kick off a background pull for any spec listed in the

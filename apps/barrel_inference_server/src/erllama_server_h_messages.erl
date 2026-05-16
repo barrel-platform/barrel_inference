@@ -527,7 +527,9 @@ handle_thinking_end(Sig, Req, S = #st{stream = true, thinking_block_started = In
                 <<"index">> => Index,
                 <<"delta">> => #{
                     <<"type">> => <<"signature_delta">>,
-                    <<"signature">> => Sig
+                    %% Sig is opaque engine bytes; Anthropic SDKs read
+                    %% the signature field as base64.
+                    <<"signature">> => base64:encode(Sig)
                 }
             },
             cowboy_req:stream_body(
@@ -758,6 +760,7 @@ nonstream_content(
 
 %% Per Anthropic spec, the thinking block carries a `signature` field
 %% when one is available (round-tripped by SDKs on the next turn).
+%% Sig is opaque engine bytes; SDKs decode as base64.
 thinking_block(Text, undefined) ->
     #{<<"type">> => <<"thinking">>, <<"thinking">> => Text};
 thinking_block(Text, <<>>) ->
@@ -766,7 +769,7 @@ thinking_block(Text, Sig) when is_binary(Sig) ->
     #{
         <<"type">> => <<"thinking">>,
         <<"thinking">> => Text,
-        <<"signature">> => Sig
+        <<"signature">> => base64:encode(Sig)
     }.
 
 finish_err(Req0, S = #st{stream = true}, Reason) ->
