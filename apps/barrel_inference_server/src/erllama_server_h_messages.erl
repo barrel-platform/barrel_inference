@@ -55,6 +55,10 @@
     text_block_started :: undefined | non_neg_integer(),
     thinking_block_started :: undefined | non_neg_integer(),
     message_started :: boolean(),
+    %% Anthropic prompt-caching markers captured at request-translate
+    %% time. Carried forward into Stats so the response/SSE usage
+    %% frame can emit the nested cache_creation TTL split.
+    cache_hints :: list(),
     %% true once stream_reply/3 has fired (separate from
     %% message_started, which guards the Anthropic message_start
     %% event). Loading-phase pings can open the stream before the
@@ -197,7 +201,8 @@ init_state(R, Requested, Worker, Mon) ->
         grammar_set = grammar_active(R),
         text_block_started = undefined,
         thinking_block_started = undefined,
-        message_started = false
+        message_started = false,
+        cache_hints = R#erllama_request.cache_hints
     }.
 
 %% Mirrors erllama_server_grammar:from_tools/2: no grammar is installed
@@ -476,6 +481,13 @@ open_block_index(#st{text_block_started = I}) when is_integer(I) -> I;
 open_block_index(#st{thinking_block_started = I}) when is_integer(I) -> I;
 open_block_index(_) -> undefined.
 
+%% Carry cache_hints from the request through to the response usage
+%% builder so it can compute the cache_creation TTL split.
+attach_cache_hints(Stats, #st{cache_hints = []}) ->
+    Stats;
+attach_cache_hints(Stats, #st{cache_hints = Hints}) ->
+    Stats#{cache_hints => Hints}.
+
 %%====================================================================
 %% Finish
 %%====================================================================
@@ -496,7 +508,7 @@ finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
                 Req0
         end,
     Delta = erllama_server_translate:internal_to_anthropic_event(
-        {message_delta, Stats}, #{}, S#st.req_id, S#st.requested
+        {message_delta, attach_cache_hints(Stats, S)}, #{}, S#st.req_id, S#st.requested
     ),
     Stop = erllama_server_translate:internal_to_anthropic_event(
         message_stop, #{}, S#st.req_id, S#st.requested
@@ -535,7 +547,10 @@ finish_ok(Req0, S0 = #st{stream = true, mode = tool_buffer}, Stats) ->
     ),
     StatsToolCall = maps:put(finish_reason, tool_call, Stats),
     MsgDelta = erllama_server_translate:internal_to_anthropic_event(
-        {message_delta, StatsToolCall}, #{}, S#st.req_id, S#st.requested
+        {message_delta, attach_cache_hints(StatsToolCall, S)},
+        #{},
+        S#st.req_id,
+        S#st.requested
     ),
     MsgStop = erllama_server_translate:internal_to_anthropic_event(
         message_stop, #{}, S#st.req_id, S#st.requested
@@ -553,7 +568,7 @@ finish_ok(Req0, S0 = #st{stream = true, mode = tool_buffer}, Stats) ->
 finish_ok(Req0, S = #st{stream = false}, Stats) ->
     Text = iolist_to_binary(S#st.buf_text),
     Body = erllama_server_translate:internal_to_anthropic_messages_response(
-        Text, Stats, S#st.requested
+        Text, attach_cache_hints(Stats, S), S#st.requested
     ),
     Req1 = cowboy_req:reply(
         200,

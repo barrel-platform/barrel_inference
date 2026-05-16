@@ -347,8 +347,35 @@ anthropic_usage_map(Stats) ->
             _ -> Base#{<<"cache_read_input_tokens">> => Read}
         end,
     case Create of
-        0 -> Maybe1;
-        _ -> Maybe1#{<<"cache_creation_input_tokens">> => Create}
+        0 ->
+            Maybe1;
+        _ ->
+            Nested = cache_creation_ttl_split(Create, Stats),
+            (Maybe1#{<<"cache_creation_input_tokens">> => Create})#{
+                <<"cache_creation">> => Nested
+            }
+    end.
+
+%% SDKs newer than 2024-08 read the nested
+%% `usage.cache_creation.ephemeral_{5m,1h}_input_tokens` form. We can't
+%% distinguish per-block hit attribution from the engine yet; we use
+%% the request-side cache_hints (carried on Stats as `cache_hints`) to
+%% decide which TTL bucket the coarse total falls into. If both 5m
+%% and 1h hints are present, prefer 1h (worst case for SDK display).
+cache_creation_ttl_split(Total, Stats) ->
+    Hints = maps:get(cache_hints, Stats, []),
+    Has1h = lists:any(fun(#{ttl := T}) -> T =:= <<"1h">> end, Hints),
+    case Has1h of
+        true ->
+            #{
+                <<"ephemeral_5m_input_tokens">> => 0,
+                <<"ephemeral_1h_input_tokens">> => Total
+            };
+        false ->
+            #{
+                <<"ephemeral_5m_input_tokens">> => Total,
+                <<"ephemeral_1h_input_tokens">> => 0
+            }
     end.
 
 %% Anthropic SSE event encoder. Returns iolist containing
@@ -1081,7 +1108,7 @@ system_cache_hints(undefined) ->
 system_cache_hints(B) when is_binary(B) -> [];
 system_cache_hints(L) when is_list(L) ->
     [
-        #{kind => system, hash => block_hash(<<"system">>, B)}
+        cache_hint(system, B, <<"system">>)
      || B <- L, has_cache_control(B)
     ].
 
@@ -1089,7 +1116,7 @@ tools_cache_hints(undefined) ->
     [];
 tools_cache_hints(L) when is_list(L) ->
     [
-        #{kind => tool, hash => block_hash(<<"tool">>, T)}
+        cache_hint(tool, T, <<"tool">>)
      || T <- L, is_map(T), has_cache_control(T)
     ].
 
@@ -1098,7 +1125,7 @@ messages_cache_hints(L) when is_list(L) ->
 
 message_cache_hints(#{<<"content">> := Blocks}) when is_list(Blocks) ->
     [
-        #{kind => message, hash => block_hash(<<"message">>, B)}
+        cache_hint(message, B, <<"message">>)
      || B <- Blocks, is_map(B), has_cache_control(B)
     ];
 message_cache_hints(_) ->
@@ -1108,6 +1135,23 @@ has_cache_control(M) when is_map(M) ->
     maps:is_key(<<"cache_control">>, M);
 has_cache_control(_) ->
     false.
+
+cache_hint(Kind, Block, HashTag) ->
+    #{
+        kind => Kind,
+        hash => block_hash(HashTag, Block),
+        ttl => cache_control_ttl(Block)
+    }.
+
+%% Anthropic cache_control carries `ttl: "5m"` or `ttl: "1h"`.
+%% Default to 5m when absent, matching Anthropic's spec.
+cache_control_ttl(#{<<"cache_control">> := CC}) when is_map(CC) ->
+    case maps:get(<<"ttl">>, CC, undefined) of
+        <<"1h">> -> <<"1h">>;
+        _ -> <<"5m">>
+    end;
+cache_control_ttl(_) ->
+    <<"5m">>.
 
 %% The hash covers the kind + a JSON-canonicalised view of the block
 %% so re-ordered keys still match. We strip cache_control itself

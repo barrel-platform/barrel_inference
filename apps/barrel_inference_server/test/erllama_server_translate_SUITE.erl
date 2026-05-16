@@ -67,7 +67,9 @@
     anthropic_event_content_block_index_threads_through/1,
     anthropic_event_message_delta/1,
     anthropic_event_message_delta_emits_cache_read_on_exact_hit/1,
-    anthropic_event_message_delta_emits_cache_creation_on_cold/1
+    anthropic_event_message_delta_emits_cache_creation_on_cold/1,
+    anthropic_event_message_delta_emits_cache_creation_nested_5m/1,
+    anthropic_event_message_delta_emits_cache_creation_nested_1h/1
 ]).
 
 %%====================================================================
@@ -134,7 +136,9 @@ all() ->
         anthropic_event_content_block_index_threads_through,
         anthropic_event_message_delta,
         anthropic_event_message_delta_emits_cache_read_on_exact_hit,
-        anthropic_event_message_delta_emits_cache_creation_on_cold
+        anthropic_event_message_delta_emits_cache_creation_on_cold,
+        anthropic_event_message_delta_emits_cache_creation_nested_5m,
+        anthropic_event_message_delta_emits_cache_creation_nested_1h
     ].
 
 %%====================================================================
@@ -989,6 +993,40 @@ anthropic_event_message_delta_emits_cache_creation_on_cold(_Cfg) ->
     Bin = iolist_to_binary(Iolist),
     ?assert(binary:match(Bin, <<"\"cache_creation_input_tokens\":128">>) =/= nomatch),
     ?assertEqual(nomatch, binary:match(Bin, <<"\"cache_read_input_tokens\"">>)).
+
+%% SDKs >=2024-08 read usage.cache_creation.{ephemeral_5m,1h}_input_tokens.
+%% We can't distinguish per-block attribution from the engine, so the
+%% coarse total falls into 5m by default; when any 1h cache_control
+%% hint is present we attribute the total to 1h instead.
+anthropic_event_message_delta_emits_cache_creation_nested_5m(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 64,
+        completion_tokens => 1,
+        cache_hit_kind => cold,
+        finish_reason => stop,
+        cache_hints => [#{kind => system, hash => <<"h">>, ttl => <<"5m">>}]
+    },
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
+    ),
+    Bin = iolist_to_binary(Iolist),
+    ?assert(binary:match(Bin, <<"\"ephemeral_5m_input_tokens\":64">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"ephemeral_1h_input_tokens\":0">>) =/= nomatch).
+
+anthropic_event_message_delta_emits_cache_creation_nested_1h(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 64,
+        completion_tokens => 1,
+        cache_hit_kind => cold,
+        finish_reason => stop,
+        cache_hints => [#{kind => system, hash => <<"h">>, ttl => <<"1h">>}]
+    },
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
+    ),
+    Bin = iolist_to_binary(Iolist),
+    ?assert(binary:match(Bin, <<"\"ephemeral_5m_input_tokens\":0">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"ephemeral_1h_input_tokens\":64">>) =/= nomatch).
 
 %%====================================================================
 %% Helpers
