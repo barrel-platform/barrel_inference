@@ -526,13 +526,8 @@ finish_ok(Req0, S = #st{stream = false}, Stats) ->
     {stop, Req1, S}.
 
 finish_err(Req0, S = #st{stream = true}, Reason) ->
-    Err = #{
-        <<"type">> => <<"error">>,
-        <<"error">> => #{
-            <<"type">> => <<"server_error">>,
-            <<"message">> => to_bin(Reason)
-        }
-    },
+    Status = http_status(Reason),
+    Err = anthropic_error_body(Status, Reason),
     cowboy_req:stream_body(
         [<<"event: error\ndata: ">>, json:encode(Err), <<"\n\n">>],
         fin,
@@ -678,13 +673,19 @@ anthropic_error_body(Status, Reason) ->
     }.
 
 anthropic_error_type(400) -> <<"invalid_request_error">>;
+anthropic_error_type(401) -> <<"authentication_error">>;
+anthropic_error_type(403) -> <<"permission_error">>;
 anthropic_error_type(404) -> <<"not_found_error">>;
+anthropic_error_type(413) -> <<"request_too_large">>;
 anthropic_error_type(429) -> <<"rate_limit_error">>;
 anthropic_error_type(503) -> <<"overloaded_error">>;
+anthropic_error_type(504) -> <<"timeout_error">>;
+anthropic_error_type(529) -> <<"overloaded_error">>;
 anthropic_error_type(_) -> <<"api_error">>.
 
 http_status(prefill_timeout) -> 504;
 http_status(generation_idle_timeout) -> 504;
+http_status(total_timeout) -> 504;
 http_status(_) -> 500.
 
 sse_headers() ->
