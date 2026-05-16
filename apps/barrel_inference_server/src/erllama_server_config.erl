@@ -23,6 +23,7 @@
     generation_ping_ms/0,
     anthropic_api_keys/0,
     anthropic_retry_after_seconds/0,
+    tool_call_formats/0,
     pool_policy_for/1,
     tracing_config/0,
     cors/0,
@@ -125,6 +126,19 @@ anthropic_api_keys() ->
 -spec anthropic_retry_after_seconds() -> pos_integer().
 anthropic_retry_after_seconds() ->
     persistent_term:get({?MODULE, anthropic_retry_after_seconds}, 5).
+
+%% Per-format tool-call registry used by erllama_server_tool_format.
+%% Built-in defaults cover the open-weights families erllama_server
+%% ships parsers for; operators may merge additional entries via the
+%% `tool_call_formats` app env (the init merge keeps both).
+-spec tool_call_formats() -> #{binary() => map()}.
+tool_call_formats() ->
+    persistent_term:get({?MODULE, tool_call_formats}, default_tool_call_formats()).
+
+default_tool_call_formats() ->
+    #{
+        <<"qwen-xml">> => #{module => erllama_server_tool_format_qwen_xml}
+    }.
 
 -spec tracing_config() -> off | {otlp, binary()}.
 tracing_config() ->
@@ -233,6 +247,10 @@ init([]) ->
     persistent_term:put(
         {?MODULE, anthropic_retry_after_seconds},
         app_env(anthropic_retry_after_seconds, 5)
+    ),
+    persistent_term:put(
+        {?MODULE, tool_call_formats},
+        maps:merge(default_tool_call_formats(), app_env(tool_call_formats, #{}))
     ),
     {ok, #state{
         aliases = Aliases,
