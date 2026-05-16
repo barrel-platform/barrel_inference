@@ -24,6 +24,9 @@
     anthropic_api_keys/0,
     anthropic_retry_after_seconds/0,
     tool_call_formats/0,
+    tool_replay_dir/0,
+    tool_replay_ttl_ms/0,
+    tool_replay_gc_interval_ms/0,
     pool_policy_for/1,
     tracing_config/0,
     cors/0,
@@ -148,6 +151,42 @@ default_tool_call_formats() ->
         <<"bare-json">> => #{module => erllama_server_tool_format_bare_json}
     }.
 
+%% Directory hosting the exact-replay DETS file used by
+%% erllama_server_tool_replay. Defaults to a `replay` sibling of the
+%% model cache root so storage stays grouped with the KV cache.
+-spec tool_replay_dir() -> string().
+tool_replay_dir() ->
+    case application:get_env(?APP, tool_replay_dir) of
+        {ok, Path} when Path =/= undefined ->
+            ensure_string(Path);
+        _ ->
+            {ok, Root} = erllama_server_fetch:cache_root(),
+            filename:join(ensure_string(Root), "replay")
+    end.
+
+%% TTL on stored replay rows. Defaults to 30 days, long enough to
+%% outlive typical Claude Code sessions but bounded so the DETS file
+%% doesn't grow without bound.
+-spec tool_replay_ttl_ms() -> pos_integer().
+tool_replay_ttl_ms() ->
+    persistent_term:get(
+        {?MODULE, tool_replay_ttl_ms},
+        30 * 24 * 60 * 60 * 1000
+    ).
+
+%% Cadence of the periodic gc that evicts expired replay rows.
+%% Defaults to 1h; the cost of running gc is one ETS select plus a
+%% few dets:delete/2 calls, so the cadence isn't load-bearing.
+-spec tool_replay_gc_interval_ms() -> pos_integer().
+tool_replay_gc_interval_ms() ->
+    persistent_term:get(
+        {?MODULE, tool_replay_gc_interval_ms},
+        60 * 60 * 1000
+    ).
+
+ensure_string(B) when is_binary(B) -> binary_to_list(B);
+ensure_string(L) when is_list(L) -> L.
+
 -spec tracing_config() -> off | {otlp, binary()}.
 tracing_config() ->
     persistent_term:get({?MODULE, tracing}, off).
@@ -259,6 +298,14 @@ init([]) ->
     persistent_term:put(
         {?MODULE, tool_call_formats},
         maps:merge(default_tool_call_formats(), app_env(tool_call_formats, #{}))
+    ),
+    persistent_term:put(
+        {?MODULE, tool_replay_ttl_ms},
+        app_env(tool_replay_ttl_ms, 30 * 24 * 60 * 60 * 1000)
+    ),
+    persistent_term:put(
+        {?MODULE, tool_replay_gc_interval_ms},
+        app_env(tool_replay_gc_interval_ms, 60 * 60 * 1000)
     ),
     {ok, #state{
         aliases = Aliases,
