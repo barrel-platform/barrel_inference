@@ -71,7 +71,13 @@
     %% of block and the sha256 of its normalised content. Surfaced
     %% in `usage.cache_creation_input_tokens` /
     %% `usage.cache_read_input_tokens` on the way out.
-    cache_hints = [] :: [#{kind := system | tool | message, hash := binary()}]
+    cache_hints = [] :: [
+        #{
+            kind := system | tool | message,
+            hash := binary(),
+            ttl := binary()
+        }
+    ]
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

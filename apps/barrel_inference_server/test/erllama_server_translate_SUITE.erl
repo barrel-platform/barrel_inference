@@ -35,6 +35,7 @@
     anthropic_system_blocks/1,
     anthropic_tools_normalise/1,
     anthropic_tool_choice_any_maps_required/1,
+    anthropic_tool_choice_none/1,
     anthropic_thinking_enabled/1,
     anthropic_stop_sequences_parsed/1,
     anthropic_content_string_passthrough/1,
@@ -42,6 +43,8 @@
     anthropic_content_blocks_multiple_join/1,
     anthropic_content_blocks_drop_non_text/1,
     anthropic_content_blocks_tool_result/1,
+    anthropic_content_blocks_assistant_tool_use_marker/1,
+    anthropic_content_blocks_drop_engine_unsupported/1,
     anthropic_content_blocks_empty/1,
     openai_content_blocks_flatten/1,
     anthropic_cache_control_captured_on_system/1,
@@ -59,11 +62,16 @@
     openai_completion_response_shape/1,
     openai_embedding_response_shape/1,
     anthropic_response_shape/1,
+    anthropic_response_tool_use_block/1,
+    anthropic_response_thinking_then_text_blocks/1,
     anthropic_event_message_start/1,
     anthropic_event_text_delta/1,
+    anthropic_event_content_block_index_threads_through/1,
     anthropic_event_message_delta/1,
     anthropic_event_message_delta_emits_cache_read_on_exact_hit/1,
-    anthropic_event_message_delta_emits_cache_creation_on_cold/1
+    anthropic_event_message_delta_emits_cache_creation_on_cold/1,
+    anthropic_event_message_delta_emits_cache_creation_nested_5m/1,
+    anthropic_event_message_delta_emits_cache_creation_nested_1h/1
 ]).
 
 %%====================================================================
@@ -98,6 +106,7 @@ all() ->
         anthropic_system_blocks,
         anthropic_tools_normalise,
         anthropic_tool_choice_any_maps_required,
+        anthropic_tool_choice_none,
         anthropic_thinking_enabled,
         anthropic_stop_sequences_parsed,
         anthropic_content_string_passthrough,
@@ -105,6 +114,8 @@ all() ->
         anthropic_content_blocks_multiple_join,
         anthropic_content_blocks_drop_non_text,
         anthropic_content_blocks_tool_result,
+        anthropic_content_blocks_assistant_tool_use_marker,
+        anthropic_content_blocks_drop_engine_unsupported,
         anthropic_content_blocks_empty,
         openai_content_blocks_flatten,
         anthropic_cache_control_captured_on_system,
@@ -122,11 +133,16 @@ all() ->
         openai_completion_response_shape,
         openai_embedding_response_shape,
         anthropic_response_shape,
+        anthropic_response_tool_use_block,
+        anthropic_response_thinking_then_text_blocks,
         anthropic_event_message_start,
         anthropic_event_text_delta,
+        anthropic_event_content_block_index_threads_through,
         anthropic_event_message_delta,
         anthropic_event_message_delta_emits_cache_read_on_exact_hit,
-        anthropic_event_message_delta_emits_cache_creation_on_cold
+        anthropic_event_message_delta_emits_cache_creation_on_cold,
+        anthropic_event_message_delta_emits_cache_creation_nested_5m,
+        anthropic_event_message_delta_emits_cache_creation_nested_1h
     ].
 
 %%====================================================================
@@ -382,6 +398,20 @@ anthropic_tool_choice_any_maps_required(_Cfg) ->
     {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
     ?assertEqual(required, R#erllama_request.tool_choice).
 
+%% `tool_choice: "none"` must round-trip to the `none` atom so the
+%% grammar layer skips installing a GBNF. The pre-fix catch-all
+%% silently downgraded it to `auto`.
+anthropic_tool_choice_none(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
+        ],
+        <<"tool_choice">> => #{<<"type">> => <<"none">>}
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual(none, R#erllama_request.tool_choice).
+
 anthropic_thinking_enabled(_Cfg) ->
     Body = #{
         <<"model">> => <<"c">>,
@@ -540,6 +570,63 @@ anthropic_content_blocks_tool_result(_Cfg) ->
         RB#erllama_request.messages
     ).
 
+%% Assistant turn with a tool_use block (from a prior round) should
+%% serialise to a stable marker, not be silently dropped, so the
+%% template input preserves the fact that a tool was called.
+anthropic_content_blocks_assistant_tool_use_marker(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"assistant">>,
+                <<"content">> => [
+                    #{
+                        <<"type">> => <<"tool_use">>,
+                        <<"id">> => <<"toolu_42">>,
+                        <<"name">> => <<"search">>,
+                        <<"input">> => #{<<"q">> => <<"x">>}
+                    }
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    [#{content := C}] = R#erllama_request.messages,
+    ?assert(binary:match(C, <<"[tool_call">>) =/= nomatch),
+    ?assert(binary:match(C, <<"name=search">>) =/= nomatch),
+    ?assert(binary:match(C, <<"id=toolu_42">>) =/= nomatch).
+
+%% Blocks the engine cannot consume (document, thinking,
+%% redacted_thinking, server_tool_use, search_result,
+%% web_search_tool_result) drop with no text contribution. Explicit
+%% clauses, not catch-all silent drops.
+anthropic_content_blocks_drop_engine_unsupported(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"c">>,
+        <<"messages">> => [
+            #{
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{<<"type">> => <<"document">>, <<"source">> => #{}},
+                    #{<<"type">> => <<"thinking">>, <<"thinking">> => <<"…">>},
+                    #{
+                        <<"type">> => <<"redacted_thinking">>,
+                        <<"data">> => <<"x">>
+                    },
+                    #{<<"type">> => <<"server_tool_use">>},
+                    #{<<"type">> => <<"web_search_tool_result">>},
+                    #{<<"type">> => <<"search_result">>},
+                    #{<<"type">> => <<"text">>, <<"text">> => <<"go">>}
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch(
+        [#{role := <<"user">>, content := <<"go">>}],
+        R#erllama_request.messages
+    ).
+
 anthropic_content_blocks_empty(_Cfg) ->
     Body = #{
         <<"model">> => <<"c">>,
@@ -693,7 +780,7 @@ anthropic_usage_emits_cache_read_on_exact_hit(_Cfg) ->
         finish_reason => stop
     },
     Resp = erllama_server_translate:internal_to_anthropic_messages_response(
-        <<"hi">>, Stats, <<"m">>
+        [text_block(<<"hi">>)], Stats, <<"m">>
     ),
     Usage = maps:get(<<"usage">>, Resp),
     ?assertEqual(128, maps:get(<<"cache_read_input_tokens">>, Usage)),
@@ -707,7 +794,7 @@ anthropic_usage_emits_cache_creation_on_cold(_Cfg) ->
         finish_reason => stop
     },
     Resp = erllama_server_translate:internal_to_anthropic_messages_response(
-        <<"hi">>, Stats, <<"m">>
+        [text_block(<<"hi">>)], Stats, <<"m">>
     ),
     Usage = maps:get(<<"usage">>, Resp),
     ?assertEqual(128, maps:get(<<"cache_creation_input_tokens">>, Usage)),
@@ -815,13 +902,51 @@ anthropic_response_shape(_Cfg) ->
         finish_reason => stop
     },
     R = erllama_server_translate:internal_to_anthropic_messages_response(
-        <<"hi">>, Stats, <<"claude">>
+        [text_block(<<"hi">>)], Stats, <<"claude">>
     ),
     ?assertEqual(<<"message">>, maps:get(<<"type">>, R)),
     ?assertEqual(<<"end_turn">>, maps:get(<<"stop_reason">>, R)),
     [Block] = maps:get(<<"content">>, R),
     ?assertEqual(<<"text">>, maps:get(<<"type">>, Block)),
     ?assertEqual(<<"hi">>, maps:get(<<"text">>, Block)).
+
+%% Non-streaming response now lets the handler choose the content
+%% shape. A tool_use block must round-trip with id, name, and parsed
+%% input, and the response carries stop_reason: "tool_use" when the
+%% caller marks Stats accordingly.
+anthropic_response_tool_use_block(_Cfg) ->
+    Stats = #{prompt_tokens => 5, completion_tokens => 3, finish_reason => tool_call},
+    ToolUse = #{
+        <<"type">> => <<"tool_use">>,
+        <<"id">> => <<"toolu_1">>,
+        <<"name">> => <<"search">>,
+        <<"input">> => #{<<"q">> => <<"hi">>}
+    },
+    R = erllama_server_translate:internal_to_anthropic_messages_response(
+        [ToolUse], Stats, <<"claude">>
+    ),
+    ?assertEqual(<<"tool_use">>, maps:get(<<"stop_reason">>, R)),
+    [Block] = maps:get(<<"content">>, R),
+    ?assertEqual(<<"tool_use">>, maps:get(<<"type">>, Block)),
+    ?assertEqual(<<"toolu_1">>, maps:get(<<"id">>, Block)),
+    ?assertEqual(<<"search">>, maps:get(<<"name">>, Block)),
+    ?assertEqual(#{<<"q">> => <<"hi">>}, maps:get(<<"input">>, Block)).
+
+%% Non-streaming response can carry both a thinking and a text block.
+anthropic_response_thinking_then_text_blocks(_Cfg) ->
+    Stats = #{prompt_tokens => 5, completion_tokens => 3, finish_reason => stop},
+    Blocks = [
+        #{<<"type">> => <<"thinking">>, <<"thinking">> => <<"hmm">>},
+        text_block(<<"answer">>)
+    ],
+    R = erllama_server_translate:internal_to_anthropic_messages_response(
+        Blocks, Stats, <<"claude">>
+    ),
+    [B1, B2] = maps:get(<<"content">>, R),
+    ?assertEqual(<<"thinking">>, maps:get(<<"type">>, B1)),
+    ?assertEqual(<<"hmm">>, maps:get(<<"thinking">>, B1)),
+    ?assertEqual(<<"text">>, maps:get(<<"type">>, B2)),
+    ?assertEqual(<<"answer">>, maps:get(<<"text">>, B2)).
 
 anthropic_event_message_start(_Cfg) ->
     Iolist = erllama_server_translate:internal_to_anthropic_event(
@@ -834,11 +959,41 @@ anthropic_event_message_start(_Cfg) ->
 
 anthropic_event_text_delta(_Cfg) ->
     Iolist = erllama_server_translate:internal_to_anthropic_event(
-        {text_delta, <<"hello">>}, #{}, <<"msg_1">>, <<"claude">>
+        {text_delta, <<"hello">>, 0}, #{}, <<"msg_1">>, <<"claude">>
     ),
     Bin = iolist_to_binary(Iolist),
     ?assert(binary:match(Bin, <<"event: content_block_delta">>) =/= nomatch),
-    ?assert(binary:match(Bin, <<"\"text\":\"hello\"">>) =/= nomatch).
+    ?assert(binary:match(Bin, <<"\"text\":\"hello\"">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"index\":0">>) =/= nomatch).
+
+%% Anthropic SDK stream accumulators slot-fill `message.content[index]`,
+%% so consecutive blocks must carry distinct indices. The emitter must
+%% honour whatever index the handler supplies.
+anthropic_event_content_block_index_threads_through(_Cfg) ->
+    Start = iolist_to_binary(
+        erllama_server_translate:internal_to_anthropic_event(
+            {content_block_start_text, 3}, #{}, <<"msg_1">>, <<"claude">>
+        )
+    ),
+    Delta = iolist_to_binary(
+        erllama_server_translate:internal_to_anthropic_event(
+            {text_delta, <<"t">>, 3}, #{}, <<"msg_1">>, <<"claude">>
+        )
+    ),
+    Thinking = iolist_to_binary(
+        erllama_server_translate:internal_to_anthropic_event(
+            {thinking_delta, <<"r">>, 2}, #{}, <<"msg_1">>, <<"claude">>
+        )
+    ),
+    Stop = iolist_to_binary(
+        erllama_server_translate:internal_to_anthropic_event(
+            {content_block_stop, 3}, #{}, <<"msg_1">>, <<"claude">>
+        )
+    ),
+    ?assert(binary:match(Start, <<"\"index\":3">>) =/= nomatch),
+    ?assert(binary:match(Delta, <<"\"index\":3">>) =/= nomatch),
+    ?assert(binary:match(Thinking, <<"\"index\":2">>) =/= nomatch),
+    ?assert(binary:match(Stop, <<"\"index\":3">>) =/= nomatch).
 
 anthropic_event_message_delta(_Cfg) ->
     Stats = #{completion_tokens => 4, finish_reason => length},
@@ -881,6 +1036,40 @@ anthropic_event_message_delta_emits_cache_creation_on_cold(_Cfg) ->
     ?assert(binary:match(Bin, <<"\"cache_creation_input_tokens\":128">>) =/= nomatch),
     ?assertEqual(nomatch, binary:match(Bin, <<"\"cache_read_input_tokens\"">>)).
 
+%% SDKs >=2024-08 read usage.cache_creation.{ephemeral_5m,1h}_input_tokens.
+%% We can't distinguish per-block attribution from the engine, so the
+%% coarse total falls into 5m by default; when any 1h cache_control
+%% hint is present we attribute the total to 1h instead.
+anthropic_event_message_delta_emits_cache_creation_nested_5m(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 64,
+        completion_tokens => 1,
+        cache_hit_kind => cold,
+        finish_reason => stop,
+        cache_hints => [#{kind => system, hash => <<"h">>, ttl => <<"5m">>}]
+    },
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
+    ),
+    Bin = iolist_to_binary(Iolist),
+    ?assert(binary:match(Bin, <<"\"ephemeral_5m_input_tokens\":64">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"ephemeral_1h_input_tokens\":0">>) =/= nomatch).
+
+anthropic_event_message_delta_emits_cache_creation_nested_1h(_Cfg) ->
+    Stats = #{
+        prompt_tokens => 64,
+        completion_tokens => 1,
+        cache_hit_kind => cold,
+        finish_reason => stop,
+        cache_hints => [#{kind => system, hash => <<"h">>, ttl => <<"1h">>}]
+    },
+    Iolist = erllama_server_translate:internal_to_anthropic_event(
+        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
+    ),
+    Bin = iolist_to_binary(Iolist),
+    ?assert(binary:match(Bin, <<"\"ephemeral_5m_input_tokens\":0">>) =/= nomatch),
+    ?assert(binary:match(Bin, <<"\"ephemeral_1h_input_tokens\":64">>) =/= nomatch).
+
 %%====================================================================
 %% Helpers
 %%====================================================================
@@ -890,3 +1079,6 @@ base_chat() ->
         <<"model">> => <<"x">>,
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
     }.
+
+text_block(Text) ->
+    #{<<"type">> => <<"text">>, <<"text">> => Text}.

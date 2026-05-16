@@ -19,10 +19,10 @@
 
 -type anthropic_event_kind() ::
     {message_start, non_neg_integer()}
-    | content_block_start_text
-    | {text_delta, binary()}
-    | {thinking_delta, binary()}
-    | content_block_stop
+    | {content_block_start_text, non_neg_integer()}
+    | {text_delta, binary(), non_neg_integer()}
+    | {thinking_delta, binary(), non_neg_integer()}
+    | {content_block_stop, non_neg_integer()}
     | {message_delta, map()}
     | message_stop.
 
@@ -316,15 +316,17 @@ internal_to_openai_embedding_response(Vectors, PromptTokens, Model) ->
         }
     }.
 
-%% Non-streaming Anthropic /v1/messages response.
--spec internal_to_anthropic_messages_response(binary(), map(), binary()) -> map().
-internal_to_anthropic_messages_response(Text, Stats, Model) ->
+%% Non-streaming Anthropic /v1/messages response. The caller assembles
+%% the Content list because only the handler knows whether to emit a
+%% text block, a tool_use block, or a thinking + text composite.
+-spec internal_to_anthropic_messages_response([map()], map(), binary()) -> map().
+internal_to_anthropic_messages_response(Content, Stats, Model) when is_list(Content) ->
     #{
         <<"id">> => make_id(<<"msg_">>),
         <<"type">> => <<"message">>,
         <<"role">> => <<"assistant">>,
         <<"model">> => Model,
-        <<"content">> => [#{<<"type">> => <<"text">>, <<"text">> => Text}],
+        <<"content">> => Content,
         <<"stop_reason">> => anthropic_stop_reason(Stats),
         <<"stop_sequence">> => null,
         <<"usage">> => anthropic_usage_map(Stats)
@@ -347,8 +349,36 @@ anthropic_usage_map(Stats) ->
             _ -> Base#{<<"cache_read_input_tokens">> => Read}
         end,
     case Create of
-        0 -> Maybe1;
-        _ -> Maybe1#{<<"cache_creation_input_tokens">> => Create}
+        0 ->
+            Maybe1;
+        _ ->
+            Nested = cache_creation_ttl_split(Create, Stats),
+            Maybe1#{
+                <<"cache_creation_input_tokens">> => Create,
+                <<"cache_creation">> => Nested
+            }
+    end.
+
+%% SDKs newer than 2024-08 read the nested
+%% `usage.cache_creation.ephemeral_{5m,1h}_input_tokens` form. We can't
+%% distinguish per-block hit attribution from the engine yet; we use
+%% the request-side cache_hints (carried on Stats as `cache_hints`) to
+%% decide which TTL bucket the coarse total falls into. If both 5m
+%% and 1h hints are present, prefer 1h (worst case for SDK display).
+cache_creation_ttl_split(Total, Stats) ->
+    Hints = maps:get(cache_hints, Stats, []),
+    Has1h = lists:any(fun(#{ttl := T}) -> T =:= <<"1h">> end, Hints),
+    case Has1h of
+        true ->
+            #{
+                <<"ephemeral_5m_input_tokens">> => 0,
+                <<"ephemeral_1h_input_tokens">> => Total
+            };
+        false ->
+            #{
+                <<"ephemeral_5m_input_tokens">> => Total,
+                <<"ephemeral_1h_input_tokens">> => 0
+            }
     end.
 
 %% Anthropic SSE event encoder. Returns iolist containing
@@ -376,37 +406,37 @@ internal_to_anthropic_event({message_start, PromptTokens}, _Acc, ReqId, Model) w
         }
     },
     sse(<<"message_start">>, Payload);
-internal_to_anthropic_event(content_block_start_text, _Acc, _ReqId, _Model) ->
+internal_to_anthropic_event({content_block_start_text, Index}, _Acc, _ReqId, _Model) ->
     sse(
         <<"content_block_start">>,
         #{
             <<"type">> => <<"content_block_start">>,
-            <<"index">> => 0,
+            <<"index">> => Index,
             <<"content_block">> => #{<<"type">> => <<"text">>, <<"text">> => <<>>}
         }
     );
-internal_to_anthropic_event({text_delta, Bin}, _Acc, _ReqId, _Model) ->
+internal_to_anthropic_event({text_delta, Bin, Index}, _Acc, _ReqId, _Model) ->
     sse(
         <<"content_block_delta">>,
         #{
             <<"type">> => <<"content_block_delta">>,
-            <<"index">> => 0,
+            <<"index">> => Index,
             <<"delta">> => #{<<"type">> => <<"text_delta">>, <<"text">> => Bin}
         }
     );
-internal_to_anthropic_event({thinking_delta, Bin}, _Acc, _ReqId, _Model) ->
+internal_to_anthropic_event({thinking_delta, Bin, Index}, _Acc, _ReqId, _Model) ->
     sse(
         <<"content_block_delta">>,
         #{
             <<"type">> => <<"content_block_delta">>,
-            <<"index">> => 0,
+            <<"index">> => Index,
             <<"delta">> => #{<<"type">> => <<"thinking_delta">>, <<"thinking">> => Bin}
         }
     );
-internal_to_anthropic_event(content_block_stop, _Acc, _ReqId, _Model) ->
+internal_to_anthropic_event({content_block_stop, Index}, _Acc, _ReqId, _Model) ->
     sse(
         <<"content_block_stop">>,
-        #{<<"type">> => <<"content_block_stop">>, <<"index">> => 0}
+        #{<<"type">> => <<"content_block_stop">>, <<"index">> => Index}
     );
 internal_to_anthropic_event({message_delta, Stats}, _Acc, _ReqId, _Model) ->
     sse(
@@ -951,8 +981,35 @@ flatten_content_blocks(L) ->
 block_text(#{<<"type">> := <<"text">>, <<"text">> := T}) when is_binary(T) -> T;
 block_text(#{<<"text">> := T}) when is_binary(T) -> T;
 block_text(#{<<"type">> := <<"tool_result">>, <<"content">> := C}) -> tool_result_text(C);
+%% Assistant turns carrying a prior tool call: serialise to a stable
+%% marker so the inference context preserves the fact that a tool was
+%% called on a previous turn. The tool_result that follows on the next
+%% turn pairs with this via the embedded id.
+block_text(#{<<"type">> := <<"tool_use">>} = Tu) -> tool_use_marker(Tu);
+%% Inputs we don't (yet) pipe to the model: image, document, thinking,
+%% redacted_thinking, server_tool_use, web_search_tool_result,
+%% search_result. The engine has no vision/audio path and thinking
+%% blocks are an assistant-only construct; drop with no text
+%% contribution. Explicit clauses (vs the catch-all) make this
+%% intentional rather than silent.
+block_text(#{<<"type">> := <<"image">>}) -> <<>>;
+block_text(#{<<"type">> := <<"document">>}) -> <<>>;
+block_text(#{<<"type">> := <<"thinking">>}) -> <<>>;
+block_text(#{<<"type">> := <<"redacted_thinking">>}) -> <<>>;
+block_text(#{<<"type">> := <<"server_tool_use">>}) -> <<>>;
+block_text(#{<<"type">> := <<"web_search_tool_result">>}) -> <<>>;
+block_text(#{<<"type">> := <<"search_result">>}) -> <<>>;
 block_text(B) when is_binary(B) -> B;
 block_text(_) -> <<>>.
+
+tool_use_marker(#{<<"name">> := Name, <<"id">> := Id}) when
+    is_binary(Name), is_binary(Id)
+->
+    <<"[tool_call name=", Name/binary, " id=", Id/binary, "]">>;
+tool_use_marker(#{<<"name">> := Name}) when is_binary(Name) ->
+    <<"[tool_call name=", Name/binary, "]">>;
+tool_use_marker(_) ->
+    <<"[tool_call]">>.
 
 tool_result_text(B) when is_binary(B) -> B;
 tool_result_text(L) when is_list(L) -> flatten_content_blocks(L);
@@ -1054,7 +1111,7 @@ system_cache_hints(undefined) ->
 system_cache_hints(B) when is_binary(B) -> [];
 system_cache_hints(L) when is_list(L) ->
     [
-        #{kind => system, hash => block_hash(<<"system">>, B)}
+        cache_hint(system, B, <<"system">>)
      || B <- L, has_cache_control(B)
     ].
 
@@ -1062,7 +1119,7 @@ tools_cache_hints(undefined) ->
     [];
 tools_cache_hints(L) when is_list(L) ->
     [
-        #{kind => tool, hash => block_hash(<<"tool">>, T)}
+        cache_hint(tool, T, <<"tool">>)
      || T <- L, is_map(T), has_cache_control(T)
     ].
 
@@ -1071,7 +1128,7 @@ messages_cache_hints(L) when is_list(L) ->
 
 message_cache_hints(#{<<"content">> := Blocks}) when is_list(Blocks) ->
     [
-        #{kind => message, hash => block_hash(<<"message">>, B)}
+        cache_hint(message, B, <<"message">>)
      || B <- Blocks, is_map(B), has_cache_control(B)
     ];
 message_cache_hints(_) ->
@@ -1081,6 +1138,23 @@ has_cache_control(M) when is_map(M) ->
     maps:is_key(<<"cache_control">>, M);
 has_cache_control(_) ->
     false.
+
+cache_hint(Kind, Block, HashTag) ->
+    #{
+        kind => Kind,
+        hash => block_hash(HashTag, Block),
+        ttl => cache_control_ttl(Block)
+    }.
+
+%% Anthropic cache_control carries `ttl: "5m"` or `ttl: "1h"`.
+%% Default to 5m when absent, matching Anthropic's spec.
+cache_control_ttl(#{<<"cache_control">> := CC}) when is_map(CC) ->
+    case maps:get(<<"ttl">>, CC, undefined) of
+        <<"1h">> -> <<"1h">>;
+        _ -> <<"5m">>
+    end;
+cache_control_ttl(_) ->
+    <<"5m">>.
 
 %% The hash covers the kind + a JSON-canonicalised view of the block
 %% so re-ordered keys still match. We strip cache_control itself
@@ -1133,6 +1207,10 @@ parse_anthropic_tool_choice(Body) ->
         #{<<"type">> := <<"auto">>} -> auto;
         #{<<"type">> := <<"any">>} -> required;
         #{<<"type">> := <<"tool">>, <<"name">> := N} -> {named, N};
+        %% Anthropic-specific opt-out. The catch-all keeps falling back
+        %% to auto, but explicit "none" must reach the grammar layer so
+        %% no GBNF is installed for this request.
+        #{<<"type">> := <<"none">>} -> none;
         _ -> auto
     end.
 

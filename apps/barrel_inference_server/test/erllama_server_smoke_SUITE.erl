@@ -22,6 +22,8 @@
     count_tokens_unknown_model_returns_503/1,
     count_tokens_invalid_json_returns_400/1,
     accepts_body_above_one_mb/1,
+    messages_413_returns_request_too_large_type/1,
+    messages_emits_request_id_header/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
     request_id_minted_when_absent/1,
@@ -48,6 +50,8 @@ all() ->
         count_tokens_unknown_model_returns_503,
         count_tokens_invalid_json_returns_400,
         accepts_body_above_one_mb,
+        messages_413_returns_request_too_large_type,
+        messages_emits_request_id_header,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
         request_id_minted_when_absent,
@@ -210,7 +214,10 @@ messages_streaming_unknown_model_emits_event_error(Cfg) ->
     %% Anthropic itself returns for the streaming-error path.)
     ?assertEqual(200, Status),
     ?assert(binary:match(Bin, <<"event: error">>) =/= nomatch),
-    ?assert(binary:match(Bin, <<"\"type\":\"error\"">>) =/= nomatch).
+    ?assert(binary:match(Bin, <<"\"type\":\"error\"">>) =/= nomatch),
+    %% The inner error.type must be one of Anthropic's enum values, not
+    %% a freeform string like the pre-fix \"server_error\".
+    ?assert(binary:match(Bin, <<"\"type\":\"not_found_error\"">>) =/= nomatch).
 
 %% /v1/messages/count_tokens with no loaded model returns 503
 %% rather than try to load on demand. Anthropic's count_tokens is
@@ -265,6 +272,40 @@ accepts_body_above_one_mb(Cfg) ->
     {ok, {{_, Status, _}, _, _}} =
         httpc:request(post, {Url, [], "application/json", Big}, [], []),
     ?assertEqual(400, Status).
+
+%% Anthropic SDKs read `request-id` (no x- prefix) into
+%% message._request_id; the existing middleware stamps `x-request-id`.
+%% The /v1/messages handler must alias the literal name with the same
+%% value so SDK consumers see a populated _request_id.
+messages_emits_request_id_header(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"max_tokens">> => 4,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
+    }),
+    {ok, {{_, _, _}, Headers, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    {value, {_, AnthrId}} = lists:keysearch("request-id", 1, Headers),
+    {value, {_, XReqId}} = lists:keysearch("x-request-id", 1, Headers),
+    ?assertEqual(XReqId, AnthrId),
+    ?assert(string:prefix(AnthrId, "req_") =/= nomatch).
+
+%% 413 response must carry Anthropic's `request_too_large` error type,
+%% not the catch-all `api_error`. SDKs match on the type to decide
+%% retry behaviour.
+messages_413_returns_request_too_large_type(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    %% Body cap is 32 MB by default; send 33 MB to trip the 413 path.
+    Oversized = binary:copy(<<"x">>, 33 * 1024 * 1024),
+    {ok, {{_, Status, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Oversized}, [], []),
+    ?assertEqual(413, Status),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(
+        #{<<"error">> := #{<<"type">> := <<"request_too_large">>}},
+        Decoded
+    ).
 
 chat_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
