@@ -80,7 +80,16 @@
     grammar_set :: boolean(),
     %% true once stream_reply/3 has fired. Separate from `ref` because
     %% a loading keepalive can open the stream before admission.
-    stream_started = false :: boolean()
+    stream_started = false :: boolean(),
+    %% erllama 0.5.0 wire-driven tool-call state. Mirrors the
+    %% h_messages handler: when the model has `tool_call_markers' set,
+    %% the engine emits `{tool_call_delta, _}' / `erllama_tool_call_end'
+    %% instead of routing tool JSON through the first-byte heuristic.
+    %% Format spec cached at admission so the hot path doesn't re-read
+    %% the manifest per request.
+    tool_format = undefined :: undefined | erllama_server_tool_format:spec(),
+    captured_tool_use = undefined ::
+        undefined | #{id := binary(), name := binary(), input := map()}
 }).
 
 %%====================================================================
@@ -158,8 +167,15 @@ init_state(R, Requested, Api, Worker, Mon) ->
         buf_text = [],
         buf_reason = [],
         mode = text,
-        grammar_set = grammar_active(R)
+        grammar_set = grammar_active(R),
+        tool_format = resolve_tool_format(R#erllama_request.model_id)
     }.
+
+resolve_tool_format(ModelId) ->
+    case erllama_server_tool_format:lookup(ModelId) of
+        {ok, Spec} -> Spec;
+        not_found -> undefined
+    end.
 
 %% Whether the pipeline is going to install a grammar for this
 %% request. Determined by the presence of a non-empty tools array
@@ -246,6 +262,16 @@ info(
 %% starts decoding) and *then* sends `admitted` to the handler.
 %% Because the handler is per-request, any token message in our
 %% mailbox is necessarily ours; we don't need to match on Ref.
+%% erllama 0.5.0: per-chunk tool-call payload. The full body lands on
+%% the matching `erllama_tool_call_end' message; the deltas are
+%% acknowledged so `learn_ref' records the slot ref and the idle
+%% timer rearms.
+info({erllama_token, Ref, {tool_call_delta, _Bin}}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    {ok, Req, rearm_idle(first_token(S)), hibernate};
+info({erllama_tool_call_end, Ref, FullBin}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    handle_tool_call_end(FullBin, Req, S);
 info({erllama_token, Ref, Tok}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     handle_token(Tok, Req, S);
@@ -687,8 +713,8 @@ is_tool_first_byte(<<${, _/binary>>) -> true;
 is_tool_first_byte(_) -> false.
 
 openai_tool_call_chunk(S, JsonBin) ->
+    {Name, ArgsJson, ToolId} = extract_tool_call(S, JsonBin),
     Created = erlang:system_time(second),
-    {Name, ArgsJson} = parse_tool_call(JsonBin),
     Chunk = #{
         <<"id">> => S#st.req_id,
         <<"object">> => <<"chat.completion.chunk">>,
@@ -702,7 +728,7 @@ openai_tool_call_chunk(S, JsonBin) ->
                     <<"tool_calls">> => [
                         #{
                             <<"index">> => 0,
-                            <<"id">> => make_tool_id(),
+                            <<"id">> => ToolId,
                             <<"type">> => <<"function">>,
                             <<"function">> => #{
                                 <<"name">> => Name,
@@ -716,6 +742,71 @@ openai_tool_call_chunk(S, JsonBin) ->
         ]
     },
     json:encode(Chunk).
+
+%% Prefer the v0.5 wire-captured tool_use when present; otherwise
+%% fall back to parsing the legacy buf_text JSON.
+extract_tool_call(#st{captured_tool_use = #{id := Id, name := N, input := I}}, _) ->
+    {N, iolist_to_binary(json:encode(I)), Id};
+extract_tool_call(_S, JsonBin) ->
+    {Nm, Args} = parse_tool_call(JsonBin),
+    {Nm, Args, make_tool_id()}.
+
+%% erllama 0.5.0 wire entry point: parse FullBin via the per-model
+%% format module, mint a tool id, persist for next-turn exact replay,
+%% and stash the captured block on #st so finish_ok's existing
+%% tool_buffer clause emits the chat.completion.chunk shape.
+handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) ->
+    {Name, Input} = parse_full_bin(Spec, FullBin),
+    ToolId = make_tool_id_toolu(),
+    maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Input),
+    Captured = #{id => ToolId, name => Name, input => Input},
+    {ok, Req,
+        rearm_idle(S#st{
+            mode = tool_buffer,
+            captured_tool_use = Captured
+        }), hibernate}.
+
+%% Parses FullBin to a `{Name, ArgsMap}' pair via the format module,
+%% with a fall-back to the in-line `parse_tool_call/1' (which returns
+%% a JSON string for arguments). When falling back, decode the JSON
+%% so the captured `input' stays a map.
+parse_full_bin(undefined, FullBin) ->
+    parse_tool_call_to_map(FullBin);
+parse_full_bin(Spec, FullBin) ->
+    case erllama_server_tool_format:parse(Spec, FullBin) of
+        {ok, #{name := Name, arguments := Args}} -> {Name, Args};
+        {error, _} -> parse_tool_call_to_map(FullBin)
+    end.
+
+parse_tool_call_to_map(JsonBin) when is_binary(JsonBin) ->
+    try json:decode(JsonBin) of
+        #{<<"name">> := Name, <<"arguments">> := Args} when is_map(Args) ->
+            {Name, Args};
+        _ ->
+            {<<"unknown">>, #{}}
+    catch
+        _:_ -> {<<"unknown">>, #{}}
+    end;
+parse_tool_call_to_map(_) ->
+    {<<"unknown">>, #{}}.
+
+maybe_persist_replay(undefined, _ToolId, _Model, _FullBin, _Name, _Input) ->
+    ok;
+maybe_persist_replay(_Spec, ToolId, Model, FullBin, Name, Input) ->
+    erllama_server_tool_replay:put(
+        ToolId,
+        Model,
+        FullBin,
+        #{name => Name, arguments => Input}
+    ).
+
+%% The Anthropic-style `toolu_' id is used in the replay-map row so
+%% PR 6's render path uses one scheme across both endpoints.
+make_tool_id_toolu() ->
+    iolist_to_binary([
+        <<"toolu_">>,
+        integer_to_binary(erlang:unique_integer([positive]))
+    ]).
 
 %% The grammar emits `{"name":"...", "arguments":{...}}`. Parse and
 %% re-encode the arguments as a JSON-encoded string (OpenAI schema).

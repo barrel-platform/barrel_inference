@@ -82,7 +82,19 @@
     %% message_started, which guards the Anthropic message_start
     %% event). Loading-phase pings can open the stream before the
     %% canonical message_start frame.
-    stream_started = false :: boolean()
+    stream_started = false :: boolean(),
+    %% erllama 0.5.0 wire-driven tool-call state. When the model has
+    %% `tool_call_markers' set on load_model/2, the engine emits
+    %% `{tool_call_delta, _}' / `{erllama_tool_call_end, _, FullBin}'
+    %% instead of routing tool JSON through the legacy first-byte
+    %% heuristic. We cache the resolved format spec at admission so
+    %% the hot path doesn't re-read the manifest per request, and
+    %% remember a captured tool_use block until finish_ok emits it
+    %% (non-streaming) or after the SSE emit (streaming, observability
+    %% only).
+    tool_format = undefined :: undefined | erllama_server_tool_format:spec(),
+    captured_tool_use = undefined ::
+        undefined | #{id := binary(), name := binary(), input := map()}
 }).
 
 %%====================================================================
@@ -272,8 +284,15 @@ init_state(R, Requested, Worker, Mon) ->
         message_started = false,
         cache_hints = R#erllama_request.cache_hints,
         thinking_display = R#erllama_request.thinking_display,
-        user_id = R#erllama_request.user_id
+        user_id = R#erllama_request.user_id,
+        tool_format = resolve_tool_format(R#erllama_request.model_id)
     }.
+
+resolve_tool_format(ModelId) ->
+    case erllama_server_tool_format:lookup(ModelId) of
+        {ok, Spec} -> Spec;
+        not_found -> undefined
+    end.
 
 %% Mirrors erllama_server_grammar:from_tools/2: no grammar is installed
 %% when tools is empty/missing or tool_choice is the explicit `none`.
@@ -363,6 +382,13 @@ info(
 info({erllama_token, Ref, {thinking_delta, Bin}}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     handle_reasoning(Bin, Req, S);
+%% erllama 0.5.0: per-chunk tool-call payload. The full body is also
+%% delivered as a single binary on the matching `erllama_tool_call_end'
+%% message, so the deltas themselves are no-ops here - we just
+%% acknowledge them and let `learn_ref' record the slot ref.
+info({erllama_token, Ref, {tool_call_delta, _Bin}}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    {ok, Req, rearm_idle(first_token(S)), hibernate};
 info({erllama_token, Ref, Tok}, Req0, S0) when is_binary(Tok) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     handle_token(Tok, Req, S);
@@ -377,6 +403,16 @@ info({erllama_reasoning_token, Ref, Tok}, Req0, S0) ->
 info({erllama_thinking_end, Ref, Sig}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     handle_thinking_end(Sig, Req, S);
+%% erllama 0.5.0: tool-call span complete. FullBin is every delta
+%% concatenated. We parse it via the per-model format module, mint a
+%% tool id, emit the Anthropic tool_use SSE frames (streaming) or
+%% stash the captured block for finish_ok (non-streaming), and
+%% persist {ToolId, Model, FullBin, Json} in the exact-replay map
+%% so PR 6's render path can splice the verbatim bytes back on the
+%% next turn.
+info({erllama_tool_call_end, Ref, FullBin}, Req0, S0) ->
+    {S, Req} = learn_ref(S0, Req0, Ref),
+    handle_tool_call_end(FullBin, Req, S);
 info({erllama_done, Ref, Stats}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     finish_ok(Req, S, Stats);
@@ -550,6 +586,91 @@ handle_thinking_end(Sig, Req, S) ->
     %% builder.
     {ok, Req, rearm_idle(S#st{thinking_signature = Sig}), hibernate}.
 
+%% Parse FullBin via the per-model format module, mint a tool id,
+%% persist for next-turn exact replay, then route to the streaming
+%% or non-streaming emit path. When no format is configured for
+%% this model we fall back to the legacy `parse_tool_call/1' so a
+%% misconfigured operator still gets *something* back, just without
+%% replay-map persistence.
+handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) ->
+    {Name, Input} = parse_full_bin(Spec, FullBin),
+    ToolId = make_tool_id(),
+    maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Input),
+    emit_captured_tool_use(Req, S, ToolId, Name, Input).
+
+parse_full_bin(undefined, FullBin) ->
+    parse_tool_call(FullBin);
+parse_full_bin(Spec, FullBin) ->
+    case erllama_server_tool_format:parse(Spec, FullBin) of
+        {ok, #{name := Name, arguments := Args}} -> {Name, Args};
+        {error, _} -> parse_tool_call(FullBin)
+    end.
+
+maybe_persist_replay(undefined, _ToolId, _Model, _FullBin, _Name, _Input) ->
+    ok;
+maybe_persist_replay(_Spec, ToolId, Model, FullBin, Name, Input) ->
+    erllama_server_tool_replay:put(
+        ToolId,
+        Model,
+        FullBin,
+        #{name => Name, arguments => Input}
+    ).
+
+emit_captured_tool_use(Req, S0 = #st{stream = true}, ToolId, Name, Input) ->
+    S = close_open_text_or_thinking(Req, S0),
+    Idx = next_block_index(S),
+    Start = #{
+        <<"type">> => <<"content_block_start">>,
+        <<"index">> => Idx,
+        <<"content_block">> => #{
+            <<"type">> => <<"tool_use">>,
+            <<"id">> => ToolId,
+            <<"name">> => Name,
+            <<"input">> => #{}
+        }
+    },
+    DeltaInput = #{
+        <<"type">> => <<"content_block_delta">>,
+        <<"index">> => Idx,
+        <<"delta">> => #{
+            <<"type">> => <<"input_json_delta">>,
+            <<"partial_json">> => json:encode(Input)
+        }
+    },
+    Stop = erllama_server_translate:internal_to_anthropic_event(
+        {content_block_stop, Idx}, #{}, S#st.req_id, S#st.requested
+    ),
+    cowboy_req:stream_body(
+        [
+            <<"event: content_block_start\ndata: ">>,
+            json:encode(Start),
+            <<"\n\n">>,
+            <<"event: content_block_delta\ndata: ">>,
+            json:encode(DeltaInput),
+            <<"\n\n">>,
+            Stop
+        ],
+        nofin,
+        Req
+    ),
+    {ok, Req, rearm_idle(S), hibernate};
+emit_captured_tool_use(Req, S = #st{stream = false}, ToolId, Name, Input) ->
+    Block = #{id => ToolId, name => Name, input => Input},
+    {ok, Req, rearm_idle(S#st{captured_tool_use = Block}), hibernate}.
+
+close_open_text_or_thinking(Req, S0) ->
+    S1 = maybe_close_thinking(Req, S0),
+    case S1#st.text_block_started of
+        undefined ->
+            S1;
+        TIdx ->
+            Stop = erllama_server_translate:internal_to_anthropic_event(
+                {content_block_stop, TIdx}, #{}, S1#st.req_id, S1#st.requested
+            ),
+            cowboy_req:stream_body(Stop, nofin, Req),
+            S1#st{text_block_started = undefined}
+    end.
+
 %%====================================================================
 %% Stream block management
 %%====================================================================
@@ -634,9 +755,14 @@ attach_cache_hints(Stats, #st{cache_hints = Hints}) ->
 %% Finish
 %%====================================================================
 
-finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
+finish_ok(Req0, S = #st{stream = true, mode = text}, Stats0) ->
     %% Close any open content block at its assigned index, then
-    %% message_delta + message_stop.
+    %% message_delta + message_stop. When the v0.5 wire captured a
+    %% tool_use earlier in this turn its block was already closed in
+    %% `emit_captured_tool_use', so `open_block_index/1' returns
+    %% undefined here; the only additional work is to flip the
+    %% finish_reason to `tool_call' for the message_delta frame.
+    Stats = maybe_set_tool_call_finish_reason(S, Stats0),
     OpenIdx = open_block_index(S),
     Req1 =
         case OpenIdx of
@@ -727,6 +853,17 @@ finish_ok(Req0, S = #st{stream = false}, Stats0) ->
 %% non-streaming path used to flatten everything into a single text
 %% block, which lost tool calls and thinking entirely. Return the
 %% (possibly amended) Stats so the stop_reason picks up `tool_use`.
+nonstream_content(#st{captured_tool_use = #{id := Id, name := N, input := I}}, Stats) ->
+    %% erllama 0.5 wire-captured tool_use (preferred path when the
+    %% model has tool_call_markers configured). The captured block
+    %% includes a parsed input map; emit it directly.
+    ToolUse = #{
+        <<"type">> => <<"tool_use">>,
+        <<"id">> => Id,
+        <<"name">> => N,
+        <<"input">> => I
+    },
+    {[ToolUse], maps:put(finish_reason, tool_call, Stats)};
 nonstream_content(#st{mode = tool_buffer, buf_text = Buf}, Stats) ->
     Json = iolist_to_binary(Buf),
     {Name, Input} = parse_tool_call(Json),
@@ -1056,6 +1193,14 @@ parse_tool_call(JsonBin) ->
     catch
         _:_ -> {<<"unknown">>, JsonBin}
     end.
+
+%% When a v0.5 wire-captured tool_use is on `#st{}', the message's
+%% stop_reason flips to `tool_call' the same way the legacy
+%% tool_buffer path already amends it in `nonstream_content/2'.
+maybe_set_tool_call_finish_reason(#st{captured_tool_use = undefined}, Stats) ->
+    Stats;
+maybe_set_tool_call_finish_reason(_, Stats) ->
+    maps:put(finish_reason, tool_call, Stats).
 
 make_tool_id() ->
     iolist_to_binary([
