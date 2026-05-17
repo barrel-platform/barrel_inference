@@ -66,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `apply_chat_template/2` or a verbatim content-block escape);
   tracked locally and documented in the asks prompt.
 
-### Sticky-seq session id derivation
+### Sticky-seq session id derivation + engine pin
 
 - New `erllama_server_session:derive/2` that yields a stable
   `session_id` for every request via a layered chain:
@@ -75,12 +75,25 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   onto `#erllama_request{}` in both handlers' fast phase. Per-
   request stable id without requiring the SDK to send an explicit
   conversation header.
-- Forwarding the derived id to `erllama:infer/4` on
-  `Params.session_id` (and the matching `sticky_busy -> 503`
-  handling) is staged but not yet active. The stub backend's
-  cancel-vs-session race breaks cancel-on-disconnect e2e tests
-  when the pin is live; the wiring lands as a follow-up once the
-  timing is verified against a real backend.
+- Engine pin live: `build_params/1` now forwards the derived id
+  on `Params.session_id` to `erllama:infer/4`. The engine pins
+  the seq_id across turns so a continuing conversation truncates-
+  and-prefills in place on warm KV cells instead of restoring
+  from disk.
+- `{error, sticky_busy}` (two concurrent admits on the same
+  session) maps to 503 with retry-after; the Anthropic handler
+  remaps 503 to 529 so SDKs honour the documented backoff.
+- Handler `cleanup/1` calls `erllama:end_session/2` only when the
+  request was cancelled mid-flight (`received_done = false`).
+  Cleanly-completed turns leave the pinned session alive for
+  cross-turn KV reuse.
+- **Operational note**: with sticky pinning enabled, the engine's
+  `context_opts.n_seq_max` (default 1) must exceed the expected
+  concurrent-session count. A pinned session occupies a seq even
+  between its turns; with `n_seq_max=1` and traffic from more than
+  one session, admission deadlocks. Set
+  `n_seq_max => N` on the model's load config (typical N = 4 or
+  matching the queue's `concurrency`).
 
 ## [0.1.0] - 2026-05-11
 

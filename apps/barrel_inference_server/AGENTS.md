@@ -182,9 +182,23 @@ binary for each request via a layered chain:
 `x-conversation-id` header > `metadata.user_id` >
 `base64(sha256(model || first user message bytes))`. The id is
 stamped onto `#erllama_request.session_id` in both handlers'
-fast phase. Forwarding it to `erllama:infer/4` on
-`Params.session_id` is staged but not yet active; the engine
-pin lands once the cancel-vs-session timing is verified.
+fast phase and forwarded to `erllama:infer/4` on
+`Params.session_id`. The engine pins the seq_id across turns so a
+continuing conversation truncates-and-prefills in place on warm
+KV cells.
+
+`{error, sticky_busy}` from concurrent admits on the same session
+maps to 503 (529 on the Anthropic surface) with retry-after.
+Handler `cleanup/1` calls `erllama:end_session/2` only when the
+request was cancelled mid-flight (`received_done = false`);
+cleanly-completed turns leave the session pinned for the next
+turn.
+
+Operators must set `context_opts.n_seq_max` on the model's load
+config to **at least** the expected concurrent-session count
+(typical: match the per-model queue concurrency). The engine
+default of 1 deadlocks under sticky pinning the moment a second
+session tries to admit.
 
 ### Test Organization
 

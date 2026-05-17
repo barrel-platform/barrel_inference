@@ -456,6 +456,48 @@ counter (Prometheus `/metrics`) reports how often the replay map
 hits on the render side - useful for verifying that turn-to-turn
 byte stability is holding up across an SDK's serialisation choices.
 
+### Sticky-seq KV reuse across turns
+
+Multi-turn conversations benefit from keeping the prior turn's KV
+cells alive on the model so the next turn truncates-and-prefills in
+place instead of restoring from disk. The server derives a stable
+`session_id` per request (no client coordination required) via:
+
+1. `x-conversation-id` HTTP header (opt-in for SDK callers that pass
+   `extra_headers`, or for proxies / gateways).
+2. `metadata.user_id` from the Anthropic body (Claude Code sends
+   this natively as a per-user stable string).
+3. `base64(sha256(model || first_user_message_bytes))` fallback.
+
+The derived id is forwarded to `erllama:infer/4` on
+`Params.session_id`. The next request on the same session reuses
+the live KV cells; concurrent admits on the same session return
+`sticky_busy` mapped to 503 with `retry-after` (529 on
+`/v1/messages`).
+
+**Operational gotcha — `n_seq_max`**
+
+The engine pins the seq_id to its session for the lifetime of the
+conversation. With the default `context_opts.n_seq_max = 1`, that
+single seq is locked to the first session and any **other** session
+deadlocks on admission. Operators must declare a higher seq count on
+the model's load config:
+
+```json
+{
+  "name": "Qwen/Qwen3-8B-Instruct-GGUF",
+  ...
+  "loader": {
+    "context_opts": { "n_seq_max": 4 }
+  }
+}
+```
+
+A reasonable rule of thumb: set `n_seq_max` to match the per-model
+queue `concurrency`, or higher if you expect concurrent sessions
+from the same model. Cleanly-completed turns leave the session
+pinned for the next turn; only mid-flight cancels free the seq.
+
 ### Optional API-key allowlist
 
 By default `/v1/messages` does not validate `x-api-key`, which
