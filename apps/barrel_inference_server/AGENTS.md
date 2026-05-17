@@ -58,10 +58,15 @@ rebar3 xref                                       # Cross-reference
 
 ```
 erllama_server_sup (rest_for_one)
+├── erllama_server_disk_cache    DETS-backed KV cache file
 ├── erllama_server_registry      via callback for {queue, ModelId}
 ├── erllama_server_config        aliases + load policy + persistent_term
+├── erllama_server_tool_replay   DETS-backed exact-replay map for tool-call bytes
 ├── erllama_server_loaders_sup   per-model loader processes
 ├── erllama_server_queues_sup    per-model semaphore queues
+├── erllama_server_fetch_sup     manifest / blob download workers
+├── erllama_server_fetch_srv     fetch coordinator
+├── erllama_server_keepalive     per-model idle-eviction timer
 └── erllama_server_listener_mon  Cowboy listener + restart watch
 ```
 
@@ -139,6 +144,48 @@ tools array into a GBNF grammar that `erllama:infer/4` accepts via
 `text_response | tool_alt`; `required` omits the text branch;
 `{named, _}` pins to a single tool; `none` returns no grammar.
 
+### Tool-call exact replay (erllama 0.5)
+
+When a model declares `loader.tool_call_markers` in its manifest,
+erllama emits `{tool_call_delta, _}` deltas and one
+`erllama_tool_call_end` per call instead of routing tool JSON
+through the first-byte heuristic. The capture path lives in both
+handlers' info/3 clauses:
+
+1. `erllama_server_tool_format:lookup/1` is called once at admit
+   time to resolve the model id to a `parse/1` + `canonicalise/1`
+   module via `loader.tool_call_format`. Five families ship in
+   the default registry: `qwen-xml`, `dsml`,
+   `llama-python-tag`, `mistral-tool-calls`, `bare-json`. Adding
+   a new family is one new `erllama_server_tool_format_<family>`
+   module plus one entry in
+   `erllama_server_config:default_tool_call_formats/0`.
+2. On `erllama_tool_call_end`, the handler parses `FullBin` via
+   the format module, mints a `toolu_...` id, and persists
+   `{ToolId, Model, FullBin, Json}` in `erllama_server_tool_replay`
+   (DETS-backed, ETS hot path). The Anthropic SSE
+   (`content_block_start` / `input_json_delta` /
+   `content_block_stop`) or OpenAI `chat.completion.chunk`
+   `tool_calls` frame is emitted from the captured block.
+3. `erllama_server_pipeline:apply_chat_template/1` walks the
+   message history before rendering and consults the replay map
+   for each prior `tool_use` block. Outcome lands on the
+   `erllama_tool_replay_lookups_total` counter (label
+   `result = hit | miss | no_format`). Byte-exact splice awaits
+   an engine-side ask (see
+   `/Users/benoitc/Projects/erllama_anthropic_support_prompt.md`).
+
+### Sticky-seq session id
+
+`erllama_server_session:derive/2` yields a stable `session_id`
+binary for each request via a layered chain:
+`x-conversation-id` header > `metadata.user_id` >
+`base64(sha256(model || first user message bytes))`. The id is
+stamped onto `#erllama_request.session_id` in both handlers'
+fast phase. Forwarding it to `erllama:infer/4` on
+`Params.session_id` is staged but not yet active; the engine
+pin lands once the cancel-vs-session timing is verified.
+
 ### Test Organization
 
 - `test/erllama_server_translate_SUITE.erl`: schema translation,
@@ -148,6 +195,15 @@ tools array into a GBNF grammar that `erllama:infer/4` accepts via
 - `test/erllama_server_smoke_SUITE.erl`: HTTP surface boot probe -
   health, ready, models, metrics, embeddings/chat error paths,
   CORS, request-id.
+- `test/erllama_server_tool_replay_SUITE.erl`: CT for the DETS-
+  backed replay store (put/get round-trip, gc-evicts-expired,
+  restart survival).
+- `test/erllama_server_tool_format_tests.erl`,
+  `..._dsml_tests.erl`, `..._llama_python_tag_tests.erl`,
+  `..._mistral_tool_calls_tests.erl`, `..._bare_json_tests.erl`:
+  eunit round-trip and tolerance for each shipped format family.
+- `test/erllama_server_session_tests.erl`: eunit for the layered
+  session-id derivation.
 
 A real-model CT suite (gated on `LLAMA_TEST_MODEL`, mirroring
 erllama's pattern) is planned for v0.2.

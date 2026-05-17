@@ -384,6 +384,78 @@ Code's Anthropic API requests to local models): `erllama_server`
 is that route, with the local registry + multi-tier KV cache
 underneath.
 
+### Per-model tool-call format
+
+When a model emits tool calls between distinguishable delimiters
+(qwen3 wraps JSON in `<tool_call>...</tool_call>`, DeepSeek-V3
+uses fullwidth `<｜tool▁call▁begin｜>...<｜tool▁call▁end｜>`,
+Llama 3.x uses `<|python_tag|>...<|eom_id|>`, Mistral v3 uses
+`[TOOL_CALLS]`), declare the format in the model's manifest so
+the server can capture the exact on-wire bytes:
+
+```json
+{
+  "name": "Qwen/Qwen3-8B-Instruct-GGUF",
+  "tag": "main",
+  ...
+  "loader": {
+    "tool_call_markers": {
+      "start": "<tool_call>",
+      "end": "</tool_call>"
+    },
+    "tool_call_format": "qwen-xml"
+  }
+}
+```
+
+Five families ship in the default registry:
+
+| Format name | Models | Body shape |
+| --- | --- | --- |
+| `qwen-xml` | Qwen3, Qwen2.5 | `<tool_call>{"name":..., "arguments":...}</tool_call>` |
+| `dsml` | DeepSeek-V3, R1 | `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME` + newline + fenced JSON + `<｜tool▁call▁end｜>` |
+| `llama-python-tag` | Llama 3.1 / 3.2 / 3.3 | `<\|python_tag\|>{"name":..., "parameters":...}<\|eom_id\|>` |
+| `mistral-tool-calls` | Mistral, Mixtral v3 | `[TOOL_CALLS][{"name":..., "arguments":...}]</s>` |
+| `bare-json` | catch-all | `{"name":..., "arguments":...}` |
+
+With both `tool_call_markers` and `tool_call_format` set, the
+engine builds a deterministic greedy-on-syntax sampler for the
+tool-call span and the server captures every `toolu_...` id's
+exact bytes in a DETS-backed replay map. Operators that need a
+format not in the default registry add one module + one map entry
+under the `tool_call_formats` app env in `sys.config`:
+
+```erlang
+{tool_call_formats, #{
+  <<"my-format">> => #{module => my_format_module}
+}}
+```
+
+The module implements the `erllama_server_tool_format` behaviour:
+`parse/1` turns `FullBin` into `#{name => Bin, arguments => Map}`,
+`canonicalise/1` does the reverse. The registry merges
+operator-supplied entries on top of the defaults, so qwen-xml
+et al. stay available even when extending the map.
+
+#### Replay-map persistence and TTL
+
+The replay map persists across restarts under
+`<model_cache_dir>/replay/replay.dets`. TTL defaults to 30 days
+(`tool_replay_ttl_ms`); gc runs hourly
+(`tool_replay_gc_interval_ms`). Override either if you want a
+shorter retention window or a different cache root:
+
+```erlang
+{tool_replay_dir, "/var/lib/erllama_server/replay"},
+{tool_replay_ttl_ms, 604800000},        %% 7 days
+{tool_replay_gc_interval_ms, 600000}    %% 10 minutes
+```
+
+The `erllama_tool_replay_lookups_total{result="hit"|"miss"|"no_format"}`
+counter (Prometheus `/metrics`) reports how often the replay map
+hits on the render side - useful for verifying that turn-to-turn
+byte stability is holding up across an SDK's serialisation choices.
+
 ### Optional API-key allowlist
 
 By default `/v1/messages` does not validate `x-api-key`, which

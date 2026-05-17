@@ -4,6 +4,84 @@ All notable changes to erllama_server are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### erllama 0.5.0 + tool-call exact-replay
+
+- Bumped to erllama 0.5.0 (`{erllama, "0.5.0"}` in `rebar.config`).
+  v0.5 exposes per-model `tool_call_markers`, the
+  `{tool_call_delta, _}` / `erllama_tool_call_end` streaming wire,
+  greedy-on-syntax sampling, sticky-seq KV reuse (`session_id` on
+  `infer/4`, `end_session/2`), and the `prefill_only/3` cache-
+  warming primitive.
+- `loader.tool_call_markers` plumbed from the manifest into the
+  Config map passed to `erllama:load_model/2`, mirroring the
+  existing `thinking_markers` path. Required keys `start` / `end`;
+  optional `payload_start` / `payload_end`.
+- New `erllama_server_tool_format` behaviour and registry. Each
+  model family ships a module implementing `parse/1` (FullBin ->
+  `#{name, arguments}`) and `canonicalise/1` (the reverse). The
+  registry resolves a canonical model id via the manifest's
+  `loader.tool_call_format` field.
+- Five built-in format families shipped in the default registry,
+  covering the major open-weights backends:
+  - `qwen-xml` (Qwen3 / Qwen2.5: `<tool_call>{...}</tool_call>`).
+    Tolerates Hermes-style string `arguments`.
+  - `dsml` (DeepSeek-V3 / R1:
+    `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n\`\`\`json\n{...}\n\`\`\`<｜tool▁call▁end｜>`).
+    Tolerates batch wrapper, missing type prefix, missing fence.
+  - `llama-python-tag` (Llama 3.1 / 3.2 / 3.3:
+    `<|python_tag|>{"name":..., "parameters":...}<|eom_id|>`).
+    Accepts `arguments` as well as `parameters`.
+  - `mistral-tool-calls` (Mistral / Mixtral v3:
+    `[TOOL_CALLS][{"name":..., "arguments":...}]</s>`). Returns
+    the first call from a multi-call array; multi-call extraction
+    is a documented follow-up.
+  - `bare-json` (fallback for models that emit raw JSON without
+    delimiters).
+- New `erllama_server_tool_replay` DETS-backed exact-replay store
+  (supervised gen_server). Public ETS table for the O(1) hot-path
+  read; sibling DETS file under `<cache_root>/replay/replay.dets`
+  persists writes across restarts; periodic gc evicts rows past
+  the TTL. Configuration knobs: `tool_replay_dir`,
+  `tool_replay_ttl_ms` (default 30 days),
+  `tool_replay_gc_interval_ms` (default 1h). All optional with
+  sensible defaults.
+- Both `/v1/messages` and `/v1/chat/completions` consume the v0.5
+  tool-call wire when the model has `tool_call_markers` configured:
+  every `erllama_tool_call_end` triggers `tool_format:parse/2`, a
+  fresh `toolu_...` id is minted, the parsed JSON + raw `FullBin` +
+  model id are persisted in the replay map, and the corresponding
+  Anthropic SSE frames (`content_block_start` / `input_json_delta`
+  / `content_block_stop`) or OpenAI `chat.completion.chunk` with
+  `tool_calls` are emitted. The legacy `mode = tool_buffer` first-
+  byte heuristic stays as the fallback for models without
+  `tool_call_markers` set.
+- Render path in `erllama_server_pipeline` walks the message
+  history before `apply_chat_template/2` and consults the replay
+  map for every prior `tool_use` block. Outcome lands on the new
+  `erllama_tool_replay_lookups_total` counter, labelled by `model`
+  and `result` (`hit` / `miss` / `no_format`). Byte-exact splice
+  awaits an engine-side ask (return-rendered-string variant of
+  `apply_chat_template/2` or a verbatim content-block escape);
+  tracked locally and documented in the asks prompt.
+
+### Sticky-seq session id derivation
+
+- New `erllama_server_session:derive/2` that yields a stable
+  `session_id` for every request via a layered chain:
+  `x-conversation-id` header > `metadata.user_id` >
+  `base64(sha256(model || first user message bytes))`. Stamped
+  onto `#erllama_request{}` in both handlers' fast phase. Per-
+  request stable id without requiring the SDK to send an explicit
+  conversation header.
+- Forwarding the derived id to `erllama:infer/4` on
+  `Params.session_id` (and the matching `sticky_busy -> 503`
+  handling) is staged but not yet active. The stub backend's
+  cancel-vs-session race breaks cancel-on-disconnect e2e tests
+  when the pin is live; the wiring lands as a follow-up once the
+  timing is verified against a real backend.
+
 ## [0.1.0] - 2026-05-11
 
 Initial public release. OpenAI-, Anthropic-, and Ollama-compatible
