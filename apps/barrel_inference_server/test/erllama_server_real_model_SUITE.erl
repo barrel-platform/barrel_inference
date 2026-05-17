@@ -36,7 +36,8 @@
     chat_non_streaming_runs/1,
     messages_streaming_runs/1,
     messages_non_streaming_runs/1,
-    embeddings_runs/1
+    embeddings_runs/1,
+    multi_turn_cache_delta_profile/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -53,7 +54,8 @@ all() ->
         chat_non_streaming_runs,
         messages_streaming_runs,
         messages_non_streaming_runs,
-        embeddings_runs
+        embeddings_runs,
+        multi_turn_cache_delta_profile
     ].
 
 %%====================================================================
@@ -417,6 +419,89 @@ messages_non_streaming_runs(Cfg) ->
     [Block] = maps:get(<<"content">>, Decoded),
     ?assertEqual(<<"text">>, maps:get(<<"type">>, Block)),
     ?assert(byte_size(maps:get(<<"text">>, Block)) > 0).
+
+%% Profile: drive a multi-turn /v1/messages conversation through the
+%% same session and log the engine's cache_delta evolution across
+%% turns. The question this answers: with PR 7b's sticky-seq engine
+%% pin live, does the longest-prefix walk on infer/4 already cover
+%% the cache reuse we need, or is there leftover prefill on
+%% continuation turns where prefill_only/3 could speculatively warm?
+%%
+%% Output appears in the CT log as a `multi_turn_cache_delta_profile`
+%% notice with the per-turn usage map. A useful run shows:
+%%
+%%   turn 1: cache_read=0, cache_creation=N (cold)
+%%   turn 2: cache_read=K, cache_creation=N2-N1
+%%   turn 3: cache_read=K', cache_creation=N3-N2
+%%
+%% If `cache_creation` on turns >= 2 is roughly the new tail length
+%% (delta over the prior prompt), the engine already does the right
+%% thing on its own and PR 8 has no measurable benefit. If it
+%% creates much more than the new tail, prefill_only could amortise
+%% the disk restore.
+multi_turn_cache_delta_profile(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    %% Same x-conversation-id across all three turns so the derived
+    %% session_id is stable. Each request adds a new user/assistant
+    %% pair to the history.
+    ConvId = <<"profile-cache-delta">>,
+    Turn1Messages = [
+        #{<<"role">> => <<"user">>, <<"content">> => <<"What is 1 + 1?">>}
+    ],
+    {Usage1, AssistantText1} = profile_turn(Url, ConvId, Turn1Messages),
+    Turn2Messages =
+        Turn1Messages ++
+            [
+                #{<<"role">> => <<"assistant">>, <<"content">> => AssistantText1},
+                #{<<"role">> => <<"user">>, <<"content">> => <<"And 2 + 2?">>}
+            ],
+    {Usage2, AssistantText2} = profile_turn(Url, ConvId, Turn2Messages),
+    Turn3Messages =
+        Turn2Messages ++
+            [
+                #{<<"role">> => <<"assistant">>, <<"content">> => AssistantText2},
+                #{<<"role">> => <<"user">>, <<"content">> => <<"And 3 + 3?">>}
+            ],
+    {Usage3, _} = profile_turn(Url, ConvId, Turn3Messages),
+    log_usage(1, Usage1),
+    log_usage(2, Usage2),
+    log_usage(3, Usage3),
+    %% Sanity: each turn must produce a response with input_tokens.
+    %% Real assertion is the log output; the build only fails if the
+    %% multi-turn flow itself broke.
+    ?assert(maps:get(<<"input_tokens">>, Usage1) > 0),
+    ?assert(maps:get(<<"input_tokens">>, Usage2) >= maps:get(<<"input_tokens">>, Usage1)),
+    ?assert(maps:get(<<"input_tokens">>, Usage3) >= maps:get(<<"input_tokens">>, Usage2)).
+
+log_usage(TurnN, Usage) ->
+    Input = maps:get(<<"input_tokens">>, Usage, 0),
+    Output = maps:get(<<"output_tokens">>, Usage, 0),
+    Read = maps:get(<<"cache_read_input_tokens">>, Usage, 0),
+    Created = maps:get(<<"cache_creation_input_tokens">>, Usage, 0),
+    ct:log(
+        "turn ~B: input=~B output=~B cache_read=~B cache_creation=~B",
+        [TurnN, Input, Output, Read, Created]
+    ).
+
+profile_turn(Url, ConvId, Messages) ->
+    Body = json:encode(#{
+        <<"model">> => <<"real">>,
+        <<"messages">> => Messages,
+        <<"max_tokens">> => 32,
+        <<"stream">> => false
+    }),
+    Headers = [{"x-conversation-id", binary_to_list(ConvId)}],
+    {ok, {{_, 200, _}, _, Resp}} = httpc:request(
+        post,
+        {Url, Headers, "application/json", Body},
+        [{timeout, 120000}],
+        []
+    ),
+    Decoded = json:decode(list_to_binary(Resp)),
+    Usage = maps:get(<<"usage">>, Decoded),
+    [Block | _] = maps:get(<<"content">>, Decoded),
+    Text = maps:get(<<"text">>, Block, <<>>),
+    {Usage, Text}.
 
 embeddings_runs(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/embeddings",

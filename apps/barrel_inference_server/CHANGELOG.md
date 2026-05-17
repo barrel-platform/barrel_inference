@@ -95,6 +95,38 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `n_seq_max => N` on the model's load config (typical N = 4 or
   matching the queue's `concurrency`).
 
+### Cache-reuse profile (TinyLlama-1.1B, 3-turn conversation)
+
+`test/erllama_server_real_model_SUITE.erl:multi_turn_cache_delta_profile/1`
+drives a stable-session three-turn conversation and logs the
+per-turn `cache_read_input_tokens` / `cache_creation_input_tokens`:
+
+| Turn | input | output | cache_read | cache_creation |
+| --- | --- | --- | --- | --- |
+| 1 | 21 | 32 | 0 | 53 |
+| 2 | 73 | 32 | **0** | 105 |
+| 3 | 125 | 32 | 64 | 93 |
+
+Turn 2 sees zero sticky reuse even with `Params.session_id` pinned.
+The chat-template re-renders the first user turn differently in a
+multi-turn context, so the engine's strict-prefix check fails and
+admits cold. Turn 3 catches up via the disk cache (read=64).
+
+This rules out `prefill_only/3` server-side cache warming
+(originally PR 8): the bottleneck is **token-level prefix
+divergence from the chat template**, not lack of an explicit
+`parent_key` hint. The engine's natural longest-prefix walk on
+admit already finds every available reuse row; an explicit
+`prefill_only` call would compute the same prefix-match
+and arrive at the same `read` count. PR 8 is closed as wontfix.
+
+The leverage point is upstream: a chat-template rendering that
+keeps leading-turn bytes stable across single- and multi-turn
+calls, OR an engine-side primitive that splices the prior turn's
+stored tokens verbatim into the new prompt (effectively the
+verbatim-content escape already proposed for tool-call replay).
+Captured in `/Users/benoitc/Projects/erllama_anthropic_support_prompt.md`.
+
 ## [0.1.0] - 2026-05-11
 
 Initial public release. OpenAI-, Anthropic-, and Ollama-compatible
