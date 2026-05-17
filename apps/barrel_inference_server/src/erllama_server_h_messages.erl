@@ -178,7 +178,11 @@ translate(Map, Req0, Opts) ->
             R1 = R#erllama_request{
                 anthropic_betas = collect_betas(Req0, Map)
             },
-            dispatch(R1, Req0, Opts);
+            %% Derive the sticky-seq session id before the pipeline
+            %% sees the record so build_params/1 forwards it as the
+            %% `Params.session_id' key on `erllama:infer/4'.
+            R2 = R1#erllama_request{session_id = erllama_server_session:derive(Req0, R1)},
+            dispatch(R2, Req0, Opts);
         {error, Reason} ->
             reply_json_error(400, Reason, Req0)
     end.

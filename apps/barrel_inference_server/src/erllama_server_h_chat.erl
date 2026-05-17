@@ -126,7 +126,10 @@ translate(Map, Api, Req0) ->
         end,
     case Translated of
         {ok, R} ->
-            start_pipeline(R, Api, Req0);
+            R1 = R#erllama_request{
+                session_id = erllama_server_session:derive(Req0, R)
+            },
+            start_pipeline(R1, Api, Req0);
         {error, Reason} ->
             reply_json_error(400, Reason, Req0)
     end.

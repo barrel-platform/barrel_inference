@@ -95,7 +95,15 @@
     %% Anthropic thinking.budget_tokens hint. erllama 0.3.0 does not
     %% accept a thinking budget yet; we capture the value for
     %% forward compatibility and observability.
-    thinking_budget = undefined :: undefined | pos_integer()
+    thinking_budget = undefined :: undefined | pos_integer(),
+    %% Sticky-seq session id used to pin the underlying seq_id across
+    %% successive requests on the same conversation. Derived in the
+    %% fast phase via `erllama_server_session:derive/2'; the layered
+    %% chain (header -> metadata.user_id -> prompt-prefix hash) keeps
+    %% out-of-box Claude Code requests cache-warm without requiring
+    %% the SDK to send an explicit conversation id. Forwarded to
+    %% `erllama:infer/4' on the `Params.session_id' key.
+    session_id = undefined :: undefined | binary()
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

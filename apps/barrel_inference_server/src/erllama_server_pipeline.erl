@@ -441,5 +441,13 @@ build_params(R) ->
     %% treats absent / non-positive as "no cap".
     maybe_put(Maybe2, thinking_budget_tokens, R#erllama_request.thinking_budget).
 
+%% NOTE: `session_id` is captured on the request record but is
+%% intentionally NOT forwarded to `erllama:infer/4' yet. The engine's
+%% cancel-vs-session lifecycle needs verification against the real
+%% backend before we pin seq_ids - the stub backend used in CT
+%% races between cancel propagation and the next request's sticky
+%% admission, breaking the cancel-on-disconnect e2e test. The wiring
+%% lives in a follow-up PR once that timing is understood.
+
 maybe_put(Map, _Key, undefined) -> Map;
 maybe_put(Map, Key, Value) -> Map#{Key => Value}.
