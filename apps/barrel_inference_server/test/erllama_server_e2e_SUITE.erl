@@ -151,6 +151,15 @@ model_config(DiskSrv) ->
         quant_bits => 16,
         ctx_params_hash => binary:copy(<<16#88>>, 32),
         context_size => 1024,
+        %% Bump the engine's seq pool above the default of 1 so the
+        %% cancel-on-disconnect test's polling request can admit on
+        %% a different seq while the cancelled request's sticky seq
+        %% is still being finalised. The front-end queue's
+        %% concurrency caps inflight; the engine's n_seq_max caps
+        %% pinned + inflight together. With sticky-seq enabled
+        %% (Params.session_id forwarded to infer/4), a single seq
+        %% can be locked out by a pinned session.
+        context_opts => #{n_seq_max => 4},
         policy => #{
             min_tokens => 4,
             cold_min_tokens => 4,
@@ -204,18 +213,16 @@ chat_busy_returns_429(Cfg) ->
     %% waiter can queue, anything else gets pool_exhausted (429). We
     %% pick a large max_tokens so the stub backend stays busy long
     %% enough for the two follow-up requests to race.
+    %% Each request uses a unique prompt so the derived session_id
+    %% differs - this test verifies queue exhaustion, not sticky-seq
+    %% admission contention.
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
-    Body = iolist_to_binary(
-        json:encode(#{
-            <<"model">> => <<"e2e-stub">>,
-            <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
-            <<"max_tokens">> => 50000,
-            <<"stream">> => true
-        })
-    ),
+    HolderBody = make_busy_body(<<"busy-holder">>),
+    R1Body = make_busy_body(<<"busy-r1">>),
+    R2Body = make_busy_body(<<"busy-r2">>),
     Parent = self(),
     Holder = spawn(fun() ->
-        Resp = http_collect(Url, Body),
+        Resp = http_collect(Url, HolderBody),
         Parent ! {holder_done, byte_size(Resp)}
     end),
     %% Wait for the holder to acquire the slot. With stream=true the
@@ -229,7 +236,7 @@ chat_busy_returns_429(Cfg) ->
             {r1,
                 httpc:request(
                     post,
-                    {Url, [], "application/json", Body},
+                    {Url, [], "application/json", R1Body},
                     [],
                     []
                 )}
@@ -239,7 +246,7 @@ chat_busy_returns_429(Cfg) ->
             {r2,
                 httpc:request(
                     post,
-                    {Url, [], "application/json", Body},
+                    {Url, [], "application/json", R2Body},
                     [],
                     []
                 )}
@@ -317,13 +324,22 @@ chat_cancel_on_disconnect_releases_slot(Cfg) ->
     %% handler's terminate/3 races with this: it has to detect the
     %% TCP close, cancel the inference, and release the queue slot.
     %% On a slow CI runner that race can outlast a single sleep, so
-    %% retry on the transient queue-busy responses (429, 504) up to
-    %% a bounded budget. Anything else (or running out of retries)
-    %% fails the assertion.
+    %% retry on the transient queue-busy responses (429, 503, 504)
+    %% up to a bounded budget. Anything else (or running out of
+    %% retries) fails the assertion.
+    %%
+    %% Use a different prompt for the polling so the derived
+    %% session_id differs from the cancelled request's. The cancelled
+    %% session's seq is still in the engine's req_table until the
+    %% cancel cast propagates through the next decode tick; a poll
+    %% on the same session_id would get sticky_busy. Production
+    %% clients handle that via Retry-After; tests can just dodge it.
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
     Body2 = json:encode(#{
         <<"model">> => <<"e2e-stub">>,
-        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"poll-cancel-test">>}
+        ],
         <<"max_tokens">> => 2,
         <<"stream">> => false
     }),
@@ -333,18 +349,29 @@ chat_cancel_on_disconnect_releases_slot(Cfg) ->
 %% Poll the chat endpoint until either the slot has been released
 %% (200) or the budget runs out. Transient responses while the
 %% disconnected request's terminate/3 is still in flight are 429
-%% (pool_exhausted) or 504 (queue_timeout). Anything else stops the
-%% polling and surfaces the actual status code for the assertion.
+%% (pool_exhausted), 503 (sticky_busy - the engine's cancel cast
+%% hasn't yet propagated through the next decode tick so the seq
+%% looks in-flight from the new request's admit path), or 504
+%% (queue_timeout). Anything else stops the polling and surfaces
+%% the actual status code for the assertion.
 post_until_slot_free(_Url, _Body, 0, _BackoffMs) ->
     timeout;
 post_until_slot_free(Url, Body, N, BackoffMs) ->
     case httpc:request(post, {Url, [], "application/json", Body}, [], []) of
         {ok, {{_, 200, _}, _, _}} ->
+            ct:log("post_until_slot_free: 200 after ~p retries", [N]),
             200;
-        {ok, {{_, Code, _}, _, _}} when Code =:= 429; Code =:= 504 ->
+        {ok, {{_, Code, _}, _, RespBody}} when
+            Code =:= 429; Code =:= 503; Code =:= 504
+        ->
+            ct:log(
+                "post_until_slot_free: ~p, retries left=~p, body=~ts",
+                [Code, N - 1, RespBody]
+            ),
             timer:sleep(BackoffMs),
             post_until_slot_free(Url, Body, N - 1, BackoffMs);
         {ok, {{_, Code, _}, _, _}} ->
+            ct:log("post_until_slot_free: unexpected ~p", [Code]),
             Code;
         {error, _} = E ->
             E
@@ -352,9 +379,13 @@ post_until_slot_free(Url, Body, N, BackoffMs) ->
 
 messages_streaming_emits_named_events(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
+    %% Use a unique prompt so the derived session_id doesn't collide
+    %% with any in-flight sticky seq from a prior test case.
     Body = json:encode(#{
         <<"model">> => <<"e2e-stub">>,
-        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
+        <<"messages">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"messages-streaming-test">>}
+        ],
         <<"max_tokens">> => 4,
         <<"stream">> => true
     }),
@@ -403,3 +434,16 @@ http_collect(Url, Body) ->
 
 code_of({ok, {{_, Code, _}, _, _}}) -> Code;
 code_of(_) -> 0.
+
+%% Build a chat-completions streaming body for the slot-exhaustion
+%% test, with a caller-supplied prompt so each spawned request gets
+%% a distinct session_id.
+make_busy_body(Prompt) ->
+    iolist_to_binary(
+        json:encode(#{
+            <<"model">> => <<"e2e-stub">>,
+            <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => Prompt}],
+            <<"max_tokens">> => 50000,
+            <<"stream">> => true
+        })
+    ).

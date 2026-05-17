@@ -81,6 +81,12 @@
     %% true once stream_reply/3 has fired. Separate from `ref` because
     %% a loading keepalive can open the stream before admission.
     stream_started = false :: boolean(),
+    %% Mirrors erllama_server_h_messages: tracks whether we observed
+    %% the engine's erllama_done so cleanup can decide whether to
+    %% end_session (cancelled mid-flight) or leave the pinned session
+    %% alive (cross-turn reuse).
+    received_done = false :: boolean(),
+    session_id = undefined :: undefined | binary(),
     %% erllama 0.5.0 wire-driven tool-call state. Mirrors the
     %% h_messages handler: when the model has `tool_call_markers' set,
     %% the engine emits `{tool_call_delta, _}' / `erllama_tool_call_end'
@@ -171,6 +177,7 @@ init_state(R, Requested, Api, Worker, Mon) ->
         buf_reason = [],
         mode = text,
         grammar_set = grammar_active(R),
+        session_id = R#erllama_request.session_id,
         tool_format = resolve_tool_format(R#erllama_request.model_id)
     }.
 
@@ -283,10 +290,10 @@ info({erllama_reasoning_token, Ref, Tok}, Req0, S0) ->
     handle_reasoning(Tok, Req, S);
 info({erllama_done, Ref, Stats}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
-    finish_ok(Req, S, Stats);
+    finish_ok(Req, S#st{received_done = true}, Stats);
 info({erllama_error, Ref, Reason}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
-    finish_err(Req, S, Reason);
+    finish_err(Req, S#st{received_done = true}, Reason);
 %% --- timeouts ---
 info({prefill_timeout, Ref}, Req, S = #st{ref = Ref}) ->
     erllama:cancel(Ref),
@@ -342,10 +349,26 @@ cleanup(S) ->
         true -> ok;
         false -> ok
     end,
+    %% Cancelled mid-flight: free the pinned session so the next
+    %% request can admit. Naturally-completed turns leave the session
+    %% alive for cross-turn KV reuse. Mirrors erllama_server_h_messages.
+    maybe_end_session(S),
     %% Decrement the keepalive active count. If this was the last
     %% request, the model enters the keep-alive grace window.
     keepalive_release(S#st.model, S#st.phase),
     erllama_server_metrics:dec_active_streams(S#st.model).
+
+maybe_end_session(#st{received_done = true}) ->
+    ok;
+maybe_end_session(#st{session_id = undefined}) ->
+    ok;
+maybe_end_session(#st{model = Model, session_id = SessionId}) ->
+    try
+        erllama:end_session(Model, SessionId)
+    catch
+        _:_ -> ok
+    end,
+    ok.
 
 %% request_end only fires if request_begin was called (i.e., load
 %% completed). If we never reached `waiting_template`, the active

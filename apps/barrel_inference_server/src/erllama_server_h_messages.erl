@@ -67,6 +67,10 @@
     %% from `#erllama_request.user_id` so the per-request structured
     %% log can include it without re-reading the original record.
     user_id = undefined :: undefined | binary(),
+    %% Sticky-seq session id derived in the handler's fast phase.
+    %% Stashed on #st so cleanup/terminate can call end_session/2
+    %% without re-reading the request record.
+    session_id = undefined :: undefined | binary(),
     %% Integrity signature for the (currently open or just-closed)
     %% thinking block, captured from the engine's
     %% {erllama_thinking_end, Ref, Sig} message. Forwarded to the
@@ -83,6 +87,14 @@
     %% event). Loading-phase pings can open the stream before the
     %% canonical message_start frame.
     stream_started = false :: boolean(),
+    %% true once an `erllama_done' message has been observed for the
+    %% inference ref. When terminate/3 fires without this flag set,
+    %% the request was cancelled (TCP close, timeout, ...) mid-flight
+    %% and the engine still has the seq pinned to the request's
+    %% sticky session. Calling end_session in cleanup frees the seq
+    %% so the next request - on any session - can admit. Naturally-
+    %% completed turns leave the session pinned for cross-turn reuse.
+    received_done = false :: boolean(),
     %% erllama 0.5.0 wire-driven tool-call state. When the model has
     %% `tool_call_markers' set on load_model/2, the engine emits
     %% `{tool_call_delta, _}' / `{erllama_tool_call_end, _, FullBin}'
@@ -289,6 +301,7 @@ init_state(R, Requested, Worker, Mon) ->
         cache_hints = R#erllama_request.cache_hints,
         thinking_display = R#erllama_request.thinking_display,
         user_id = R#erllama_request.user_id,
+        session_id = R#erllama_request.session_id,
         tool_format = resolve_tool_format(R#erllama_request.model_id)
     }.
 
@@ -419,10 +432,10 @@ info({erllama_tool_call_end, Ref, FullBin}, Req0, S0) ->
     handle_tool_call_end(FullBin, Req, S);
 info({erllama_done, Ref, Stats}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
-    finish_ok(Req, S, Stats);
+    finish_ok(Req, S#st{received_done = true}, Stats);
 info({erllama_error, Ref, Reason}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
-    finish_err(Req, S, Reason);
+    finish_err(Req, S#st{received_done = true}, Reason);
 info({prefill_timeout, Ref}, Req, S = #st{ref = Ref}) ->
     erllama:cancel(Ref),
     finish_err(Req, S, prefill_timeout);
@@ -477,8 +490,27 @@ cleanup(S) ->
         undefined -> ok;
         Slot -> erllama_server_queue:release(S#st.model, Slot)
     end,
+    %% If the request was cancelled mid-flight (TCP close, timeout,
+    %% pipeline crash) the engine still has the seq pinned to this
+    %% request's sticky session. Free it so the next request - on
+    %% any session - can admit. Cleanly-completed turns
+    %% (received_done = true) leave the pinned session alive for
+    %% cross-turn KV reuse.
+    maybe_end_session(S),
     keepalive_release(S#st.model, S#st.phase),
     erllama_server_metrics:dec_active_streams(S#st.model).
+
+maybe_end_session(#st{received_done = true}) ->
+    ok;
+maybe_end_session(#st{session_id = undefined}) ->
+    ok;
+maybe_end_session(#st{model = Model, session_id = SessionId}) ->
+    try
+        erllama:end_session(Model, SessionId)
+    catch
+        _:_ -> ok
+    end,
+    ok.
 
 keepalive_release(_Model, waiting_load) ->
     ok;

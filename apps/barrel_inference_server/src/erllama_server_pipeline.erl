@@ -377,6 +377,13 @@ step_infer(W) ->
         {error, busy} ->
             erllama_server_metrics:inc_pool_exhausted(model_id(W)),
             {error, 429, busy};
+        %% erllama 0.5.0: two concurrent admits on the same session_id
+        %% are out of scope - the second returns sticky_busy. Map to a
+        %% retryable 503; the Anthropic handler further remaps 503 to
+        %% 529 with a retry-after header that SDKs honour as the next
+        %% backoff delay.
+        {error, sticky_busy} ->
+            {error, 503, sticky_busy};
         {error, Reason} ->
             {error, 500, Reason}
     catch
@@ -439,15 +446,14 @@ build_params(R) ->
     %% on extended-thinking length. Forward Anthropic's
     %% thinking.budget_tokens through when set and positive; the engine
     %% treats absent / non-positive as "no cap".
-    maybe_put(Maybe2, thinking_budget_tokens, R#erllama_request.thinking_budget).
-
-%% NOTE: `session_id` is captured on the request record but is
-%% intentionally NOT forwarded to `erllama:infer/4' yet. The engine's
-%% cancel-vs-session lifecycle needs verification against the real
-%% backend before we pin seq_ids - the stub backend used in CT
-%% races between cancel propagation and the next request's sticky
-%% admission, breaking the cancel-on-disconnect e2e test. The wiring
-%% lives in a follow-up PR once that timing is understood.
+    Maybe3 = maybe_put(Maybe2, thinking_budget_tokens, R#erllama_request.thinking_budget),
+    %% erllama 0.5.0 pins the underlying seq_id to whatever session_id
+    %% Params carries. The next turn on the same id truncates-and-
+    %% prefills in place on the live KV cells instead of warm-restoring
+    %% from disk. Cancel is async (next decode tick observes it) so a
+    %% retry with the same session_id during that window gets
+    %% `{error, sticky_busy}` -> 503; SDKs honour Retry-After.
+    maybe_put(Maybe3, session_id, R#erllama_request.session_id).
 
 maybe_put(Map, _Key, undefined) -> Map;
 maybe_put(Map, Key, Value) -> Map#{Key => Value}.
