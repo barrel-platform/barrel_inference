@@ -63,11 +63,10 @@ init(Req0, Opts = #{op := Op}) ->
     end.
 
 handle_post(Req0, Opts, Op) ->
-    MaxBody = erllama_server_config:max_request_body_bytes(),
-    case cowboy_req:read_body(Req0, #{length => MaxBody}) of
+    case erllama_server_body:read(Req0) of
         {ok, Body, Req1} ->
             fast_phase(Body, Req1, Opts, Op);
-        {more, _, Req1} ->
+        {too_large, Req1} ->
             reply_json(413, #{<<"error">> => <<"request_too_large">>}, Req1, Opts)
     end.
 

@@ -167,10 +167,9 @@ mirror_request_id(Req) ->
     end.
 
 handle_post(Req0, Opts) ->
-    MaxBody = erllama_server_config:max_request_body_bytes(),
-    case cowboy_req:read_body(Req0, #{length => MaxBody}) of
+    case erllama_server_body:read(Req0) of
         {ok, Body, Req1} -> fast_phase(Body, Req1, Opts);
-        {more, _, Req1} -> reply_json_error(413, request_too_large, Req1)
+        {too_large, Req1} -> reply_json_error(413, request_too_large, Req1)
     end.
 
 fast_phase(Body, Req0, Opts) ->
@@ -1185,13 +1184,25 @@ anthropic_error_body(Status, Reason, Req) ->
         <<"type">> => <<"error">>,
         <<"error">> => #{
             <<"type">> => anthropic_error_type(Status),
-            <<"message">> => to_bin(Reason)
+            <<"message">> => error_message(Reason)
         }
     },
     case cowboy_req:resp_header(<<"x-request-id">>, Req, undefined) of
         undefined -> Base;
         Id -> Base#{<<"request_id">> => Id}
     end.
+
+%% Human-readable text for the `error.message' field. Clients (and
+%% users) see this string directly; the atom name is useful in logs
+%% but not as wire copy. Fall back to `to_bin/1' for reasons we have
+%% not bothered to humanise yet.
+error_message(request_too_large) ->
+    Max = erllama_server_config:max_request_body_bytes(),
+    iolist_to_binary(
+        io_lib:format("request body too large: max ~B bytes", [Max])
+    );
+error_message(Reason) ->
+    to_bin(Reason).
 
 anthropic_error_type(400) -> <<"invalid_request_error">>;
 anthropic_error_type(401) -> <<"authentication_error">>;

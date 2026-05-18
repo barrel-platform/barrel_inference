@@ -24,6 +24,7 @@
     count_tokens_unknown_model_returns_529/1,
     count_tokens_invalid_json_returns_400/1,
     accepts_body_above_one_mb/1,
+    accepts_body_above_cowboy_default_length/1,
     messages_413_returns_request_too_large_type/1,
     messages_emits_request_id_header/1,
     messages_no_allowlist_accepts_any_key/1,
@@ -56,6 +57,7 @@ all() ->
         count_tokens_unknown_model_returns_529,
         count_tokens_invalid_json_returns_400,
         accepts_body_above_one_mb,
+        accepts_body_above_cowboy_default_length,
         messages_413_returns_request_too_large_type,
         messages_emits_request_id_header,
         messages_no_allowlist_accepts_any_key,
@@ -288,6 +290,17 @@ anthropic_version_header_echoed(Cfg) ->
 accepts_body_above_one_mb(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
     Big = binary:copy(<<"x">>, 5 * 1024 * 1024),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", Big}, [], []),
+    ?assertEqual(400, Status).
+
+%% Cowboy's default per-read `length' is 8 MB; the handler must loop
+%% `read_body/1' across multiple `{more, _, _}' chunks instead of
+%% treating the first non-final chunk as 413. A 10 MB body is enough
+%% to force at least two reads even on a fast localhost socket.
+accepts_body_above_cowboy_default_length(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Big = binary:copy(<<"x">>, 10 * 1024 * 1024),
     {ok, {{_, Status, _}, _, _}} =
         httpc:request(post, {Url, [], "application/json", Big}, [], []),
     ?assertEqual(400, Status).
