@@ -232,8 +232,11 @@ note_tool_use_block(_Model, _) ->
 %% Mirrors Ollama's `server/prompt.go` truncation strategy: preserve
 %% system + the final (most recent) message, shave from the head.
 %% Cap retries so a single oversized final turn fails cleanly with
-%% 413 rather than looping. llama.cpp would otherwise segfault when
-%% the prefill batch token count >= n_ctx.
+%% 400 / `context_overflow' rather than looping. llama.cpp would
+%% otherwise segfault when the prefill batch token count >= n_ctx.
+%% Per Anthropic / OpenAI conventions, prompt-too-long is 400
+%% `invalid_request_error', not 413 `request_too_large' (which is
+%% reserved for raw byte size).
 apply_chat_template_with_truncate(W, System, Tools, Messages) ->
     case render_template(W, System, Tools, Messages) of
         {ok, Tokens} ->
@@ -243,11 +246,7 @@ apply_chat_template_with_truncate(W, System, Tools, Messages) ->
                 {error, 503, _} = E ->
                     E;
                 {overflow, Ctx} when length(Messages) =< 1 ->
-                    {error, 413, #{
-                        error => context_overflow,
-                        prompt_tokens => length(Tokens),
-                        context_size => Ctx
-                    }};
+                    {error, 400, {context_overflow, length(Tokens), Ctx}};
                 {overflow, _Ctx} ->
                     apply_chat_template_with_truncate(
                         W, System, Tools, drop_oldest_non_system(Messages)
@@ -281,11 +280,7 @@ tokenise_raw(W, Prompt) ->
                 {error, _, _} = E ->
                     E;
                 {overflow, Ctx} ->
-                    {error, 413, #{
-                        error => context_overflow,
-                        prompt_tokens => length(Tokens),
-                        context_size => Ctx
-                    }}
+                    {error, 400, {context_overflow, length(Tokens), Ctx}}
             end;
         {error, Reason} ->
             {error, 400, Reason}

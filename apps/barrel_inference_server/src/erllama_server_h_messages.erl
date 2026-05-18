@@ -1260,6 +1260,13 @@ error_message(request_too_large) ->
     iolist_to_binary(
         io_lib:format("request body too large: max ~B bytes", [Max])
     );
+error_message({context_overflow, Tokens, Ctx}) ->
+    iolist_to_binary(
+        io_lib:format(
+            "prompt is too long: ~B tokens > ~B maximum",
+            [Tokens, Ctx]
+        )
+    );
 error_message(Reason) ->
     to_bin(Reason).
 

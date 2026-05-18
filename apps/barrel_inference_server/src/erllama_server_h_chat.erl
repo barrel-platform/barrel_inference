@@ -644,7 +644,7 @@ error_payload(Status, Reason) ->
     #{
         <<"error">> => #{
             <<"status">> => Status,
-            <<"message">> => to_bin(Reason)
+            <<"message">> => error_message(Reason)
         }
     }.
 
@@ -753,9 +753,9 @@ reply_json_error(Status, Reason, Req0) ->
 json_error(Status, Reason, Req0) ->
     Body = #{
         <<"error">> => #{
-            <<"message">> => to_bin(Reason),
+            <<"message">> => error_message(Reason),
             <<"type">> => error_type(Status),
-            <<"code">> => to_bin(Reason)
+            <<"code">> => error_code(Reason)
         }
     },
     cowboy_req:reply(
@@ -764,6 +764,24 @@ json_error(Status, Reason, Req0) ->
         json:encode(Body),
         Req0
     ).
+
+%% Render `error.message' as a sentence rather than an Erlang term.
+%% OpenAI clients show the message verbatim, so a tuple printed with
+%% `~p' (`{context_overflow,4500,4096}') leaks Erlang syntax.
+error_message({context_overflow, Tokens, Ctx}) ->
+    iolist_to_binary(
+        io_lib:format(
+            "prompt is too long: ~B tokens > ~B maximum",
+            [Tokens, Ctx]
+        )
+    );
+error_message(Reason) ->
+    to_bin(Reason).
+
+%% Stable atom-style code for tooling; OpenAI uses these for retry /
+%% UX decisions (e.g. `context_length_exceeded' is well-known).
+error_code({context_overflow, _, _}) -> <<"context_length_exceeded">>;
+error_code(Reason) -> to_bin(Reason).
 
 error_type(400) -> <<"invalid_request_error">>;
 error_type(404) -> <<"invalid_request_error">>;

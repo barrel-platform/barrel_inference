@@ -432,6 +432,14 @@ error_body(B) when is_binary(B) ->
     #{<<"error">> => B};
 error_body(A) when is_atom(A) ->
     #{<<"error">> => atom_to_binary(A, utf8)};
+error_body({context_overflow, Tokens, Ctx}) ->
+    Msg = iolist_to_binary(
+        io_lib:format(
+            "prompt is too long: ~B tokens > ~B maximum",
+            [Tokens, Ctx]
+        )
+    ),
+    #{<<"error">> => Msg};
 error_body(T) ->
     #{<<"error">> => iolist_to_binary(io_lib:format("~p", [T]))}.
 

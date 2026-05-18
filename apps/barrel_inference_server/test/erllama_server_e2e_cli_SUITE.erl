@@ -23,7 +23,7 @@
     api_chat_keep_alive_zero_unloads/1,
     api_chat_after_unload_reloads_cleanly/1,
     api_chat_truncates_old_messages_on_overflow/1,
-    api_chat_413_when_single_message_overflows/1,
+    api_chat_400_when_single_message_overflows/1,
     api_embed_returns_vectors/1,
     api_embeddings_legacy_returns_embedding/1
 ]).
@@ -44,7 +44,7 @@ all() ->
         api_chat_keep_alive_zero_unloads,
         api_chat_after_unload_reloads_cleanly,
         api_chat_truncates_old_messages_on_overflow,
-        api_chat_413_when_single_message_overflows,
+        api_chat_400_when_single_message_overflows,
         api_embed_returns_vectors,
         api_embeddings_legacy_returns_embedding
     ].
@@ -283,9 +283,10 @@ api_chat_truncates_old_messages_on_overflow(Cfg) ->
     ?assertEqual(true, maps:get(<<"done">>, Resp)).
 
 %% A single message whose tokens alone overflow context can't be
-%% truncated. The pipeline must return 413 context_overflow rather
-%% than 200 or 500 (NIF crash).
-api_chat_413_when_single_message_overflows(Cfg) ->
+%% truncated. The pipeline must return 400 `context_overflow' rather
+%% than 200 or 500 (NIF crash). 413 is reserved for HTTP body-byte
+%% size per Anthropic / OpenAI conventions.
+api_chat_400_when_single_message_overflows(Cfg) ->
     {ok, _} = pull_for(<<"trunc-2">>, <<"latest">>, Cfg),
     %% > 1024 tokens in one message (each space-separated word = 1 token).
     Huge = iolist_to_binary(lists:duplicate(1100, <<"x ">>)),
@@ -295,7 +296,7 @@ api_chat_413_when_single_message_overflows(Cfg) ->
         <<"stream">> => false
     }),
     {ok, {{_, Status, _}, _, _Raw}} = post_json(Cfg, "/api/chat", Body),
-    ?assertEqual(413, Status).
+    ?assertEqual(400, Status).
 
 api_chat_after_unload_reloads_cleanly(Cfg) ->
     {ok, _} = pull_for(<<"reload-1">>, <<"latest">>, Cfg),
