@@ -44,6 +44,13 @@
     request :: #erllama_request{},
     %% State filled in as we progress.
     tokens :: [non_neg_integer()] | undefined,
+    %% When set, this turn extends a prior pinned session whose
+    %% committed-token count is known. `suffix' is the new tail
+    %% (tokens after the slice); `infer/4' is replaced with
+    %% `erllama:continue/3' on this turn. Unset on the first turn
+    %% of a session, after `no_session' fallback, or when the
+    %% server-side session_state has no entry for this session.
+    continuation :: [non_neg_integer()] | undefined,
     slot :: erllama_server_queue:slot() | undefined,
     infer_ref :: reference() | undefined
 }).
@@ -292,8 +299,32 @@ tokenise_raw(W, Prompt) ->
 
 accept_tokens(W, Tokens) ->
     W1 = put_tokens(W, Tokens),
+    W2 = maybe_arm_continuation(W1, Tokens),
     W#work.handler ! {pipeline, templated, Tokens},
-    {ok, W1}.
+    {ok, W2}.
+
+%% When the request's session has a prior `committed_tokens' count
+%% on file and the freshly-rendered prompt is longer than that
+%% count, this turn is a continuation: slice the tokens after the
+%% prior count and route through `erllama:continue/3' instead of
+%% `infer/4'. Returns the work record annotated with the suffix on
+%% success; leaves it untouched (first turn / no session state /
+%% shorter prompt than prior) so step_infer falls through to the
+%% normal `infer/4' path.
+maybe_arm_continuation(W, Tokens) ->
+    R = W#work.request,
+    case R#erllama_request.session_id of
+        undefined ->
+            W;
+        SessionId ->
+            case erllama_server_session_state:get(R#erllama_request.model_id, SessionId) of
+                {ok, N} when is_integer(N), N > 0, N < length(Tokens) ->
+                    Suffix = lists:nthtail(N, Tokens),
+                    W#work{continuation = Suffix};
+                _ ->
+                    W
+            end
+    end.
 
 %% Returns `ok` if the prompt fits, `{overflow, Ctx}` if it doesn't,
 %% or `{error, 503, not_loaded}` if the model has gone away between
@@ -371,7 +402,7 @@ step_queue(W) ->
 
 step_infer(W) ->
     Params = build_params(W#work.request),
-    try erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler) of
+    try do_infer(W, Params) of
         {ok, Ref} ->
             {ok, W#work{infer_ref = Ref}};
         {error, busy} ->
@@ -392,6 +423,38 @@ step_infer(W) ->
         Class:Why:Stack ->
             log_erllama_crash(model_id(W), infer, Class, Why, Stack),
             {error, 500, model_crashed}
+    end.
+
+%% Try `continue/3' when the work record carries a suffix; fall
+%% through to a full `infer/4' on `no_session' (engine has no
+%% session entry for this id - TTL evict, server restart wiped
+%% our cache but engine didn't match, etc.). Other errors bubble
+%% up unchanged.
+do_infer(#work{continuation = undefined} = W, Params) ->
+    erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler);
+do_infer(W, Params) ->
+    R = W#work.request,
+    ContOpts = maps:merge(Params, #{
+        session_id => R#erllama_request.session_id,
+        caller_pid => W#work.handler
+    }),
+    case erllama:continue(model_id(W), W#work.continuation, ContOpts) of
+        {error, no_session} ->
+            clear_session_state(W),
+            erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler);
+        Other ->
+            Other
+    end.
+
+clear_session_state(W) ->
+    R = W#work.request,
+    case R#erllama_request.session_id of
+        undefined ->
+            ok;
+        SessionId ->
+            erllama_server_session_state:delete(
+                R#erllama_request.model_id, SessionId
+            )
     end.
 
 %% Convert crashes coming back from erllama (gen_statem `call` exits,

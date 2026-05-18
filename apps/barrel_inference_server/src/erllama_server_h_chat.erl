@@ -290,6 +290,7 @@ info({erllama_reasoning_token, Ref, Tok}, Req0, S0) ->
     handle_reasoning(Tok, Req, S);
 info({erllama_done, Ref, Stats}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
+    record_session_committed(S, Stats),
     finish_ok(Req, S#st{received_done = true}, Stats);
 info({erllama_error, Ref, Reason}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
@@ -368,7 +369,18 @@ maybe_end_session(#st{model = Model, session_id = SessionId}) ->
     catch
         _:_ -> ok
     end,
+    erllama_server_session_state:delete(Model, SessionId),
     ok.
+
+record_session_committed(#st{session_id = undefined}, _) ->
+    ok;
+record_session_committed(#st{model = Model, session_id = SessionId}, Stats) ->
+    case maps:get(committed_tokens, Stats, undefined) of
+        N when is_integer(N), N > 0 ->
+            erllama_server_session_state:put(Model, SessionId, N);
+        _ ->
+            ok
+    end.
 
 %% request_end only fires if request_begin was called (i.e., load
 %% completed). If we never reached `waiting_template`, the active

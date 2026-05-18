@@ -432,6 +432,7 @@ info({erllama_tool_call_end, Ref, FullBin}, Req0, S0) ->
     handle_tool_call_end(FullBin, Req, S);
 info({erllama_done, Ref, Stats}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
+    record_session_committed(S, Stats),
     finish_ok(Req, S#st{received_done = true}, Stats);
 info({erllama_error, Ref, Reason}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
@@ -510,7 +511,25 @@ maybe_end_session(#st{model = Model, session_id = SessionId}) ->
     catch
         _:_ -> ok
     end,
+    %% Mirror the engine's cleanup on our side: cancel-mid-flight
+    %% leaves no useful prior count for the next turn.
+    erllama_server_session_state:delete(Model, SessionId),
     ok.
+
+%% Stash the engine-reported `committed_tokens' so the next turn's
+%% pipeline can slice the rendered prompt at the right boundary
+%% for `erllama:continue/3'. Skip when no session id is on file
+%% (legacy path) or the engine didn't surface the count (very old
+%% engine).
+record_session_committed(#st{session_id = undefined}, _) ->
+    ok;
+record_session_committed(#st{model = Model, session_id = SessionId}, Stats) ->
+    case maps:get(committed_tokens, Stats, undefined) of
+        N when is_integer(N), N > 0 ->
+            erllama_server_session_state:put(Model, SessionId, N);
+        _ ->
+            ok
+    end.
 
 keepalive_release(_Model, waiting_load) ->
     ok;

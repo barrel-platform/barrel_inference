@@ -466,12 +466,19 @@ multi_turn_cache_delta_profile(Cfg) ->
     log_usage(1, Usage1),
     log_usage(2, Usage2),
     log_usage(3, Usage3),
-    %% Sanity: each turn must produce a response with input_tokens.
-    %% Real assertion is the log output; the build only fails if the
-    %% multi-turn flow itself broke.
+    %% Each turn produces a real response.
     ?assert(maps:get(<<"input_tokens">>, Usage1) > 0),
     ?assert(maps:get(<<"input_tokens">>, Usage2) >= maps:get(<<"input_tokens">>, Usage1)),
-    ?assert(maps:get(<<"input_tokens">>, Usage3) >= maps:get(<<"input_tokens">>, Usage2)).
+    ?assert(maps:get(<<"input_tokens">>, Usage3) >= maps:get(<<"input_tokens">>, Usage2)),
+    %% With erllama 0.6.0's continue/3 wired in, turn 2 and turn 3
+    %% must reuse the predecessor's full committed state instead of
+    %% admitting cold. A regression in the session_state plumbing
+    %% (lost count, off-by-one slice) would surface as cache_read = 0
+    %% on turn 2.
+    Read2 = maps:get(<<"cache_read_input_tokens">>, Usage2, 0),
+    Read3 = maps:get(<<"cache_read_input_tokens">>, Usage3, 0),
+    ?assert(Read2 > 0),
+    ?assert(Read3 > Read2).
 
 log_usage(TurnN, Usage) ->
     Input = maps:get(<<"input_tokens">>, Usage, 0),
