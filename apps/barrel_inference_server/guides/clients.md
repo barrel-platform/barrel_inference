@@ -332,6 +332,142 @@ rewrite: `claude-sonnet-4-5` -> `Qwen/...:main` -> registry
 lookup. Unknown ids fall through to a registry lookup as-is, so
 the registry name itself always works.
 
+### End-to-end walkthrough
+
+From clone to a working Claude Code session against your laptop's
+GPU. Skips steps already done in the [quickstart](quickstart.md).
+
+#### 1. Build and put both binaries on PATH
+
+```sh
+cd erllama_server
+rebar3 release
+export PATH=$PWD/_build/default/rel/erllama_server/bin:$PATH
+```
+
+`erllama_server` (daemon) and `erllama` (CLI) are now both
+callable.
+
+#### 2. Configure aliases + the `n_seq_max` gotcha
+
+Edit `config/sys.config`:
+
+```erlang
+[
+ {erllama_server, [
+   {port, 8080},
+   {model_aliases, #{
+     %% Claude Code's current default trio.
+     <<"claude-opus-4-7">>            => <<"local-coder">>,
+     <<"claude-sonnet-4-5">>          => <<"local-coder">>,
+     <<"claude-haiku-4-5">>           => <<"local-coder">>,
+     %% Older Claude ids some SDKs still cache.
+     <<"claude-3-5-sonnet-20241022">> => <<"local-coder">>,
+     <<"claude-3-5-haiku-20241022">>  => <<"local-coder">>
+   }},
+   {pool_exhausted_policy,
+     {queue, #{concurrency => 2, depth => 4, timeout_ms => 30000}}}
+ ]}
+].
+```
+
+`concurrency => 2` here is paired with the model's
+`context_opts.n_seq_max => 4` (see below). Sticky-seq pins one
+engine seq_id per active conversation, so `n_seq_max=1` (the
+engine default) deadlocks the moment two sessions overlap.
+
+#### 3. Pull a model
+
+Claude Code talks to real coding workloads, so you want at least
+a 7B coder-tuned model. Qwen2.5-Coder-7B is a good first target:
+
+```sh
+erllama pull hf://Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/qwen2.5-coder-7b-instruct-q4_k_m.gguf
+erllama copy "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:main" "local-coder:main"
+```
+
+If you want tool-call exact-replay (recommended for repeat-loop
+agents like Claude Code), the manifest needs `tool_call_markers`
+and `tool_call_format` declared in its `loader` section. For
+Qwen-family models the default registry already has `qwen-xml`;
+you just need the markers. Edit the manifest:
+
+```sh
+MANIFEST="$(find ~/Library/Caches/erllama_server/manifests \
+  -name '*.json' -path '*local-coder*' | head -1)"
+# add to the JSON's "loader" object:
+#   "tool_call_markers": {"start":"<tool_call>","end":"</tool_call>"},
+#   "tool_call_format": "qwen-xml",
+#   "context_opts": {"n_seq_max": 4}
+```
+
+(The cache root and exact path depend on your platform; check
+`erllama show local-coder:main` to confirm where it landed.)
+
+#### 4. Boot the daemon
+
+```sh
+erllama_server daemon
+curl -fsS http://127.0.0.1:8080/health     # -> {"status":"ok"}
+curl -fsS http://127.0.0.1:8080/v1/models  # confirms `local-coder` + aliases
+```
+
+#### 5. Point Claude Code at it
+
+Two env vars and Claude Code uses your daemon instead of
+Anthropic's hosted API:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_AUTH_TOKEN=not-used   # any non-empty value
+```
+
+Then in any project directory:
+
+```sh
+claude "list the files in this repo and summarise the layout"
+```
+
+Claude Code sends a `claude-opus-4-7` (or similar) request; the
+daemon's alias map routes it to `local-coder:main`; Qwen2.5-Coder
+generates the response; the Anthropic SSE stream comes back to
+Claude Code. Subsequent turns on the same conversation reuse the
+prior KV state via the v0.6 `continue/3` path.
+
+#### 6. Watch what's happening
+
+```sh
+# Daemon log (structured per-request lines + access log)
+tail -f _build/default/rel/erllama_server/log/erlang.log.*
+
+# Prometheus counters
+curl -sS http://127.0.0.1:8080/metrics | \
+  grep -E 'cache_hits_total|active_streams|tool_replay_lookups'
+
+# Loaded models
+erllama ps
+```
+
+The `erllama_cache_hits_total{kind="continuation"}` counter
+climbs on every multi-turn continuation — that's the v0.6 path
+firing.
+
+#### 7. Troubleshooting
+
+| Symptom | Likely cause |
+| --- | --- |
+| 529 with `retry-after` | Two concurrent admits on the same session — Claude Code occasionally fires parallel asks; SDKs retry. A spike means `n_seq_max` is too low. |
+| 504 `queue_timeout` after a few turns | A sticky session pinned a seq and no spare seq_ids are left; bump `loader.context_opts.n_seq_max` to 4+. |
+| Garbage tokens on turn 2+ | Model's chat template re-renders prior turns differently across turns; the continuation suffix doesn't line up against the engine's stored prefix. Pick a model whose template is stable (run `multi_turn_cache_delta_profile` against it first). |
+| Claude Code says "model not found" | The alias key in `sys.config` doesn't match the exact id Claude Code is sending. Check `curl http://127.0.0.1:8080/v1/models` and compare. |
+| First load is slow | Cold-pull + GGUF mmap + Metal/CUDA init can be 20-30 s for a 7B Q4 on Apple Silicon. Warm reloads are sub-second. |
+
+#### 8. Stop
+
+```sh
+erllama_server stop
+```
+
 ### Multiple Claude models on one server
 
 `model_aliases` is the mechanism for "Claude Code's model picker
