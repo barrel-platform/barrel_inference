@@ -8,17 +8,26 @@ Five minutes from clone to first token.
 git clone https://github.com/erllama/erllama_server.git
 cd erllama_server
 rebar3 release
-rebar3 escriptize
 ```
 
-`rebar3 release` pulls `erllama` and builds its `llama.cpp` NIF
-(needs `cmake` + a C++17 toolchain). `rebar3 escriptize` produces
-the `erllama` CLI at `_build/default/bin/erllama`.
+`rebar3 release` pulls `erllama`, builds its `llama.cpp` NIF
+(needs `cmake` + a C++17 toolchain), and bundles the `erllama`
+CLI escript next to the daemon's start script. Both binaries
+land in `_build/default/rel/erllama_server/bin/`:
+
+- `erllama_server` — the daemon (`start`, `stop`, `daemon`, …).
+- `erllama` — the CLI client (`pull`, `list`, `run`, …).
+
+Put the release `bin/` on `PATH` and you have both:
+
+```sh
+export PATH=$PWD/_build/default/rel/erllama_server/bin:$PATH
+```
 
 ## 2. Start the daemon
 
 ```sh
-_build/default/rel/erllama_server/bin/erllama_server daemon
+erllama_server daemon
 curl -fsS http://127.0.0.1:8080/health     # -> {"status":"ok"}
 ```
 
@@ -28,8 +37,6 @@ A Qwen 2.5 7B Q3_K_M (~3.8 GB, single-file) is a good first target
 on a MacBook:
 
 ```sh
-export PATH=$PWD/_build/default/bin:$PATH
-
 erllama pull hf://Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q3_k_m.gguf
 erllama list
 # NAME                                SIZE     QUANT   FAMILY
@@ -92,7 +99,7 @@ Drop in your existing tooling: the server speaks all three.
 ## Stop the daemon
 
 ```sh
-_build/default/rel/erllama_server/bin/erllama_server stop
+erllama_server stop
 ```
 
 ## Next reads
