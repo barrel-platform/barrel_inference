@@ -695,16 +695,23 @@ Requests with `x-api-key` not in the list get
 `401 authentication_error` in the standard Anthropic envelope.
 Leave empty (default) for trusted local use.
 
-### Big requests and the 32 MB ceiling
+### Big requests and the 256 MiB ceiling
 
-Claude Code's HTTP client refuses to send any request body larger
-than 32 MB. With many MCP servers connected, the system prompt +
-tool definitions alone can approach that on every turn. The server
-accepts up to 32 MB by default (`max_request_body_bytes` in
-`sys.config`); the ceiling lives in the client.
+Anthropic's documented developer-API cap is 32 MB, but Claude
+Code on a Max plan effectively ships far larger bodies — long
+conversation history + MCP tool schemas + repo `CLAUDE.md` /
+`AGENTS.md` context comfortably reach a few hundred MB. To stand
+in for the Max endpoint without 413 surprises, the server's
+default `max_request_body_bytes` is **256 MiB** (`config/sys.config`).
+Bump it higher if your real-world traffic does too; lower it if
+memory pressure on the cowboy acceptor pool is a concern
+(worst case = `pool_concurrency * cap` in live buffers).
 
-If you see `Request too large (max 32MB)` in your Claude Code
-terminal, the only fix is to **reduce what Claude Code sends**:
+If Claude Code shows `Request too large (max NN MB)` in its
+terminal, the number in the message is whatever the **server**
+reported on the 413 — not a hardcoded Claude Code number. Bump
+this cap until it fits. As a fallback you can still **reduce
+what Claude Code sends**:
 
 - Disconnect MCP servers you aren't using (`claude mcp remove …`).
 - Shorten `~/.claude/CLAUDE.md`.

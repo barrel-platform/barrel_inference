@@ -419,8 +419,8 @@ messages_error_body_carries_request_id(Cfg) ->
 %% retry behaviour.
 messages_413_returns_request_too_large_type(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
-    %% Body cap is 32 MB by default; send 33 MB to trip the 413 path.
-    Oversized = binary:copy(<<"x">>, 33 * 1024 * 1024),
+    %% Default body cap is 256 MiB; send 257 MiB to trip the 413 path.
+    Oversized = binary:copy(<<"x">>, 257 * 1024 * 1024),
     {ok, {{_, Status, _}, _, RespBody}} =
         httpc:request(post, {Url, [], "application/json", Oversized}, [], []),
     ?assertEqual(413, Status),
