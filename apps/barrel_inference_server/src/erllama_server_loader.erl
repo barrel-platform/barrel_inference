@@ -332,6 +332,12 @@ manifest_to_config(Manifest) ->
     NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
     Ctx = min(default_int(ParamCtx, NativeCtx), MaxCtx),
     NBatch = default_int(maps:get(<<"n_batch">>, Loader, undefined), 512),
+    %% `n_seq_max` controls the engine's seq pool. Sticky-seq
+    %% pinning (PR 28+) and the continue/3 path (PR 32) need at
+    %% least 2 here to avoid admission deadlock the moment a second
+    %% session arrives; documented in guides/clients.md. Manifest
+    %% override path lives on `loader.n_seq_max`.
+    NSeqMax = pos_int(maps:get(<<"n_seq_max">>, Loader, undefined)),
     %% erllama_model_llama reads `context_opts` (forwarded to
     %% erllama_nif:new_context/2) and `model_opts` (forwarded to
     %% erllama_nif:load_model/2). Without these the NIF falls back to
@@ -354,10 +360,10 @@ manifest_to_config(Manifest) ->
         quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
         quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
         context_size => Ctx,
-        context_opts => #{
-            n_ctx => Ctx,
-            n_batch => NBatch
-        },
+        context_opts => maybe_put_n_seq_max(
+            #{n_ctx => Ctx, n_batch => NBatch},
+            NSeqMax
+        ),
         model_opts => model_opts_from(Loader, Params)
     },
     Config1 = maybe_put_thinking_markers(Config0, Loader),
@@ -405,6 +411,15 @@ add_payload_markers(Base, #{<<"payload_start">> := PS, <<"payload_end">> := PE})
     Base#{payload_start => PS, payload_end => PE};
 add_payload_markers(Base, _) ->
     Base.
+
+%% Normalise an optional positive-integer manifest field. Anything
+%% else (null, missing, 0, non-integer) collapses to `undefined' so
+%% the caller can decide on the default.
+pos_int(N) when is_integer(N), N > 0 -> N;
+pos_int(_) -> undefined.
+
+maybe_put_n_seq_max(Opts, undefined) -> Opts;
+maybe_put_n_seq_max(Opts, N) -> Opts#{n_seq_max => N}.
 
 %% Build the model_opts map. Only set keys the manifest actually
 %% supplies; let llama.cpp pick its own platform-appropriate default

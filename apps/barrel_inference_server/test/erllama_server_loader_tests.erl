@@ -154,6 +154,37 @@ manifest_to_config_ignores_malformed_tool_call_markers_test() ->
     Config = erllama_server_loader:manifest_to_config(Manifest),
     ?assertNot(maps:is_key(tool_call_markers, Config)).
 
+%% Manifest's `loader.n_seq_max` becomes `context_opts.n_seq_max'.
+%% Required for sticky-seq + continue/3 to admit more than one
+%% session concurrently against the same model.
+manifest_to_config_propagates_n_seq_max_test() ->
+    Manifest = (manifest(<<"sha256:0009">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{
+            <<"quant_bits">> => 4,
+            <<"n_ctx">> => 4096,
+            <<"n_seq_max">> => 4
+        }
+    },
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertEqual(4, maps:get(n_seq_max, CtxOpts)).
+
+manifest_to_config_omits_n_seq_max_when_absent_test() ->
+    Manifest = manifest(<<"sha256:000a">>, <<"q4_k_m">>, 4096, 4),
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertNot(maps:is_key(n_seq_max, CtxOpts)).
+
+manifest_to_config_ignores_zero_n_seq_max_test() ->
+    %% `0` and negatives collapse to `undefined` so the engine
+    %% keeps its own default rather than admitting nothing.
+    Manifest = (manifest(<<"sha256:000b">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{<<"quant_bits">> => 4, <<"n_seq_max">> => 0}
+    },
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertNot(maps:is_key(n_seq_max, CtxOpts)).
+
 %% =============================================================================
 %% default_opts/1
 %% =============================================================================
