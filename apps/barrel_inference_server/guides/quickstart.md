@@ -106,6 +106,7 @@ erllama_server stop
 
 - [`api.md`](api.md) — curl examples for every endpoint
 - [`clients.md`](clients.md) — Python / JS / Erlang client snippets
+- [`sizing.md`](sizing.md) — picking a model that fits your laptop
 - [`registry.md`](registry.md) — Modelfile + pull semantics
 - [`fetching.md`](fetching.md) — URL syntax, cache layout, resume
 - [`openapi.yaml`](openapi.md) — full OpenAPI 3.1 spec
