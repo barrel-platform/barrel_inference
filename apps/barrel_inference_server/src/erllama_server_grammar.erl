@@ -99,7 +99,7 @@ from_response_format(_) ->
 
 top_rule(auto, ToolRules) ->
     %% text_response | one_of_tools
-    [<<"text_response | ">>, tool_alternation(ToolRules)];
+    [<<"text-response | ">>, tool_alternation(ToolRules)];
 top_rule(required, ToolRules) ->
     tool_alternation(ToolRules);
 top_rule({named, _Name}, [{Rule, _Body}]) ->
@@ -129,7 +129,11 @@ tool_rule(#{name := Name, schema := Schema}, _Index) ->
     ].
 
 tool_rule_name(I) ->
-    iolist_to_binary([<<"tool_">>, integer_to_binary(I)]).
+    %% llama.cpp's GBNF parser (`is_word_char` in src/llama-grammar.cpp)
+    %% accepts letters, digits, and `-` for rule names but rejects
+    %% `_'. The hyphen form is the only portable rule-name spelling
+    %% across the grammar parsers we care about.
+    iolist_to_binary([<<"tool-">>, integer_to_binary(I)]).
 
 filter_tools(Tools, {named, Name}) ->
     case [T || T = #{name := N} <- Tools, N =:= Name] of
@@ -151,12 +155,12 @@ schema_value(Schema) ->
     case schema_type(Schema) of
         <<"object">> -> schema_object(Schema);
         <<"array">> -> schema_array(Schema);
-        <<"string">> -> <<"json_string">>;
-        <<"integer">> -> <<"json_integer">>;
-        <<"number">> -> <<"json_number">>;
-        <<"boolean">> -> <<"json_bool">>;
+        <<"string">> -> <<"json-string">>;
+        <<"integer">> -> <<"json-integer">>;
+        <<"number">> -> <<"json-number">>;
+        <<"boolean">> -> <<"json-bool">>;
         <<"null">> -> <<"\"null\"">>;
-        undefined -> <<"json_value">>
+        undefined -> <<"json-value">>
     end.
 
 schema_type(#{<<"type">> := T}) when is_binary(T) -> T;
@@ -201,7 +205,7 @@ schema_array(Schema) ->
                 maps:get(items, Schema, undefined)
             )
         of
-            undefined -> <<"json_value">>;
+            undefined -> <<"json-value">>;
             S -> schema_value(S)
         end,
     Inner = iolist_to_binary([Items, <<" (\",\" ws ">>, Items, <<")*">>]),
@@ -236,27 +240,27 @@ required(_) -> [].
 
 shared_rules() ->
     [
-        {<<"text_response">>, [<<"[^\\x00]*">>]},
-        {<<"json_value">>, [
-            <<"json_object | json_array | json_string | json_number ">>,
-            <<"| json_bool | \"null\"">>
+        {<<"text-response">>, [<<"[^\\x00]*">>]},
+        {<<"json-value">>, [
+            <<"json-object | json-array | json-string | json-number ">>,
+            <<"| json-bool | \"null\"">>
         ]},
-        {<<"json_object">>, [<<"\"{\" ws ( json_member (\",\" ws json_member)* )? ws \"}\"">>]},
-        {<<"json_member">>, [<<"json_string \":\" ws json_value">>]},
-        {<<"json_array">>, [<<"\"[\" ws ( json_value (\",\" ws json_value)* )? ws \"]\"">>]},
-        {<<"json_string">>, [<<"\"\\\"\" json_string_chars* \"\\\"\"">>]},
-        {<<"json_string_chars">>, [
+        {<<"json-object">>, [<<"\"{\" ws ( json-member (\",\" ws json-member)* )? ws \"}\"">>]},
+        {<<"json-member">>, [<<"json-string \":\" ws json-value">>]},
+        {<<"json-array">>, [<<"\"[\" ws ( json-value (\",\" ws json-value)* )? ws \"]\"">>]},
+        {<<"json-string">>, [<<"\"\\\"\" json-string-chars* \"\\\"\"">>]},
+        {<<"json-string-chars">>, [
             <<"[^\"\\\\\\x00-\\x1f] | \"\\\\\" (\"\\\"\" | \"\\\\\" | \"/\" ">>,
             <<"| \"b\" | \"f\" | \"n\" | \"r\" | \"t\" ">>,
             <<"| \"u\" hex hex hex hex)">>
         ]},
         {<<"hex">>, [<<"[0-9a-fA-F]">>]},
-        {<<"json_integer">>, [<<"\"-\"? ([0-9] | [1-9] [0-9]*)">>]},
-        {<<"json_number">>, [
+        {<<"json-integer">>, [<<"\"-\"? ([0-9] | [1-9] [0-9]*)">>]},
+        {<<"json-number">>, [
             <<"\"-\"? ([0-9] | [1-9] [0-9]*) (\".\" [0-9]+)? ">>,
             <<"([eE] [-+]? [0-9]+)?">>
         ]},
-        {<<"json_bool">>, [<<"\"true\" | \"false\"">>]},
+        {<<"json-bool">>, [<<"\"true\" | \"false\"">>]},
         {<<"ws">>, [<<"[ \\t\\n]*">>]}
     ].
 

@@ -78,9 +78,9 @@ auto_emits_text_or_tool(_Cfg) ->
         }
     ],
     {ok, G} = erllama_server_grammar:from_tools(Tools, auto),
-    %% root contains both text_response and tool_0 alternatives.
-    ?assert(binary:match(G, <<"text_response">>) =/= nomatch),
-    ?assert(binary:match(G, <<"tool_0">>) =/= nomatch).
+    %% root contains both text-response and tool-0 alternatives.
+    ?assert(binary:match(G, <<"text-response">>) =/= nomatch),
+    ?assert(binary:match(G, <<"tool-0">>) =/= nomatch).
 
 required_omits_text_branch(_Cfg) ->
     Tools = [
@@ -91,9 +91,9 @@ required_omits_text_branch(_Cfg) ->
         }
     ],
     {ok, G} = erllama_server_grammar:from_tools(Tools, required),
-    %% root must not include `text_response` on its right-hand side.
+    %% root must not include `text-response` on its right-hand side.
     {RootRhs, _} = root_body(G),
-    ?assertEqual(nomatch, binary:match(RootRhs, <<"text_response">>)).
+    ?assertEqual(nomatch, binary:match(RootRhs, <<"text-response">>)).
 
 named_pins_to_tool(_Cfg) ->
     Tools = [
@@ -196,7 +196,7 @@ schema_one_of_alternation_is_parenthesised(_Cfg) ->
     },
     Bin = iolist_to_binary(erllama_server_grammar:schema_to_gbnf(Schema)),
     %% The oneOf body must start with `(` and end with `)`.
-    ?assertMatch({match, _}, re:run(Bin, <<"\\(\\s*json_string\\s*\\|\\s*json_integer\\s*\\)">>)).
+    ?assertMatch({match, _}, re:run(Bin, <<"\\(\\s*json-string\\s*\\|\\s*json-integer\\s*\\)">>)).
 
 %% End-to-end: tool with an enum field followed by another required
 %% field. The comma between fields must NOT be inside the enum

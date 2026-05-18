@@ -301,11 +301,13 @@ messages_with_many_tools_does_not_crash(Cfg) ->
     %% was torn — almost always a BEAM segfault on the server.
     ?assertMatch({ok, {{_, _, _}, _, _}}, Result),
     {ok, {{_, Status, _}, _, Resp}} = Result,
-    %% Either a real 200 inference or a clean error envelope. Both
-    %% prove the server stayed up through chat-template + grammar
-    %% + prefill. We do not assert content correctness — the model
-    %% is small and may refuse with a structured error.
-    ?assert(Status =:= 200 orelse Status >= 400),
+    %% Pre-fix this case accepted any status >= 400, which masked a
+    %% grammar-build regression (llama.cpp's GBNF parser rejecting
+    %% rule names with underscores). Tighten to: 200 (real inference)
+    %% or 4xx (client error envelope). Anything 5xx means the server
+    %% blew up on grammar / chat-template / prefill - the very paths
+    %% this case was added to regress against.
+    ?assert(Status =:= 200 orelse (Status >= 400 andalso Status < 500)),
     ?assert(byte_size(list_to_binary(Resp)) > 0).
 
 %% A synthetic Anthropic tool with a non-trivial JSON Schema so the
