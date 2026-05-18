@@ -498,6 +498,49 @@ queue `concurrency`, or higher if you expect concurrent sessions
 from the same model. Cleanly-completed turns leave the session
 pinned for the next turn; only mid-flight cancels free the seq.
 
+**Continuation path (`erllama:continue/3`)**
+
+Many chat templates render the leading turns *differently* in a
+multi-turn context (different role markers, system-prefix
+formatting). The engine's prefix-equality check on the `sticky`
+path is byte-exact; when bytes diverge, it falls back to cold
+admit and you pay full prefill per turn. To work around this,
+the server uses erllama 0.6's `continue/3` primitive: after each
+turn the engine-reported `committed_tokens` count is cached
+server-side, and the next turn's pipeline slices the rendered
+prompt at that boundary and asks the engine to prefill only the
+tail.
+
+Empirical impact (TinyLlama-1.1B, three-turn conversation with a
+stable `x-conversation-id`):
+
+| Turn | input | output | cache_read | cache_creation |
+| --- | --- | --- | --- | --- |
+| 1 | 21 | 32 | 0 | 53 |
+| 2 | 73 | 32 | 53 | 52 |
+| 3 | 125 | 32 | 105 | 52 |
+
+Every turn after the first reuses the predecessor's entire
+committed state. `cache_creation` collapses to the new tail
+plus the generated output.
+
+**Risk** — the slice is optimistic. `continue/3` doesn't verify
+the suffix; if a model's chat template re-renders prior turns
+differently, the engine prefills tokens that don't belong on
+top of the stored prefix and the model emits garbage. Stats
+report `cache_hit_kind = continuation` on this path, which
+makes the failure mode diagnosable. Operators should run the
+`multi_turn_cache_delta_profile/1` CT case against their
+production model before relying on continuation — the test
+asserts `cache_read > 0` on turn 2, which only passes when the
+chat template's render is stable across turns.
+
+```bash
+LLAMA_TEST_MODEL=/path/to/model.gguf rebar3 ct \
+  --suite=erllama_server_real_model_SUITE \
+  --case=multi_turn_cache_delta_profile
+```
+
 ### Optional API-key allowlist
 
 By default `/v1/messages` does not validate `x-api-key`, which

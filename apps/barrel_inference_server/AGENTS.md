@@ -200,6 +200,35 @@ config to **at least** the expected concurrent-session count
 default of 1 deadlocks under sticky pinning the moment a second
 session tries to admit.
 
+### Continuation path (`erllama:continue/3`, v0.6+)
+
+For chat templates whose multi-turn render diverges at the head
+from the single-turn render, the engine's prefix-equality check
+on the `sticky` path fails and the session falls back to cold
+admit. To work around this, erllama 0.6 ships `continue/3` (a
+caller-asserted variant of admission: the caller passes only
+the new suffix, the engine prefills it on top of the session's
+stored state without verification).
+
+`erllama_server_session_state` (supervised gen_server + public
+ETS, keyed on `{Model, SessionId} -> committed_tokens`) caches
+the `committed_tokens` count from each turn's `erllama_done`
+Stats. The pipeline's `accept_tokens/2` checks this state: if a
+prior count is on file, `lists:nthtail(N, NewTokens)` becomes
+the suffix passed to `erllama:continue/3` instead of running
+`infer/4` with the full token list.
+
+Failure modes:
+- `{error, no_session}` (TTL eviction, server restart, prior
+  cancel-mid-flight): pipeline clears the stale local state and
+  retries with the full token list via `infer/4`.
+- Mis-sliced suffix (chat-template re-renders prior turns
+  differently across turns): engine accepts the suffix, model
+  emits garbage tokens. `cache_hit_kind = continuation` in
+  Stats makes this diagnosable. Operators should run
+  `multi_turn_cache_delta_profile/1` against their production
+  model before relying on the continuation path.
+
 ### Test Organization
 
 - `test/erllama_server_translate_SUITE.erl`: schema translation,

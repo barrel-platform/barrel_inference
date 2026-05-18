@@ -127,6 +127,58 @@ stored tokens verbatim into the new prompt (effectively the
 verbatim-content escape already proposed for tool-call replay).
 Captured in `/Users/benoitc/Projects/erllama_anthropic_support_prompt.md`.
 
+### erllama 0.6.0: caller-asserted continuation (`continue/3`)
+
+The leverage-point ask above landed upstream as
+`erllama:continue/3`: the caller passes `(Model, SuffixTokens,
+Opts)`, the engine prefills only the suffix on top of the
+session's stored tokens without verifying the prefix. Two-PR
+integration:
+
+- Bump `rebar.config` to erllama 0.6.0. The new surface also
+  carries `cache_hit_kind = continuation` to make the call-path
+  distinguishable from engine-verified `sticky` reuse in Stats.
+- New `erllama_server_session_state` (supervised gen_server +
+  public ETS) caches `{Model, SessionId} -> committed_tokens`.
+  No disk persistence; restart drops the count and the next
+  turn falls back to a full `infer/4`.
+- Pipeline `accept_tokens/2` arms a continuation slice when a
+  prior count is on file:
+  `lists:nthtail(N, NewTokens)` becomes the suffix passed to
+  `erllama:continue/3`. First-turn / no-state requests still
+  take the `infer/4` path.
+- `{error, no_session}` from `continue/3` (TTL eviction, server
+  restart, end_session-from-cancel) clears the stale local
+  state and retries with the full token list via `infer/4`.
+- Both handlers stash `committed_tokens` from `erllama_done`
+  Stats; `maybe_end_session/1` on cancel-mid-flight clears the
+  local entry alongside the engine's.
+
+Profile against TinyLlama-1.1B with `continue/3` live:
+
+| Turn | input | output | cache_read | cache_creation |
+| --- | --- | --- | --- | --- |
+| 1 | 21 | 32 | 0 | 53 |
+| 2 | 73 | 32 | **53** | 52 |
+| 3 | 125 | 32 | **105** | 52 |
+
+Every turn after the first reuses the predecessor's entire
+committed state. `cache_creation` collapses to roughly the new
+tail plus the generated output. The
+`multi_turn_cache_delta_profile/1` CT case now asserts `Read2 > 0`
+and `Read3 > Read2` so a slicing or state regression fails the
+build.
+
+**Risk**: the slice is **optimistic** - `continue/3` does not
+verify that the suffix is the correct continuation of the
+engine's stored prefix. If a model's chat template re-renders
+prior turns differently across turns (different role-marker
+bytes), the model emits garbage tokens on the continuation path.
+The `cache_hit_kind = continuation` reported in Stats makes this
+diagnosable. TinyLlama is stable; production models need a
+per-model test against `multi_turn_cache_delta_profile/1` before
+relying on continuation.
+
 ## [0.1.0] - 2026-05-11
 
 Initial public release. OpenAI-, Anthropic-, and Ollama-compatible
