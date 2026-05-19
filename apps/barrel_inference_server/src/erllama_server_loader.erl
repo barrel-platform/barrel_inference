@@ -332,13 +332,17 @@ manifest_to_config(Manifest) ->
     NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
     Ctx = min(default_int(ParamCtx, NativeCtx), MaxCtx),
     %% n_batch sizes the per-call prefill batch the engine submits
-    %% to llama.cpp. Prefill on Metal / CUDA is batch-bound; 512
-    %% leaves a 3-4x speedup on the table for any host with a GPU.
-    %% 2048 matches llama.cpp's own current default and the larger
-    %% compute buffer is negligible on unified-memory / discrete-GPU
-    %% hosts. CPU-only operators with constrained RAM can override
-    %% per-manifest via `loader.n_batch'.
-    NBatch = default_int(maps:get(<<"n_batch">>, Loader, undefined), 2048),
+    %% to llama.cpp. The compute buffer scales with `n_layers *
+    %% n_embd * n_batch'; bigger = faster prefill, more memory.
+    %% Resolution: explicit `loader.n_batch' override > parameter-
+    %% size heuristic > 2048 fallback. The heuristic picks a value
+    %% that has been observed safe on Metal / CUDA hosts for each
+    %% rough model bracket; operators on tight CPU memory or known-
+    %% problematic models can override per-manifest.
+    NBatch = default_int(
+        maps:get(<<"n_batch">>, Loader, undefined),
+        default_n_batch(Manifest)
+    ),
     %% `n_seq_max` controls the engine's seq pool. Sticky-seq
     %% pinning (PR 28+) and the continue/3 path (PR 32) need at
     %% least 2 here to avoid admission deadlock the moment a second
@@ -523,3 +527,48 @@ default_int(undefined, Default) -> Default;
 default_int(null, Default) -> Default;
 default_int(N, _) when is_integer(N), N > 0 -> N;
 default_int(_, Default) -> Default.
+
+%% Pick a sensible `n_batch' default from the manifest's
+%% `parameter_size' label (`"7B"', `"30B"', `"70B"', `"0.5B"', ...).
+%% The compute buffer llama.cpp allocates for a prefill step scales
+%% with `n_layers * n_embd * n_batch'; larger models can OOM at
+%% 2048 on hosts that fit smaller models comfortably. Brackets are
+%% conservative numbers that have been observed safe on Metal /
+%% unified-memory hosts. Returns 2048 when the manifest lacks
+%% `parameter_size' or the label cannot be parsed - matches
+%% llama.cpp's own default and is the safe choice for anything <= 8B
+%% which is the most common case.
+default_n_batch(Manifest) ->
+    case parameter_size_billions(Manifest) of
+        undefined -> 2048;
+        N when N =< 13.0 -> 2048;
+        N when N =< 33.0 -> 1024;
+        _ -> 512
+    end.
+
+parameter_size_billions(Manifest) ->
+    case maps:get(<<"parameter_size">>, Manifest, undefined) of
+        Bin when is_binary(Bin) -> parse_billions(Bin);
+        _ -> undefined
+    end.
+
+parse_billions(Bin) ->
+    case
+        re:run(Bin, <<"^(\\d+(?:\\.\\d+)?)[BMK]?$">>, [
+            {capture, all_but_first, binary}
+        ])
+    of
+        {match, [NumBin]} ->
+            try binary_to_float(NumBin) of
+                F -> F
+            catch
+                _:_ ->
+                    try binary_to_integer(NumBin) of
+                        I -> float(I)
+                    catch
+                        _:_ -> undefined
+                    end
+            end;
+        _ ->
+            undefined
+    end.

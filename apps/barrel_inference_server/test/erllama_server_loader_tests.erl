@@ -56,8 +56,52 @@ manifest_to_config_passes_n_ctx_to_context_opts_test() ->
     %% Capped at max_context_size.
     ?assertEqual(4096, maps:get(n_ctx, CtxOpts)),
     %% n_batch falls through from the manifest's loader.n_batch when
-    %% set; defaults to 512 otherwise.
+    %% set; auto-derives from parameter_size otherwise (2048 fallback
+    %% when neither is present).
     ?assert(is_integer(maps:get(n_batch, CtxOpts))).
+
+%% Without an explicit `loader.n_batch', the loader picks a default
+%% from the manifest's `parameter_size'. Larger models get a smaller
+%% n_batch to keep the compute buffer in check.
+manifest_to_config_auto_n_batch_from_parameter_size_test_() ->
+    application:set_env(erllama_server, max_context_size, 8192),
+    [
+        {"7B  -> 2048", batch_for_size_assert(<<"7B">>, 2048)},
+        {"0.5B -> 2048", batch_for_size_assert(<<"0.5B">>, 2048)},
+        {"13B -> 2048", batch_for_size_assert(<<"13B">>, 2048)},
+        {"30B -> 1024", batch_for_size_assert(<<"30B">>, 1024)},
+        {"32B -> 1024", batch_for_size_assert(<<"32B">>, 1024)},
+        {"70B -> 512", batch_for_size_assert(<<"70B">>, 512)},
+        {"405B -> 512", batch_for_size_assert(<<"405B">>, 512)},
+        {"unknown -> 2048", batch_for_size_assert(undefined, 2048)},
+        {"garbage -> 2048", batch_for_size_assert(<<"MoE-A3B">>, 2048)}
+    ].
+
+batch_for_size_assert(Size, Expected) ->
+    fun() ->
+        Manifest = manifest_with_param_size(Size),
+        Config = erllama_server_loader:manifest_to_config(Manifest),
+        CtxOpts = maps:get(context_opts, Config),
+        ?assertEqual(Expected, maps:get(n_batch, CtxOpts))
+    end.
+
+manifest_with_param_size(undefined) ->
+    manifest(<<"sha256:0003">>, <<"q4_k_m">>, 4096, 4);
+manifest_with_param_size(Size) ->
+    (manifest(<<"sha256:0003">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"parameter_size">> => Size
+    }.
+
+%% Explicit `loader.n_batch' wins over the parameter-size heuristic.
+manifest_to_config_explicit_n_batch_overrides_size_default_test() ->
+    application:set_env(erllama_server, max_context_size, 8192),
+    Manifest = (manifest(<<"sha256:0004">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"parameter_size">> => <<"70B">>,
+        <<"loader">> => #{<<"n_batch">> => 4096, <<"quant_bits">> => 4}
+    },
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertEqual(4096, maps:get(n_batch, CtxOpts)).
 
 manifest_to_config_propagates_loader_overrides_test() ->
     application:set_env(erllama_server, max_context_size, 8192),
