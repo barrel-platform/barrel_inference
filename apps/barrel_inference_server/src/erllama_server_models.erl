@@ -306,6 +306,7 @@ read_metadata_safe(BlobPath) ->
 build_manifest(Spec, Name, Tag, BlobPath, Metadata) ->
     Quant = erllama_server_gguf:quantization(Metadata),
     Ctx = erllama_server_gguf:context_length(Metadata),
+    Tpl = erllama_server_gguf:chat_template(Metadata),
     #{
         <<"name">> => Name,
         <<"tag">> => Tag,
@@ -320,19 +321,58 @@ build_manifest(Spec, Name, Tag, BlobPath, Metadata) ->
         <<"quantization">> => or_null(Quant),
         <<"context_size">> => or_null(Ctx),
         <<"embedding_length">> => or_null(erllama_server_gguf:embedding_length(Metadata)),
-        <<"chat_template">> => or_null(erllama_server_gguf:chat_template(Metadata)),
-        <<"loader">> => loader_opts(Quant, Ctx),
+        <<"chat_template">> => or_null(Tpl),
+        <<"loader">> => loader_opts(Quant, Ctx, Tpl),
         <<"modified_at">> => iso8601_now()
     }.
 
-loader_opts(Quant, Ctx) ->
-    #{
+loader_opts(Quant, Ctx, Tpl) ->
+    Base = #{
         <<"n_gpu_layers">> => 0,
         <<"n_ctx">> => default_int(Ctx, 4096),
         <<"n_batch">> => 512,
         <<"quant_type">> => or_null(Quant),
         <<"quant_bits">> => or_null(quant_bits(Quant))
-    }.
+    },
+    case detect_tool_call_format(Tpl) of
+        undefined ->
+            Base;
+        {Name, Start, End} ->
+            Base#{
+                <<"tool_call_format">> => Name,
+                <<"tool_call_markers">> => #{
+                    <<"start">> => Start,
+                    <<"end">> => End
+                }
+            }
+    end.
+
+%% Scan the GGUF chat_template for the wire-format markers each
+%% known family uses. First hit wins (none of the four overlap in
+%% practice). Templates that match none fall through, leaving the
+%% loader without `tool_call_markers' / `tool_call_format' so the
+%% engine uses the legacy GBNF `text-response | tool-N' grammar.
+%% Mirrors Ollama's auto-detect-at-pull-time pattern.
+detect_tool_call_format(undefined) ->
+    undefined;
+detect_tool_call_format(<<>>) ->
+    undefined;
+detect_tool_call_format(Template) when is_binary(Template) ->
+    Candidates = [
+        {<<"qwen-xml">>, <<"<tool_call>">>, <<"</tool_call>">>},
+        {<<"dsml">>, <<"<｜tool▁call▁begin｜>"/utf8>>, <<"<｜tool▁call▁end｜>"/utf8>>},
+        {<<"llama-python-tag">>, <<"<|python_tag|>">>, <<"<|eom_id|>">>},
+        {<<"mistral-tool-calls">>, <<"[TOOL_CALLS]">>, <<"</s>">>}
+    ],
+    first_match_marker(Template, Candidates).
+
+first_match_marker(_, []) ->
+    undefined;
+first_match_marker(Template, [{Name, Start, End} | Rest]) ->
+    case binary:match(Template, Start) of
+        nomatch -> first_match_marker(Template, Rest);
+        _ -> {Name, Start, End}
+    end.
 
 quant_bits(undefined) -> undefined;
 quant_bits(<<"f32">>) -> 32;

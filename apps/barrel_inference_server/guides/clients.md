@@ -725,6 +725,15 @@ to override** in five situations:
 5. **Bug workarounds** — known engine bug at the default; need to
    ship a hot mitigation.
 
+The four common tool-call families (Qwen, DeepSeek, Llama-3,
+Mistral) are **auto-detected at pull time** by scanning the GGUF's
+`chat_template`. The matching `loader.tool_call_markers` and
+`loader.tool_call_format` are written into the manifest
+automatically — operators only need to set them manually for
+models the autodetector can't recognise (none currently shipped,
+but a custom GGUF with a non-standard wrapper would fall through
+to the GBNF fallback).
+
 #### Supported PARAMETER keys
 
 The loader reads these from the manifest's `parameters` sub-map,

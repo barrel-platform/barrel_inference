@@ -24,7 +24,12 @@
     delete_unknown_returns_not_found/1,
     copy_creates_alias/1,
     pull_short_name_wraps_to_ollama/1,
-    resolve_spec_for_known_schemes/1
+    resolve_spec_for_known_schemes/1,
+    pull_detects_qwen_xml_tool_call_format/1,
+    pull_detects_dsml_tool_call_format/1,
+    pull_detects_llama_python_tag_tool_call_format/1,
+    pull_detects_mistral_tool_call_format/1,
+    pull_leaves_loader_untouched_when_no_markers/1
 ]).
 
 %% GGUF value type tags (mirroring the gguf parser).
@@ -45,7 +50,12 @@ all() ->
         delete_unknown_returns_not_found,
         copy_creates_alias,
         pull_short_name_wraps_to_ollama,
-        resolve_spec_for_known_schemes
+        resolve_spec_for_known_schemes,
+        pull_detects_qwen_xml_tool_call_format,
+        pull_detects_dsml_tool_call_format,
+        pull_detects_llama_python_tag_tool_call_format,
+        pull_detects_mistral_tool_call_format,
+        pull_leaves_loader_untouched_when_no_markers
     ].
 
 init_per_suite(Config) ->
@@ -146,6 +156,55 @@ pull_short_name_wraps_to_ollama(_Config) ->
     ?assertEqual(<<"llama3">>, Name2),
     ?assertEqual(<<"8b">>, Tag2).
 
+%% Auto-detect of tool_call_markers from the chat_template at pull
+%% time. The four common families - Qwen, DeepSeek, Llama-3,
+%% Mistral - each have a distinctive marker substring; the autodetect
+%% writes the matching `tool_call_format' + `tool_call_markers' into
+%% the manifest's loader sub-map. Templates that match none leave
+%% the loader untouched so the engine falls back to the legacy GBNF
+%% grammar.
+
+pull_detects_qwen_xml_tool_call_format(Config) ->
+    Template = <<"...<tool_call>{ name, args }</tool_call>...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"qwen-fake">>),
+    ?assertEqual(<<"qwen-xml">>, maps:get(<<"tool_call_format">>, Loader)),
+    Markers = maps:get(<<"tool_call_markers">>, Loader),
+    ?assertEqual(<<"<tool_call>">>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"</tool_call>">>, maps:get(<<"end">>, Markers)).
+
+pull_detects_dsml_tool_call_format(Config) ->
+    Template = <<"...<｜tool▁call▁begin｜>{...}<｜tool▁call▁end｜>..."/utf8>>,
+    Loader = pull_loader_with_template(Config, Template, <<"dsml-fake">>),
+    ?assertEqual(<<"dsml">>, maps:get(<<"tool_call_format">>, Loader)),
+    Markers = maps:get(<<"tool_call_markers">>, Loader),
+    ?assertEqual(<<"<｜tool▁call▁begin｜>"/utf8>>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"<｜tool▁call▁end｜>"/utf8>>, maps:get(<<"end">>, Markers)).
+
+pull_detects_llama_python_tag_tool_call_format(Config) ->
+    Template = <<"... <|python_tag|>foo(bar)<|eom_id|> ...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"llama-fake">>),
+    ?assertEqual(<<"llama-python-tag">>, maps:get(<<"tool_call_format">>, Loader)),
+    Markers = maps:get(<<"tool_call_markers">>, Loader),
+    ?assertEqual(<<"<|python_tag|>">>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"<|eom_id|>">>, maps:get(<<"end">>, Markers)).
+
+pull_detects_mistral_tool_call_format(Config) ->
+    Template = <<"... [TOOL_CALLS][{...}] ...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"mistral-fake">>),
+    ?assertEqual(<<"mistral-tool-calls">>, maps:get(<<"tool_call_format">>, Loader)),
+    Markers = maps:get(<<"tool_call_markers">>, Loader),
+    ?assertEqual(<<"[TOOL_CALLS]">>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"</s>">>, maps:get(<<"end">>, Markers)).
+
+pull_leaves_loader_untouched_when_no_markers(Config) ->
+    %% Generic template that doesn't contain any known marker
+    %% substring; the loader stays free of `tool_call_*' keys so the
+    %% engine uses the GBNF fallback.
+    Template = <<"{% for x in y %}{{ x }}{% endfor %}">>,
+    Loader = pull_loader_with_template(Config, Template, <<"generic-fake">>),
+    ?assertNot(maps:is_key(<<"tool_call_format">>, Loader)),
+    ?assertNot(maps:is_key(<<"tool_call_markers">>, Loader)).
+
 resolve_spec_for_known_schemes(_Config) ->
     {ok, Spec1, N1, T1} = erllama_server_models:resolve_spec(<<"hf://Org/Repo/x.gguf">>),
     ?assertEqual(<<"hf://Org/Repo/x.gguf">>, Spec1),
@@ -172,11 +231,29 @@ pull_synthetic(Config, Name, Tag) ->
     Spec = list_to_binary("file://" ++ Blob),
     erllama_server_models:pull(Spec, #{name => Name, tag => Tag}).
 
+%% Write a fresh synthetic GGUF with a caller-supplied chat_template
+%% and pull it. Returns the `loader' sub-map for the assert sites
+%% above. Each test gets its own blob path (per Name) so different
+%% templates hash to different blob files.
+pull_loader_with_template(Config, Template, Name) ->
+    Cwd = ?config(cwd, Config),
+    BlobName = binary_to_list(Name) ++ ".gguf",
+    Path = filename:join(Cwd, BlobName),
+    ok = file:write_file(Path, synthetic_gguf(Template)),
+    Spec = list_to_binary("file://" ++ Path),
+    {ok, Manifest} = erllama_server_models:pull(
+        Spec, #{name => Name, tag => <<"latest">>}
+    ),
+    maps:get(<<"loader">>, Manifest).
+
 %% Build a synthetic GGUF v3 binary with the metadata fields the
 %% suite asserts on. Mirrors the encoders in
 %% erllama_server_gguf_tests so the registry pull pipeline sees a
 %% real GGUF without depending on a downloaded model.
 synthetic_gguf() ->
+    synthetic_gguf(<<"{% for x in y %}{{ x }}{% endfor %}">>).
+
+synthetic_gguf(Template) ->
     KVs = [
         {<<"general.architecture">>, ?T_STRING, <<"qwen2">>},
         {<<"qwen2.context_length">>, ?T_UINT32, 4096},
@@ -185,7 +262,7 @@ synthetic_gguf() ->
         {<<"general.size_label">>, ?T_STRING, <<"7B">>},
         {<<"general.use_eos">>, ?T_BOOL, true},
         {<<"general.temperature">>, ?T_FLOAT32, 0.8},
-        {<<"tokenizer.chat_template">>, ?T_STRING, <<"{% for x in y %}{{ x }}{% endfor %}">>},
+        {<<"tokenizer.chat_template">>, ?T_STRING, Template},
         {<<"tokenizer.ggml.model">>, ?T_STRING, <<"gpt2">>}
     ],
     Body = iolist_to_binary([encode_kv(K, T, V) || {K, T, V} <- KVs]),
