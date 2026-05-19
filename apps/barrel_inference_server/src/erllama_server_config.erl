@@ -80,13 +80,47 @@ set_aliases(Map) when is_map(Map) ->
 load_policy() ->
     persistent_term:get({?MODULE, load_policy}, on_demand).
 
+%% Resolution order: explicit operator override
+%% (`per_model_pool_exhausted_policy`) > the model manifest's
+%% `loader.n_seq_max` (auto-derived concurrency) > the global
+%% `pool_exhausted_policy`. Auto-derivation keeps the server's
+%% admission parallelism in lock-step with the engine's seq pool so
+%% operators do not have to align two numbers (and so the server
+%% never admits more parallel work than the engine can hold seqs
+%% for). Matches Ollama's `OLLAMA_NUM_PARALLEL` ergonomics where one
+%% number drives both layers.
 -spec pool_policy_for(binary()) -> pool_policy().
 pool_policy_for(ModelId) ->
     Per = persistent_term:get({?MODULE, per_model_pool_policy}, #{}),
     case maps:find(ModelId, Per) of
-        {ok, P} -> P;
-        error -> persistent_term:get({?MODULE, pool_policy})
+        {ok, P} ->
+            P;
+        error ->
+            Global = persistent_term:get({?MODULE, pool_policy}),
+            case manifest_n_seq_max(ModelId) of
+                undefined -> Global;
+                N -> override_concurrency(Global, N)
+            end
     end.
+
+manifest_n_seq_max(ModelId) ->
+    try erllama_server_models:get(ModelId) of
+        {ok, M} when is_map(M) ->
+            Loader = maps:get(<<"loader">>, M, #{}),
+            case maps:get(<<"n_seq_max">>, Loader, undefined) of
+                N when is_integer(N), N > 0 -> N;
+                _ -> undefined
+            end;
+        _ ->
+            undefined
+    catch
+        _:_ -> undefined
+    end.
+
+override_concurrency({queue, Opts}, N) when is_map(Opts) ->
+    {queue, Opts#{concurrency => N}};
+override_concurrency(Other, _) ->
+    Other.
 
 -spec max_request_body_bytes() -> pos_integer().
 max_request_body_bytes() ->
