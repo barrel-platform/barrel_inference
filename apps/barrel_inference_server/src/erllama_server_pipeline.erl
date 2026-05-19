@@ -257,23 +257,27 @@ apply_chat_template_with_truncate(W, System, Tools, Messages) ->
     end.
 
 render_template(W, System, Tools, Messages) ->
+    ModelId = model_id(W),
     Req = #{messages => Messages, system => System, tools => Tools},
-    try erllama:apply_chat_template(model_id(W), Req) of
-        {ok, Tokens} -> {ok, Tokens};
-        {error, no_template} -> {error, 501, no_chat_template};
-        {error, not_supported} -> {error, 501, chat_template_not_supported};
-        {error, Reason} -> {error, 400, Reason}
-    catch
-        exit:{noproc, {erllama_model, not_found, _}} ->
-            {error, 503, not_loaded};
-        Class:Why:Stack ->
-            log_erllama_crash(model_id(W), apply_chat_template, Class, Why, Stack),
-            {error, 500, model_crashed}
+    Call = fun() -> erllama:apply_chat_template(ModelId, Req) end,
+    case call_engine(Call, ModelId, apply_chat_template) of
+        {ok, {ok, Tokens}} ->
+            {ok, Tokens};
+        {ok, {error, no_template}} ->
+            {error, 501, no_chat_template};
+        {ok, {error, not_supported}} ->
+            {error, 501, chat_template_not_supported};
+        {ok, {error, Reason}} ->
+            {error, 400, Reason};
+        {error, _, _} = E ->
+            E
     end.
 
 tokenise_raw(W, Prompt) ->
-    try erllama:tokenize(model_id(W), Prompt) of
-        {ok, Tokens} ->
+    ModelId = model_id(W),
+    Call = fun() -> erllama:tokenize(ModelId, Prompt) end,
+    case call_engine(Call, ModelId, tokenize) of
+        {ok, {ok, Tokens}} ->
             case fits_context(W, length(Tokens)) of
                 ok ->
                     accept_tokens(W, Tokens);
@@ -282,15 +286,51 @@ tokenise_raw(W, Prompt) ->
                 {overflow, Ctx} ->
                     {error, 400, {context_overflow, length(Tokens), Ctx}}
             end;
-        {error, Reason} ->
-            {error, 400, Reason}
-    catch
-        exit:{noproc, {erllama_model, not_found, _}} ->
-            {error, 503, not_loaded};
-        Class:Why:Stack ->
-            log_erllama_crash(model_id(W), tokenize, Class, Why, Stack),
-            {error, 500, model_crashed}
+        {ok, {error, Reason}} ->
+            {error, 400, Reason};
+        {error, _, _} = E ->
+            E
     end.
+
+%% Wrap a blocking engine call (gen_statem:call to erllama_model,
+%% which uses `infinity' internally) in a bounded timeout. If the
+%% engine wedges inside the NIF (silent llama_decode failure, KV
+%% corruption, ...), the caller would otherwise hang forever and
+%% Claude Code's 5 min client cap would close the socket with no
+%% status logged. With a bounded timeout the handler emits a clean
+%% 504 `engine_unresponsive' in seconds and the connection is freed
+%% for the next request. The worker process is left running because
+%% killing the caller of an in-flight gen_statem:call doesn't abort
+%% the engine's work; once the engine eventually responds, the
+%% orphan exits naturally.
+call_engine(Fun, ModelId, Op) ->
+    Self = self(),
+    Tag = make_ref(),
+    _Worker = spawn(fun() ->
+        Result =
+            try Fun() of
+                R -> {ok, R}
+            catch
+                exit:{noproc, {erllama_model, not_found, _}} ->
+                    {error, 503, not_loaded};
+                Class:Why:Stack ->
+                    log_erllama_crash(ModelId, Op, Class, Why, Stack),
+                    {error, 500, model_crashed}
+            end,
+        Self ! {Tag, Result}
+    end),
+    receive
+        {Tag, R} -> R
+    after engine_call_timeout_ms() ->
+        logger:warning(
+            "erllama_server: engine call timed out: model=~ts op=~p",
+            [ModelId, Op]
+        ),
+        {error, 504, engine_unresponsive}
+    end.
+
+engine_call_timeout_ms() ->
+    application:get_env(erllama_server, engine_call_timeout_ms, 30000).
 
 accept_tokens(W, Tokens) ->
     W1 = put_tokens(W, Tokens),
@@ -397,10 +437,11 @@ step_queue(W) ->
 
 step_infer(W) ->
     Params = build_params(W#work.request),
-    try do_infer(W, Params) of
-        {ok, Ref} ->
+    Call = fun() -> do_infer(W, Params) end,
+    case call_engine(Call, model_id(W), infer) of
+        {ok, {ok, Ref}} ->
             {ok, W#work{infer_ref = Ref}};
-        {error, busy} ->
+        {ok, {error, busy}} ->
             erllama_server_metrics:inc_pool_exhausted(model_id(W)),
             {error, 429, busy};
         %% erllama 0.5.0: two concurrent admits on the same session_id
@@ -408,16 +449,12 @@ step_infer(W) ->
         %% retryable 503; the Anthropic handler further remaps 503 to
         %% 529 with a retry-after header that SDKs honour as the next
         %% backoff delay.
-        {error, sticky_busy} ->
+        {ok, {error, sticky_busy}} ->
             {error, 503, sticky_busy};
-        {error, Reason} ->
-            {error, 500, Reason}
-    catch
-        exit:{noproc, {erllama_model, not_found, _}} ->
-            {error, 503, not_loaded};
-        Class:Why:Stack ->
-            log_erllama_crash(model_id(W), infer, Class, Why, Stack),
-            {error, 500, model_crashed}
+        {ok, {error, Reason}} ->
+            {error, 500, Reason};
+        {error, _, _} = E ->
+            E
     end.
 
 %% Try `continue/3' when the work record carries a suffix; fall
