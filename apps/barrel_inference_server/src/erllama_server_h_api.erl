@@ -37,6 +37,8 @@ init(Req0, #{op := delete} = Opts) ->
     expect(<<"DELETE">>, Req0, Opts, fun handle_delete/2);
 init(Req0, #{op := copy} = Opts) ->
     expect(<<"POST">>, Req0, Opts, fun handle_copy/2);
+init(Req0, #{op := edit} = Opts) ->
+    expect(<<"POST">>, Req0, Opts, fun handle_edit/2);
 init(Req0, #{op := create} = Opts) ->
     expect(<<"POST">>, Req0, Opts, fun handle_create/2);
 init(Req0, #{op := pull} = Opts) ->
@@ -271,6 +273,44 @@ handle_copy(Req0, Opts) ->
             end;
         {ok, _, Req1} ->
             reply(Req1, Opts, 400, error_body(<<"missing source/destination">>));
+        {error, Req1, Status} ->
+            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
+    end.
+
+%% =============================================================================
+%% POST /api/edit
+%% =============================================================================
+%%
+%% Body: `{"name": "model:tag", "parameters": {"num_batch": 512, ...}}'.
+%%
+%% Merges the supplied PARAMETER values into the manifest's
+%% `parameters' sub-map and persists atomically. Keys not in the
+%% request body stay intact; keys in the body overwrite. Returns
+%% the updated manifest in the same envelope as `/api/show'.
+%%
+%% The loaded model (if any) keeps running with its current
+%% `context_opts'; the new values take effect on the next admit
+%% after the model unloads (via `keep_alive' expiry or a
+%% `keep_alive: 0' request). The loader honours `parameters.num_X'
+%% over `loader.n_X' on the next load.
+
+handle_edit(Req0, Opts) ->
+    case read_json(Req0) of
+        {ok, #{<<"name">> := Name, <<"parameters">> := Params}, Req1} when
+            is_map(Params)
+        ->
+            case erllama_server_models:edit(Name, Params) of
+                {ok, Updated} ->
+                    reply(Req1, Opts, 200, show_body(Updated));
+                {error, not_found} ->
+                    reply(Req1, Opts, 404, error_body(<<"model_not_found">>));
+                {error, bad_parameters} ->
+                    reply(Req1, Opts, 400, error_body(<<"bad_parameters">>));
+                {error, Reason} ->
+                    reply(Req1, Opts, 500, error_body(reason_string(Reason)))
+            end;
+        {ok, _, Req1} ->
+            reply(Req1, Opts, 400, error_body(<<"missing name/parameters">>));
         {error, Req1, Status} ->
             reply(Req1, Opts, Status, error_body(<<"bad_request">>))
     end.

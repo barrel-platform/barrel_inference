@@ -103,6 +103,33 @@ manifest_to_config_explicit_n_batch_overrides_size_default_test() ->
     CtxOpts = maps:get(context_opts, Config),
     ?assertEqual(4096, maps:get(n_batch, CtxOpts)).
 
+%% `parameters.num_batch' (set via /api/edit) wins over both
+%% `loader.n_batch' and the parameter_size heuristic. Mirrors how
+%% Ollama's `PARAMETER num_X' overrides loader-derived values for
+%% num_ctx today.
+manifest_to_config_parameters_num_batch_overrides_loader_test() ->
+    application:set_env(erllama_server, max_context_size, 8192),
+    Manifest = (manifest(<<"sha256:0010">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"parameter_size">> => <<"7B">>,
+        <<"loader">> => #{<<"n_batch">> => 1024, <<"quant_bits">> => 4},
+        <<"parameters">> => #{<<"num_batch">> => 256}
+    },
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertEqual(256, maps:get(n_batch, CtxOpts)).
+
+%% `parameters.num_seq_max' (set via /api/edit) wins over
+%% `loader.n_seq_max'.
+manifest_to_config_parameters_num_seq_max_overrides_loader_test() ->
+    application:set_env(erllama_server, max_context_size, 8192),
+    Manifest = (manifest(<<"sha256:0011">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{<<"n_seq_max">> => 4, <<"quant_bits">> => 4},
+        <<"parameters">> => #{<<"num_seq_max">> => 2}
+    },
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertEqual(2, maps:get(n_seq_max, CtxOpts)).
+
 manifest_to_config_propagates_loader_overrides_test() ->
     application:set_env(erllama_server, max_context_size, 8192),
     Manifest = (manifest(<<"sha256:0002">>, <<"q4_k_m">>, 8192, 4))#{

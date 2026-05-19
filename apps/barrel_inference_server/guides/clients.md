@@ -695,6 +695,109 @@ Requests with `x-api-key` not in the list get
 `401 authentication_error` in the standard Anthropic envelope.
 Leave empty (default) for trusted local use.
 
+### Tuning a loaded model
+
+The model manifest written by `pull` carries the loader settings
+(`n_ctx`, `n_batch`, `n_seq_max`, ...). Most of these are
+auto-derived:
+
+- `n_batch` falls out of the manifest's `parameter_size`
+  (≤13 B → 2048, ≤33 B → 1024, > 33 B → 512). Larger models get a
+  smaller compute buffer to keep memory bounded.
+- `n_seq_max` flows into the per-model queue concurrency so the
+  server's admission parallelism stays in lock-step with the
+  engine's seq pool — operators don't have to align two numbers.
+- `n_ctx` is whatever the GGUF advertises, clamped by the global
+  `max_context_size` (default 32 KiB in `config/sys.config`).
+
+Default behaviour is what almost everyone wants. **You only need
+to override** in five situations:
+
+1. **Hardware / driver quirks** — a Metal or CUDA release hits
+   `decode_failed` at the heuristic-picked `n_batch`. Drop it
+   without re-pulling 4 GB of weights.
+2. **Non-standard quantisations** — third-party quants don't fit
+   the `parameter_size` brackets cleanly.
+3. **Experimentation** — sweeping `n_batch` / `n_ctx` to find the
+   throughput / latency knee on a given host.
+4. **Constrained hardware** — on a low-RAM box, even a 7 B model
+   may want a smaller compute buffer than the heuristic picks.
+5. **Bug workarounds** — known engine bug at the default; need to
+   ship a hot mitigation.
+
+#### Supported PARAMETER keys
+
+The loader reads these from the manifest's `parameters` sub-map,
+with Ollama-convention `num_*` names on the wire mapping to `n_*`
+on the loader:
+
+| Wire key | Loader field | Notes |
+|---|---|---|
+| `num_ctx` | `n_ctx` | Capped by `max_context_size`. |
+| `num_batch` | `n_batch` | Overrides the `parameter_size` heuristic. |
+| `num_seq_max` | `n_seq_max` | Pinned per-model parallelism. |
+| `n_gpu_layers` | `n_gpu_layers` | `0` means "let llama.cpp pick" — same as unset. |
+| `main_gpu` | `main_gpu` | Multi-GPU host selector. |
+| `use_mmap` | `use_mmap` | `true` / `false`. |
+| `use_mlock` | `use_mlock` | `true` / `false`. |
+
+`parameters.X` always wins over `loader.X` in the manifest and
+over any heuristic default.
+
+#### In-place edit via `/api/edit`
+
+Drop `n_batch` on an already-pulled model without re-downloading:
+
+```bash
+curl -sX POST http://127.0.0.1:8080/api/edit \
+  -H 'content-type: application/json' \
+  -d '{"name":"local-coder:main","parameters":{"num_batch":512}}'
+```
+
+The response is the same shape as `/api/show` so callers can
+confirm the applied state. The merge is shallow — keys not in the
+request body stay; keys in the body overwrite. The write is atomic
+(temp file + rename).
+
+#### Creating a tuned copy via `/api/create`
+
+When you want an A/B variant rather than mutating the original,
+write a Modelfile that points back at the pulled blob and `create`
+under a new tag:
+
+```
+# Modelfile
+FROM local-coder:main
+PARAMETER num_batch 512
+PARAMETER num_ctx 16384
+```
+
+```bash
+curl -sX POST http://127.0.0.1:8080/api/create \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"local-coder:slow\",\"modelfile\":$(jq -Rsa < Modelfile)}"
+```
+
+You now have two models — original and tuned — sharing the same
+GGUF blob on disk.
+
+#### When the changes take effect
+
+The loaded model (if any) keeps running with its current
+`context_opts`. The new values land on the **next admit after the
+model unloads** — either via `keep_alive` expiry (default 1 h in
+`config/sys.config`) or by sending one request with
+`"keep_alive": 0` which evicts the model immediately:
+
+```bash
+# Force eviction.
+curl -sX POST http://127.0.0.1:8080/api/generate \
+  -H 'content-type: application/json' \
+  -d '{"model":"local-coder:main","prompt":"","keep_alive":0}'
+
+# Next request reloads with the new parameters.
+```
+
 ### Big requests and the 256 MiB ceiling
 
 Anthropic's documented developer-API cap is 32 MB, but Claude

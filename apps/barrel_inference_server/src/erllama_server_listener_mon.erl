@@ -126,6 +126,7 @@ routes() ->
             {"/api/show", erllama_server_h_api, #{op => show}},
             {"/api/delete", erllama_server_h_api, #{op => delete}},
             {"/api/copy", erllama_server_h_api, #{op => copy}},
+            {"/api/edit", erllama_server_h_api, #{op => edit}},
             {"/api/create", erllama_server_h_api, #{op => create}},
             {"/api/search", erllama_server_h_api, #{op => search}},
             {"/api/generate", erllama_server_h_ollama, #{op => generate}},

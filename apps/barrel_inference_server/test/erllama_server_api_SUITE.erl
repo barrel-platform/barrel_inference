@@ -26,7 +26,10 @@
     create_with_parameter_directive/1,
     create_with_system_directive/1,
     create_with_template_directive/1,
-    create_unsupported_adapter_returns_400/1
+    create_unsupported_adapter_returns_400/1,
+    edit_merges_parameters_in_place/1,
+    edit_unknown_model_returns_404/1,
+    edit_rejects_bad_parameter_value/1
 ]).
 
 %% GGUF tags.
@@ -53,7 +56,10 @@ all() ->
         create_with_parameter_directive,
         create_with_system_directive,
         create_with_template_directive,
-        create_unsupported_adapter_returns_400
+        create_unsupported_adapter_returns_400,
+        edit_merges_parameters_in_place,
+        edit_unknown_model_returns_404,
+        edit_rejects_bad_parameter_value
     ].
 
 %% =============================================================================
@@ -333,6 +339,47 @@ create_unsupported_adapter_returns_400(Cfg) ->
     {ok, {{_, 400, _}, _, Resp}} = post_json(Cfg, "/api/create", Body),
     Decoded = json:decode(list_to_binary(Resp)),
     ?assert(binary:match(maps:get(<<"error">>, Decoded), <<"ADAPTER">>) =/= nomatch).
+
+%% /api/edit merges the supplied parameters into the manifest's
+%% `parameters' sub-map. Keys not in the request body stay intact;
+%% keys in the body overwrite. Returns the updated manifest.
+edit_merges_parameters_in_place(Cfg) ->
+    {ok, _} = pull_for(<<"editable">>, <<"latest">>, Cfg),
+    %% Seed an initial num_ctx so we can assert it survives the
+    %% subsequent partial edit.
+    Seed = json:encode(#{
+        <<"name">> => <<"editable:latest">>,
+        <<"parameters">> => #{<<"num_ctx">> => 8192}
+    }),
+    {ok, {{_, 200, _}, _, _}} = post_json(Cfg, "/api/edit", Seed),
+    %% Now edit only num_batch.
+    Body = json:encode(#{
+        <<"name">> => <<"editable:latest">>,
+        <<"parameters">> => #{<<"num_batch">> => 256}
+    }),
+    {ok, {{_, 200, _}, _, _}} = post_json(Cfg, "/api/edit", Body),
+    {ok, M} = erllama_server_models:get(<<"editable:latest">>),
+    Params = maps:get(<<"parameters">>, M),
+    ?assertEqual(256, maps:get(<<"num_batch">>, Params)),
+    %% num_ctx from the seed edit survives the second partial edit.
+    ?assertEqual(8192, maps:get(<<"num_ctx">>, Params)).
+
+edit_unknown_model_returns_404(Cfg) ->
+    Body = json:encode(#{
+        <<"name">> => <<"does-not-exist:latest">>,
+        <<"parameters">> => #{<<"num_batch">> => 256}
+    }),
+    {ok, {{_, 404, _}, _, _}} = post_json(Cfg, "/api/edit", Body).
+
+%% Maps / lists / atoms in parameter values are rejected. Anything
+%% that wouldn't survive a Modelfile PARAMETER round-trip is 400.
+edit_rejects_bad_parameter_value(Cfg) ->
+    {ok, _} = pull_for(<<"strict">>, <<"latest">>, Cfg),
+    Body = json:encode(#{
+        <<"name">> => <<"strict:latest">>,
+        <<"parameters">> => #{<<"num_batch">> => [1, 2, 3]}
+    }),
+    {ok, {{_, 400, _}, _, _}} = post_json(Cfg, "/api/edit", Body).
 
 %% =============================================================================
 %% Helpers

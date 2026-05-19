@@ -334,21 +334,32 @@ manifest_to_config(Manifest) ->
     %% n_batch sizes the per-call prefill batch the engine submits
     %% to llama.cpp. The compute buffer scales with `n_layers *
     %% n_embd * n_batch'; bigger = faster prefill, more memory.
-    %% Resolution: explicit `loader.n_batch' override > parameter-
-    %% size heuristic > 2048 fallback. The heuristic picks a value
-    %% that has been observed safe on Metal / CUDA hosts for each
-    %% rough model bracket; operators on tight CPU memory or known-
-    %% problematic models can override per-manifest.
+    %% Resolution: `parameters.num_batch' (operator override via
+    %% /api/edit) > `loader.n_batch' (as-pulled) > parameter-size
+    %% heuristic > 2048 fallback. Ollama-style `num_X' on the wire,
+    %% `n_X' on the loader, matches the existing `num_ctx -> n_ctx'
+    %% mapping at line 331.
     NBatch = default_int(
-        maps:get(<<"n_batch">>, Loader, undefined),
-        default_n_batch(Manifest)
+        maps:get(<<"num_batch">>, Params, undefined),
+        default_int(
+            maps:get(<<"n_batch">>, Loader, undefined),
+            default_n_batch(Manifest)
+        )
     ),
     %% `n_seq_max` controls the engine's seq pool. Sticky-seq
     %% pinning (PR 28+) and the continue/3 path (PR 32) need at
     %% least 2 here to avoid admission deadlock the moment a second
-    %% session arrives; documented in guides/clients.md. Manifest
-    %% override path lives on `loader.n_seq_max`.
-    NSeqMax = pos_int(maps:get(<<"n_seq_max">>, Loader, undefined)),
+    %% session arrives; documented in guides/clients.md. Resolution
+    %% mirrors n_batch: `parameters.num_seq_max' > `loader.n_seq_max'
+    %% > engine default (1). When undefined the loader leaves the
+    %% key off `context_opts' and the engine picks its own default.
+    NSeqMax = pos_int(
+        maps:get(
+            <<"num_seq_max">>,
+            Params,
+            maps:get(<<"n_seq_max">>, Loader, undefined)
+        )
+    ),
     %% erllama_model_llama reads `context_opts` (forwarded to
     %% erllama_nif:new_context/2) and `model_opts` (forwarded to
     %% erllama_nif:load_model/2). Without these the NIF falls back to

@@ -37,6 +37,7 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
     show/1,
     pull/1,
     pull/2,
+    edit/2,
     delete/1,
     copy/2,
     resolve_spec/1,
@@ -99,6 +100,54 @@ pull(SpecOrName, Opts) when is_map(Opts) ->
         {error, _} = E ->
             E
     end.
+
+%% Merge `Overrides' (a flat map of `binary() => json_scalar()')
+%% into the manifest's `parameters' sub-map and persist atomically.
+%% Existing keys not mentioned in `Overrides' stay intact;
+%% mentioned keys are overwritten. The loaded model (if any) keeps
+%% running with its current context_opts; the new values take
+%% effect on the next admit after the model unloads. See
+%% `guides/clients.md' for the operator-facing flow.
+-spec edit(name_or_tag(), map()) ->
+    {ok, manifest()} | {error, not_found | bad_parameters | term()}.
+edit(NameOrTag, Overrides) when is_map(Overrides) ->
+    case validate_parameters(Overrides) of
+        ok ->
+            {Name, Tag} = split_name_tag(NameOrTag),
+            {ok, Root} = cache_root(),
+            case erllama_server_models_store:read(Root, Name, Tag) of
+                {ok, Manifest} ->
+                    Existing = maps:get(<<"parameters">>, Manifest, #{}),
+                    Merged = maps:merge(Existing, Overrides),
+                    Updated = Manifest#{<<"parameters">> => Merged},
+                    case erllama_server_models_store:write(Root, Updated) of
+                        ok -> {ok, Updated};
+                        {error, _} = E -> E
+                    end;
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end;
+edit(_, _) ->
+    {error, bad_parameters}.
+
+%% Reject lists, nested maps, atoms, anything that wouldn't
+%% round-trip as a Modelfile PARAMETER value.
+validate_parameters(Overrides) ->
+    case maps:fold(fun validate_param/3, ok, Overrides) of
+        ok -> ok;
+        {error, _} = E -> E
+    end.
+
+validate_param(_, _, {error, _} = E) ->
+    E;
+validate_param(K, _, _) when not is_binary(K) -> {error, bad_parameters};
+validate_param(_, V, ok) when is_integer(V); is_float(V); is_binary(V); is_boolean(V) ->
+    ok;
+validate_param(_, _, _) ->
+    {error, bad_parameters}.
 
 -spec delete(name_or_tag()) -> ok | {error, not_found | term()}.
 delete(NameOrTag) ->
