@@ -334,18 +334,29 @@ loader_opts(Quant, Ctx, Tpl) ->
         <<"quant_type">> => or_null(Quant),
         <<"quant_bits">> => or_null(quant_bits(Quant))
     },
-    case detect_tool_call_format(Tpl) of
-        undefined ->
-            Base;
-        {Name, Start, End} ->
-            Base#{
-                <<"tool_call_format">> => Name,
-                <<"tool_call_markers">> => #{
-                    <<"start">> => Start,
-                    <<"end">> => End
-                }
-            }
-    end.
+    Base1 = maybe_merge_tool_call(Base, detect_tool_call_format(Tpl)),
+    maybe_merge_thinking(Base1, detect_thinking_markers(Tpl)).
+
+maybe_merge_tool_call(Base, undefined) ->
+    Base;
+maybe_merge_tool_call(Base, {Name, Start, End}) ->
+    Base#{
+        <<"tool_call_format">> => Name,
+        <<"tool_call_markers">> => #{
+            <<"start">> => Start,
+            <<"end">> => End
+        }
+    }.
+
+maybe_merge_thinking(Base, undefined) ->
+    Base;
+maybe_merge_thinking(Base, {Start, End}) ->
+    Base#{
+        <<"thinking_markers">> => #{
+            <<"start">> => Start,
+            <<"end">> => End
+        }
+    }.
 
 %% Scan the GGUF chat_template for the wire-format markers each
 %% known family uses. First hit wins (none of the four overlap in
@@ -372,6 +383,33 @@ first_match_marker(Template, [{Name, Start, End} | Rest]) ->
     case binary:match(Template, Start) of
         nomatch -> first_match_marker(Template, Rest);
         _ -> {Name, Start, End}
+    end.
+
+%% Scan the chat_template for known reasoning-block delimiters.
+%% Two families ship today: `<think>...</think>' (Qwen3, QwQ,
+%% DeepSeek-R1 lineage) and `<thinking>...</thinking>' (Claude-
+%% distilled lookalikes). Templates that contain neither fall
+%% through; the engine then treats reasoning text as regular
+%% output. `<think>' is not a substring of `<thinking>' (next byte
+%% after `<think' is `i', not `>') so order only matters for
+%% templates that contain BOTH tags - none in practice.
+detect_thinking_markers(undefined) ->
+    undefined;
+detect_thinking_markers(<<>>) ->
+    undefined;
+detect_thinking_markers(Template) when is_binary(Template) ->
+    Candidates = [
+        {<<"<think>">>, <<"</think>">>},
+        {<<"<thinking>">>, <<"</thinking>">>}
+    ],
+    first_match_thinking(Template, Candidates).
+
+first_match_thinking(_, []) ->
+    undefined;
+first_match_thinking(Template, [{Start, End} | Rest]) ->
+    case binary:match(Template, Start) of
+        nomatch -> first_match_thinking(Template, Rest);
+        _ -> {Start, End}
     end.
 
 quant_bits(undefined) -> undefined;

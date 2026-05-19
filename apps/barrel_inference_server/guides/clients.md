@@ -732,7 +732,13 @@ Mistral) are **auto-detected at pull time** by scanning the GGUF's
 automatically — operators only need to set them manually for
 models the autodetector can't recognise (none currently shipped,
 but a custom GGUF with a non-standard wrapper would fall through
-to the GBNF fallback).
+to the GBNF fallback). The same scan also picks up reasoning
+delimiters and writes `loader.thinking_markers` when the template
+contains `<think>` / `</think>` (Qwen3, QwQ, DeepSeek-R1) or
+`<thinking>` / `</thinking>` (Claude-distilled lookalikes), so the
+engine streams reasoning tokens as separate Anthropic
+`thinking_delta` SSE frames instead of leaking them into the
+visible answer.
 
 #### Supported PARAMETER keys
 

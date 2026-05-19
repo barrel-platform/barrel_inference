@@ -29,7 +29,10 @@
     pull_detects_dsml_tool_call_format/1,
     pull_detects_llama_python_tag_tool_call_format/1,
     pull_detects_mistral_tool_call_format/1,
-    pull_leaves_loader_untouched_when_no_markers/1
+    pull_leaves_loader_untouched_when_no_markers/1,
+    pull_detects_think_tag_thinking_markers/1,
+    pull_detects_thinking_tag_thinking_markers/1,
+    pull_leaves_thinking_markers_unset_when_no_tags/1
 ]).
 
 %% GGUF value type tags (mirroring the gguf parser).
@@ -55,7 +58,10 @@ all() ->
         pull_detects_dsml_tool_call_format,
         pull_detects_llama_python_tag_tool_call_format,
         pull_detects_mistral_tool_call_format,
-        pull_leaves_loader_untouched_when_no_markers
+        pull_leaves_loader_untouched_when_no_markers,
+        pull_detects_think_tag_thinking_markers,
+        pull_detects_thinking_tag_thinking_markers,
+        pull_leaves_thinking_markers_unset_when_no_tags
     ].
 
 init_per_suite(Config) ->
@@ -204,6 +210,35 @@ pull_leaves_loader_untouched_when_no_markers(Config) ->
     Loader = pull_loader_with_template(Config, Template, <<"generic-fake">>),
     ?assertNot(maps:is_key(<<"tool_call_format">>, Loader)),
     ?assertNot(maps:is_key(<<"tool_call_markers">>, Loader)).
+
+%% Auto-detect of `thinking_markers' from the chat_template at pull
+%% time. Two families: `<think>' (Qwen3 / QwQ / DeepSeek-R1 lineage)
+%% and `<thinking>' (Claude-distilled lookalikes). With markers
+%% set, the engine routes reasoning tokens to dedicated
+%% erllama_reasoning_token messages instead of leaking them into
+%% the visible content block.
+
+pull_detects_think_tag_thinking_markers(Config) ->
+    Template = <<"...<think>{ chain of thought }</think>...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"qwen3-fake">>),
+    Markers = maps:get(<<"thinking_markers">>, Loader),
+    ?assertEqual(<<"<think>">>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"</think>">>, maps:get(<<"end">>, Markers)).
+
+pull_detects_thinking_tag_thinking_markers(Config) ->
+    Template = <<"...<thinking>{ chain of thought }</thinking>...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"claude-fake">>),
+    Markers = maps:get(<<"thinking_markers">>, Loader),
+    ?assertEqual(<<"<thinking>">>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"</thinking>">>, maps:get(<<"end">>, Markers)).
+
+pull_leaves_thinking_markers_unset_when_no_tags(Config) ->
+    %% Generic template with no thinking tag; the loader stays free
+    %% of `thinking_markers' so the engine treats reasoning text
+    %% (if any) as regular output.
+    Template = <<"{% for x in y %}{{ x }}{% endfor %}">>,
+    Loader = pull_loader_with_template(Config, Template, <<"generic-think-fake">>),
+    ?assertNot(maps:is_key(<<"thinking_markers">>, Loader)).
 
 resolve_spec_for_known_schemes(_Config) ->
     {ok, Spec1, N1, T1} = erllama_server_models:resolve_spec(<<"hf://Org/Repo/x.gguf">>),
