@@ -268,9 +268,18 @@ ensure_loaded(ModelId) when is_binary(ModelId) ->
 %% A `ready` fast-check shortcut delivers the `done` message
 %% immediately; the caller's receive loop sees the same shape either
 %% way.
+%% Use `infinity' on the wrapping gen_server:call: the actual
+%% load deadline is enforced by the caller's `wait_for_load' loop
+%% (see `erllama_server_pipeline:wait_for_load/3'). The call itself
+%% only registers a subscriber on the loader; the engine's
+%% `model_info' lookup inside `fast_check/1' can block briefly the
+%% first time after a daemon restart while the engine gen_statem is
+%% being registered, which used to blow the default 5s timeout and
+%% surface as `status: 0' on the first one or two requests after
+%% boot.
 -spec ensure_loaded_async(binary(), pid(), integer()) -> ok | {error, atom()}.
 ensure_loaded_async(ModelId, Caller, _Deadline) when is_binary(ModelId), is_pid(Caller) ->
-    gen_server:call(?MODULE, {ensure_loaded_async, ModelId, Caller}).
+    gen_server:call(?MODULE, {ensure_loaded_async, ModelId, Caller}, infinity).
 
 %%====================================================================
 %% gen_server
