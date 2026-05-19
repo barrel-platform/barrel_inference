@@ -399,7 +399,7 @@ stream_post(URL, Body) ->
 stream_recv_ndjson(RequestId) ->
     receive
         {http, {RequestId, stream_start, _Headers}} ->
-            stream_recv_ndjson(RequestId, <<>>);
+            stream_recv_ndjson(RequestId, <<>>, progress_state());
         {http, {RequestId, {error, Reason}}} ->
             {error, Reason};
         {http, {RequestId, {{_, Code, _}, _, Body}}} when Code >= 400 ->
@@ -412,48 +412,129 @@ stream_recv_ndjson(RequestId) ->
         {error, timeout}
     end.
 
-stream_recv_ndjson(RequestId, Buf) ->
+stream_recv_ndjson(RequestId, Buf, State) ->
     receive
         {http, {RequestId, stream, Chunk}} ->
-            Buf1 = print_ndjson_lines(<<Buf/binary, Chunk/binary>>),
-            stream_recv_ndjson(RequestId, Buf1);
+            {Buf1, State1} = print_ndjson_lines(<<Buf/binary, Chunk/binary>>, State),
+            stream_recv_ndjson(RequestId, Buf1, State1);
         {http, {RequestId, stream_end, _}} ->
-            _ = print_ndjson_lines(<<Buf/binary, "\n">>),
+            {_, State1} = print_ndjson_lines(<<Buf/binary, "\n">>, State),
+            _ = finalize_progress(State1),
             ok;
         {http, {RequestId, {error, Reason}}} ->
+            _ = finalize_progress(State),
             {error, Reason}
     after 600000 ->
+        _ = finalize_progress(State),
         {error, timeout}
     end.
 
-print_ndjson_lines(Buf) ->
+print_ndjson_lines(Buf, State) ->
     case binary:split(Buf, <<"\n">>) of
         [Last] ->
-            Last;
+            {Last, State};
         [Line, Rest] ->
-            print_status_line(Line),
-            print_ndjson_lines(Rest)
+            State1 = print_status_line(Line, State),
+            print_ndjson_lines(Rest, State1)
     end.
 
-print_status_line(<<>>) ->
-    ok;
-print_status_line(Line) ->
-    try json:decode(Line) of
-        #{<<"status">> := <<"success">>} ->
-            io:put_chars("success\n");
-        #{<<"status">> := S, <<"completed">> := C, <<"total">> := T} when is_integer(T) ->
-            io:put_chars(
-                io_lib:format("~ts  ~B / ~B~n", [S, C, T])
-            );
-        #{<<"status">> := S} ->
-            io:put_chars(io_lib:format("~ts~n", [S]));
-        #{<<"error">> := E} ->
-            io:put_chars(io_lib:format("error: ~ts~n", [E]));
-        Other ->
-            io:put_chars(io_lib:format("~p~n", [Other]))
-    catch
-        _:_ -> io:put_chars([Line, "\n"])
+%% State threaded across NDJSON events so a stream of progress
+%% updates on the same `status' overwrites a single line via `\r'
+%% (TTY) instead of scrolling N lines. On a status change the
+%% previous line is finalised with `\n' and a fresh in-place line
+%% starts. In non-TTY mode (pipe / CI / logs) we keep the old
+%% line-per-update output so the stream stays parseable.
+progress_state() ->
+    #{last_status => undefined, on_progress_line => false, tty => is_tty()}.
+
+is_tty() ->
+    case io:columns() of
+        {ok, _} -> true;
+        _ -> false
     end.
+
+print_status_line(<<>>, State) ->
+    State;
+print_status_line(Line, State) ->
+    try json:decode(Line) of
+        Decoded -> render_event(Decoded, State)
+    catch
+        _:_ ->
+            State1 = finalize_progress(State),
+            io:put_chars([Line, "\n"]),
+            State1
+    end.
+
+render_event(#{<<"status">> := <<"success">>}, State) ->
+    State1 = finalize_progress(State),
+    io:put_chars("success\n"),
+    State1;
+render_event(
+    #{<<"status">> := S, <<"completed">> := C, <<"total">> := T},
+    State
+) when is_integer(T), T > 0, is_integer(C) ->
+    progress(S, C, T, State);
+render_event(#{<<"status">> := S}, State) ->
+    State1 = finalize_progress(State),
+    io:put_chars(io_lib:format("~ts~n", [S])),
+    State1#{last_status => S};
+render_event(#{<<"error">> := E}, State) ->
+    State1 = finalize_progress(State),
+    io:put_chars(io_lib:format("error: ~ts~n", [E])),
+    State1;
+render_event(Other, State) ->
+    State1 = finalize_progress(State),
+    io:put_chars(io_lib:format("~p~n", [Other])),
+    State1.
+
+progress(Status, Completed, Total, State = #{tty := true, last_status := Status}) ->
+    io:put_chars([$\r, render_bar(Status, Completed, Total)]),
+    State#{on_progress_line => true};
+progress(Status, Completed, Total, State) ->
+    State1 = finalize_progress(State),
+    case maps:get(tty, State1, false) of
+        true ->
+            io:put_chars(render_bar(Status, Completed, Total)),
+            State1#{last_status => Status, on_progress_line => true};
+        false ->
+            %% Non-TTY: keep the old shape so log scrapers still
+            %% see one self-contained line per event.
+            io:put_chars(
+                io_lib:format("~ts  ~B / ~B~n", [Status, Completed, Total])
+            ),
+            State1#{last_status => Status, on_progress_line => false}
+    end.
+
+finalize_progress(State = #{on_progress_line := true}) ->
+    io:put_chars("\n"),
+    State#{on_progress_line => false};
+finalize_progress(State) ->
+    State.
+
+render_bar(Status, Completed, Total) ->
+    Pct = (Completed * 100) div Total,
+    Filled = Pct div 5,
+    Empty = 20 - Filled,
+    io_lib:format(
+        "~ts: ~3B% [~ts~ts] ~ts / ~ts",
+        [
+            Status,
+            Pct,
+            lists:duplicate(Filled, $#),
+            lists:duplicate(Empty, $.),
+            human_bytes(Completed),
+            human_bytes(Total)
+        ]
+    ).
+
+human_bytes(N) when N < 1024 ->
+    io_lib:format("~B B", [N]);
+human_bytes(N) when N < 1024 * 1024 ->
+    io_lib:format("~.1f KB", [N / 1024]);
+human_bytes(N) when N < 1024 * 1024 * 1024 ->
+    io_lib:format("~.1f MB", [N / 1024 / 1024]);
+human_bytes(N) ->
+    io_lib:format("~.2f GB", [N / 1024 / 1024 / 1024]).
 
 %% Streaming POST that prints OpenAI SSE deltas as they arrive.
 stream_post_sse(URL, Body) ->
