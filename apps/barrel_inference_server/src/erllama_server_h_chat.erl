@@ -639,7 +639,7 @@ cancel_timer(Ref) ->
     ok.
 
 record_success(S, Stats) ->
-    record_metrics(S, 200),
+    record_metrics(S, 200, Stats),
     erllama_server_metrics:inc_prompt_tokens(
         S#st.model,
         maps:get(prompt_tokens, Stats, 0)
@@ -665,7 +665,9 @@ record_success(S, Stats) ->
 record_error(S, _Reason) ->
     record_metrics(S, 500).
 
-record_metrics(S, Status) ->
+record_metrics(S, Status) -> record_metrics(S, Status, #{}).
+
+record_metrics(S, Status, Stats) ->
     Now = mono_ms(),
     Duration = (Now - S#st.started_mono) / 1000.0,
     Endpoint =
@@ -675,7 +677,34 @@ record_metrics(S, Status) ->
         end,
     erllama_server_metrics:record_request(
         Endpoint, S#st.requested, integer_to_binary(Status), Duration
+    ),
+    %% Structured per-request log line. Mirrors the Anthropic handler:
+    %% Stats on 200 carries cache_hit_kind + cache_delta so operators
+    %% can measure cross-conversation prefix reuse from the daemon's
+    %% logs. Error paths pass an empty Stats; cache fields collapse to
+    %% defaults.
+    logger:notice(
+        maps:merge(
+            #{
+                event => openai_request,
+                endpoint => Endpoint,
+                model => S#st.requested,
+                status => Status,
+                duration_ms => round(Duration * 1000),
+                request_id => S#st.req_id
+            },
+            cache_log_fields(Stats)
+        )
     ).
+
+cache_log_fields(Stats) ->
+    Delta = maps:get(cache_delta, Stats, #{}),
+    #{
+        cache_hit_kind => maps:get(cache_hit_kind, Stats, undefined),
+        cache_read_tokens => maps:get(read, Delta, 0),
+        cache_created_tokens => maps:get(created, Delta, 0),
+        prompt_tokens => maps:get(prompt_tokens, Stats, 0)
+    }.
 
 %%====================================================================
 %% Reply helpers

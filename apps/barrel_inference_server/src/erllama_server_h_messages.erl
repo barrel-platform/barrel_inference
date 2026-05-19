@@ -1104,7 +1104,7 @@ cancel_timer(Ref) ->
     ok.
 
 record_success(S, Stats) ->
-    record_metrics(S, 200),
+    record_metrics(S, 200, Stats),
     erllama_server_metrics:inc_prompt_tokens(
         S#st.model,
         maps:get(prompt_tokens, Stats, 0)
@@ -1116,7 +1116,9 @@ record_success(S, Stats) ->
 
 record_error(S, _Reason) -> record_metrics(S, 500).
 
-record_metrics(S, Status) ->
+record_metrics(S, Status) -> record_metrics(S, Status, #{}).
+
+record_metrics(S, Status, Stats) ->
     Now = mono_ms(),
     Duration = (Now - S#st.started_mono) / 1000.0,
     erllama_server_metrics:record_request(
@@ -1132,15 +1134,37 @@ record_metrics(S, Status) ->
     %% same level as the access log) so the default OTP logger config
     %% picks it up. Kept out of metric labels to avoid Prometheus
     %% cardinality blow-up.
-    logger:notice(#{
-        event => anthropic_request,
-        endpoint => <<"/v1/messages">>,
-        model => S#st.requested,
-        status => Status,
-        duration_ms => round(Duration * 1000),
-        request_id => S#st.req_id,
-        user_id => S#st.user_id
-    }).
+    %%
+    %% On 200 paths Stats carries cache_hit_kind (exact|partial|cold|
+    %% sticky|continuation) and cache_delta := #{read, created}. The
+    %% pair is the answer to "did the engine warm-restore the static
+    %% prefix on this turn?" and lets operators measure cross-
+    %% conversation prefix reuse without instrumenting the model.
+    %% Error paths pass an empty Stats map; cache_* fields land as
+    %% undefined / 0 and observability sinks can drop them.
+    logger:notice(
+        maps:merge(
+            #{
+                event => anthropic_request,
+                endpoint => <<"/v1/messages">>,
+                model => S#st.requested,
+                status => Status,
+                duration_ms => round(Duration * 1000),
+                request_id => S#st.req_id,
+                user_id => S#st.user_id
+            },
+            cache_log_fields(Stats)
+        )
+    ).
+
+cache_log_fields(Stats) ->
+    Delta = maps:get(cache_delta, Stats, #{}),
+    #{
+        cache_hit_kind => maps:get(cache_hit_kind, Stats, undefined),
+        cache_read_tokens => maps:get(read, Delta, 0),
+        cache_created_tokens => maps:get(created, Delta, 0),
+        prompt_tokens => maps:get(prompt_tokens, Stats, 0)
+    }.
 
 reply_json_error(Status, Reason, Req0) ->
     Req1 = json_error(Status, Reason, Req0),

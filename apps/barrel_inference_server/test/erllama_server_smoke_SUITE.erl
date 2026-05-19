@@ -344,9 +344,13 @@ messages_no_allowlist_accepts_any_key(Cfg) ->
     %% point is the auth gate did not 401.
     ?assertEqual(404, Status).
 
-%% record_metrics/2 emits a structured logger:info event including
-%% metadata.user_id and the message id so observability sinks can
-%% slice request traffic by user. The event is keyed `anthropic_request`.
+%% record_metrics emits a structured logger:notice event including
+%% metadata.user_id, the message id, and cache stats from the engine
+%% so observability sinks can slice request traffic by user AND see
+%% whether the engine warm-restored the static prefix on this turn.
+%% The event is keyed `anthropic_request`. Error paths (this test
+%% hits 404 / not_found) carry the cache fields as their defaults
+%% (undefined / 0); successful paths carry the engine's real values.
 messages_logs_user_id_in_event(Cfg) ->
     persistent_term:put({?MODULE, log_pid}, self()),
     HandlerId = anthropic_log_capture,
@@ -366,7 +370,14 @@ messages_logs_user_id_in_event(Cfg) ->
             {log_event, Report} ->
                 ?assertEqual(<<"u-test">>, maps:get(user_id, Report)),
                 ?assertEqual(anthropic_request, maps:get(event, Report)),
-                ?assertEqual(<<"/v1/messages">>, maps:get(endpoint, Report))
+                ?assertEqual(<<"/v1/messages">>, maps:get(endpoint, Report)),
+                %% Cache observability fields are always emitted, with
+                %% defaults on error paths so consumers can rely on
+                %% their presence.
+                ?assertEqual(undefined, maps:get(cache_hit_kind, Report)),
+                ?assertEqual(0, maps:get(cache_read_tokens, Report)),
+                ?assertEqual(0, maps:get(cache_created_tokens, Report)),
+                ?assertEqual(0, maps:get(prompt_tokens, Report))
         after 2000 ->
             ct:fail(no_anthropic_request_log_seen)
         end
