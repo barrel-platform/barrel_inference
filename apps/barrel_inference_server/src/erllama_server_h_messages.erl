@@ -35,6 +35,11 @@
         | running,
     worker :: pid() | undefined,
     worker_mon :: reference() | undefined,
+    %% Set on {pipeline, admitted, _, _}: monitors the engine
+    %% gen_statem for this model so a mid-inference crash surfaces
+    %% as 500 model_crashed instead of a hung connection. Cleared
+    %% on erllama_done and on terminate/3.
+    engine_mon :: reference() | undefined,
     ref :: reference() | undefined,
     slot :: erllama_server_queue:slot() | undefined,
     started_mono :: integer(),
@@ -280,6 +285,7 @@ init_state(R, Requested, Worker, Mon) ->
         phase = waiting_load,
         worker = Worker,
         worker_mon = Mon,
+        engine_mon = undefined,
         ref = undefined,
         slot = undefined,
         started_mono = mono_ms(),
@@ -347,7 +353,7 @@ info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
             undefined -> arm_prefill(S0#st{phase = running, ref = Ref});
             _ -> S0
         end,
-    S2 = S1#st{slot = Slot},
+    S2 = monitor_engine(S1#st{slot = Slot}),
     case S2#st.stream of
         true ->
             {Req1, S3} = ensure_stream(Req0, S2),
@@ -377,6 +383,16 @@ info({pipeline, error, Status, Reason}, Req0, S) ->
     Req1 = stamp_ratelimit(Req0, S#st.model),
     Req2 = json_error(Status, Reason, Req1),
     {stop, Req2, S};
+info(
+    {'DOWN', Mon, process, _Pid, _Reason},
+    Req0,
+    S = #st{engine_mon = Mon}
+) ->
+    %% Engine gen_statem crashed mid-inference (e.g. decode_failed in
+    %% the NIF). Reroute to the existing pipeline-error path so the
+    %% client sees 500 model_crashed instead of a hung connection.
+    self() ! {pipeline, error, 500, model_crashed},
+    {ok, Req0, S#st{engine_mon = undefined}, hibernate};
 info(
     {'DOWN', Mon, process, Worker, _Reason},
     Req0,
@@ -432,10 +448,10 @@ info({erllama_tool_call_end, Ref, FullBin}, Req0, S0) ->
 info({erllama_done, Ref, Stats}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     record_session_committed(S, Stats),
-    finish_ok(Req, S#st{received_done = true}, Stats);
+    finish_ok(Req, demonitor_engine(S#st{received_done = true}), Stats);
 info({erllama_error, Ref, Reason}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
-    finish_err(Req, S#st{received_done = true}, Reason);
+    finish_err(Req, demonitor_engine(S#st{received_done = true}), Reason);
 info({prefill_timeout, Ref}, Req, S = #st{ref = Ref}) ->
     erllama:cancel(Ref),
     finish_err(Req, S, prefill_timeout);
@@ -478,6 +494,7 @@ cleanup(S) ->
     cancel_timer(S#st.idle_tref),
     cancel_timer(S#st.total_tref),
     cancel_timer(S#st.gen_ping_tref),
+    _ = demonitor_engine(S),
     case is_pid(S#st.worker) of
         true -> erllama_server_pipeline:abort(S#st.worker);
         false -> ok
@@ -1096,6 +1113,24 @@ rearm_idle(S) ->
                 )
             }
     end.
+
+%% Monitor the engine's gen_statem so a mid-inference crash
+%% (e.g. NIF decode_failed) surfaces as 500 model_crashed instead
+%% of hanging the handler until the client disconnects. No-op if
+%% the engine is no longer registered.
+monitor_engine(S = #st{engine_mon = Mon}) when is_reference(Mon) ->
+    S;
+monitor_engine(S = #st{model = Model}) ->
+    case erllama_registry:whereis_name(Model) of
+        undefined -> S;
+        Pid when is_pid(Pid) -> S#st{engine_mon = erlang:monitor(process, Pid)}
+    end.
+
+demonitor_engine(S = #st{engine_mon = Mon}) when is_reference(Mon) ->
+    _ = erlang:demonitor(Mon, [flush]),
+    S#st{engine_mon = undefined};
+demonitor_engine(S) ->
+    S.
 
 cancel_timer(undefined) ->
     ok;
