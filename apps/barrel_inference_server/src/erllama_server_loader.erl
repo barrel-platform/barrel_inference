@@ -331,7 +331,14 @@ manifest_to_config(Manifest) ->
     ParamCtx = maps:get(<<"num_ctx">>, Params, undefined),
     NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
     Ctx = min(default_int(ParamCtx, NativeCtx), MaxCtx),
-    NBatch = default_int(maps:get(<<"n_batch">>, Loader, undefined), 512),
+    %% n_batch sizes the per-call prefill batch the engine submits
+    %% to llama.cpp. Prefill on Metal / CUDA is batch-bound; 512
+    %% leaves a 3-4x speedup on the table for any host with a GPU.
+    %% 2048 matches llama.cpp's own current default and the larger
+    %% compute buffer is negligible on unified-memory / discrete-GPU
+    %% hosts. CPU-only operators with constrained RAM can override
+    %% per-manifest via `loader.n_batch'.
+    NBatch = default_int(maps:get(<<"n_batch">>, Loader, undefined), 2048),
     %% `n_seq_max` controls the engine's seq pool. Sticky-seq
     %% pinning (PR 28+) and the continue/3 path (PR 32) need at
     %% least 2 here to avoid admission deadlock the moment a second
