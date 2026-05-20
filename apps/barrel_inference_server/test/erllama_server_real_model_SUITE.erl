@@ -38,7 +38,8 @@
     messages_non_streaming_runs/1,
     embeddings_runs/1,
     multi_turn_cache_delta_profile/1,
-    responses_previous_response_id_continues/1
+    responses_previous_response_id_continues/1,
+    responses_server_tool_loop_runs/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -57,7 +58,8 @@ all() ->
         messages_non_streaming_runs,
         embeddings_runs,
         multi_turn_cache_delta_profile,
-        responses_previous_response_id_continues
+        responses_previous_response_id_continues,
+        responses_server_tool_loop_runs
     ].
 
 %%====================================================================
@@ -524,6 +526,46 @@ responses_previous_response_id_continues(Cfg) ->
     ),
     ?assert(ContIn > BareIn),
     ?assert(byte_size(ContText) > 0).
+
+%% Drive the agentic continue-loop: register the stub executor for
+%% `web_search`, force the model to call it (tool_choice=required) and
+%% cap the loop low. The server runs the executor and re-infers each
+%% round; the turn must terminate (status=completed) at the cap rather
+%% than hang or return a client function_call. The loop engages only
+%% for a marker-configured model (wire-driven tool calls); output item
+%% types are logged so a human can confirm web_search_call rounds.
+responses_server_tool_loop_runs(Cfg) ->
+    persistent_term:put(
+        {erllama_server_config, builtin_tool_executors},
+        #{
+            <<"web_search">> => #{
+                module => erllama_server_tool_executor_stub,
+                type => <<"web_search">>
+            }
+        }
+    ),
+    persistent_term:put({erllama_server_config, max_tool_iterations}, 2),
+    try
+        Url = ?config(base, Cfg) ++ "/v1/responses",
+        Body = json:encode(#{
+            <<"model">> => <<"real">>,
+            <<"input">> => <<"Search the web for today's date.">>,
+            <<"tools">> => [#{<<"type">> => <<"web_search">>}],
+            <<"tool_choice">> => <<"required">>,
+            <<"max_output_tokens">> => 32,
+            <<"stream">> => false
+        }),
+        {ok, {{_, 200, _}, _, Resp}} = httpc:request(
+            post, {Url, [], "application/json", Body}, [{timeout, 240000}], []
+        ),
+        Decoded = json:decode(list_to_binary(Resp)),
+        Types = [maps:get(<<"type">>, I) || I <- maps:get(<<"output">>, Decoded, [])],
+        ct:log("server-tool loop output types: ~p", [Types]),
+        ?assertEqual(<<"completed">>, maps:get(<<"status">>, Decoded))
+    after
+        persistent_term:erase({erllama_server_config, builtin_tool_executors}),
+        persistent_term:erase({erllama_server_config, max_tool_iterations})
+    end.
 
 responses_turn(Url, Body) ->
     {ok, {{_, 200, _}, _, Resp}} = httpc:request(

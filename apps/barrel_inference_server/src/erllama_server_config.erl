@@ -25,6 +25,7 @@
     anthropic_retry_after_seconds/0,
     tool_call_formats/0,
     builtin_tool_executors/0,
+    max_tool_iterations/0,
     tool_replay_dir/0,
     tool_replay_ttl_ms/0,
     tool_replay_gc_interval_ms/0,
@@ -202,6 +203,14 @@ builtin_tool_executors() ->
 
 default_builtin_tool_executors() ->
     #{}.
+
+%% Cap on server-side tool rounds within a single request. Each round
+%% is one executor call + a re-inference; the cap bounds the agentic
+%% continue-loop so a model that keeps calling tools cannot spin
+%% forever. Defaults to 5.
+-spec max_tool_iterations() -> pos_integer().
+max_tool_iterations() ->
+    persistent_term:get({?MODULE, max_tool_iterations}, 5).
 
 %% Directory hosting the exact-replay DETS file used by
 %% erllama_server_tool_replay. Defaults to a `replay` sibling of the
@@ -383,6 +392,10 @@ init([]) ->
         maps:merge(
             default_builtin_tool_executors(), app_env(builtin_tool_executors, #{})
         )
+    ),
+    persistent_term:put(
+        {?MODULE, max_tool_iterations},
+        app_env(max_tool_iterations, 5)
     ),
     persistent_term:put(
         {?MODULE, tool_replay_ttl_ms},
