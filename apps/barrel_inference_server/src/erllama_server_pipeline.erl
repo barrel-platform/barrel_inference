@@ -363,7 +363,10 @@ try_reset_and_retry(W, Fun, Op) ->
     R = W#work.request,
     case R#erllama_request.session_id of
         undefined ->
-            {error, 504, engine_unresponsive};
+            %% No sticky session to reset - the wedge is at cold
+            %% admit (global context), not per-session KV. Escalate
+            %% straight to unload.
+            escalate_unload(ModelId, Op);
         SessionId ->
             case erllama:reset_session(ModelId, SessionId) of
                 {ok, Outcome} ->
@@ -373,17 +376,42 @@ try_reset_and_retry(W, Fun, Op) ->
                         [Outcome, ModelId, Op]
                     ),
                     clear_session_state(W),
-                    call_engine(Fun, ModelId, Op);
+                    case call_engine(Fun, ModelId, Op) of
+                        {error, 504, engine_unresponsive} ->
+                            %% Per-session reset didn't unwedge it -
+                            %% the wedge is at the global llama.cpp
+                            %% context level, which reset_session
+                            %% structurally can't reach. Escalate.
+                            escalate_unload(ModelId, Op);
+                        Other ->
+                            Other
+                    end;
                 {error, timeout} ->
-                    logger:error(
-                        "erllama_server: engine reset itself timed out: "
-                        "model=~ts op=~p (engine likely dead; restart "
-                        "required)",
-                        [ModelId, Op]
-                    ),
-                    {error, 504, engine_unresponsive}
+                    %% reset_session itself couldn't reach the
+                    %% gen_statem mailbox. Unload is supervisor-level
+                    %% so it lands anyway.
+                    escalate_unload(ModelId, Op)
             end
     end.
+
+%% Last-resort recovery for a wedge that per-session reset can't
+%% clear (global llama.cpp context stuck at admit, or an unreachable
+%% gen_statem mailbox). `erllama:unload/1' goes through the model
+%% supervisor's `terminate_child', not a gen_statem:call, so it
+%% lands even when the engine is stuck in a dirty NIF. The next
+%% request's `ensure_loaded' reloads a fresh context cold. We return
+%% 503 `model_reloading' so the Anthropic surface remaps to 529 +
+%% retry-after (SDKs back off) and OpenAI / Responses callers retry
+%% against the reloaded model. Converts "wedge = dead daemon until
+%% manual restart" into "wedge = one 503, then self-healed".
+escalate_unload(ModelId, Op) ->
+    logger:error(
+        "erllama_server: engine unrecoverable via reset; unloading "
+        "model=~ts op=~p - next request reloads cold",
+        [ModelId, Op]
+    ),
+    _ = erllama:unload(ModelId),
+    {error, 503, model_reloading}.
 
 accept_tokens(W, Tokens) ->
     W1 = put_tokens(W, Tokens),
