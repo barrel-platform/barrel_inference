@@ -260,7 +260,7 @@ render_template(W, System, Tools, Messages) ->
     ModelId = model_id(W),
     Req = #{messages => Messages, system => System, tools => Tools},
     Call = fun() -> erllama:apply_chat_template(ModelId, Req) end,
-    case call_engine(Call, ModelId, apply_chat_template) of
+    case call_engine_with_recovery(W, Call, apply_chat_template) of
         {ok, {ok, Tokens}} ->
             {ok, Tokens};
         {ok, {error, no_template}} ->
@@ -276,7 +276,7 @@ render_template(W, System, Tools, Messages) ->
 tokenise_raw(W, Prompt) ->
     ModelId = model_id(W),
     Call = fun() -> erllama:tokenize(ModelId, Prompt) end,
-    case call_engine(Call, ModelId, tokenize) of
+    case call_engine_with_recovery(W, Call, tokenize) of
         {ok, {ok, Tokens}} ->
             case fits_context(W, length(Tokens)) of
                 ok ->
@@ -331,6 +331,59 @@ call_engine(Fun, ModelId, Op) ->
 
 engine_call_timeout_ms() ->
     application:get_env(erllama_server, engine_call_timeout_ms, 30000).
+
+%% On `engine_unresponsive' (the 504 from `call_engine/3`'s
+%% bounded timeout), invoke the upstream `erllama:reset_session/2'
+%% recovery primitive (erllama 0.7+) and retry the call once. Reset
+%% drops the session's live KV cells and any in-flight `#req{}'
+%% tagged to its seq, then returns the seq to the idle pool. Uses
+%% a short 5 s `gen_statem:call` timeout upstream so it stays
+%% reachable when the engine's hot path is wedged.
+%%
+%% If the retry's `do_infer' had `continuation' armed, the engine
+%% has no session post-reset; `do_infer' falls through `no_session'
+%% to a cold `infer/4', so the retry succeeds cold rather than
+%% asserting on the now-evicted KV.
+%%
+%% When `reset_session/2' itself returns `{error, timeout}', the
+%% engine's mailbox is unreachable - the model is genuinely dead
+%% and the daemon needs a restart. We surface the original 504
+%% with an explicit error log.
+call_engine_with_recovery(W, Fun, Op) ->
+    ModelId = model_id(W),
+    case call_engine(Fun, ModelId, Op) of
+        {error, 504, engine_unresponsive} ->
+            try_reset_and_retry(W, Fun, Op);
+        Other ->
+            Other
+    end.
+
+try_reset_and_retry(W, Fun, Op) ->
+    ModelId = model_id(W),
+    R = W#work.request,
+    case R#erllama_request.session_id of
+        undefined ->
+            {error, 504, engine_unresponsive};
+        SessionId ->
+            case erllama:reset_session(ModelId, SessionId) of
+                {ok, Outcome} ->
+                    logger:warning(
+                        "erllama_server: engine reset (~p), retrying: "
+                        "model=~ts op=~p",
+                        [Outcome, ModelId, Op]
+                    ),
+                    clear_session_state(W),
+                    call_engine(Fun, ModelId, Op);
+                {error, timeout} ->
+                    logger:error(
+                        "erllama_server: engine reset itself timed out: "
+                        "model=~ts op=~p (engine likely dead; restart "
+                        "required)",
+                        [ModelId, Op]
+                    ),
+                    {error, 504, engine_unresponsive}
+            end
+    end.
 
 accept_tokens(W, Tokens) ->
     W1 = put_tokens(W, Tokens),
@@ -438,7 +491,7 @@ step_queue(W) ->
 step_infer(W) ->
     Params = build_params(W#work.request),
     Call = fun() -> do_infer(W, Params) end,
-    case call_engine(Call, model_id(W), infer) of
+    case call_engine_with_recovery(W, Call, infer) of
         {ok, {ok, Ref}} ->
             {ok, W#work{infer_ref = Ref}};
         {ok, {error, busy}} ->
