@@ -98,7 +98,13 @@
     stream_options_include_usage_parsed/1,
     parallel_tool_calls_parsed/1,
     chat_final_chunk_usage_null/1,
-    usage_chunk_has_empty_choices_and_usage/1
+    usage_chunk_has_empty_choices_and_usage/1,
+    %% cross-surface builtin classification
+    chat_builtin_tool_dropped/1,
+    chat_builtin_tool_with_executor_synthesised/1,
+    anthropic_custom_tool_kept/1,
+    anthropic_builtin_tool_dropped/1,
+    anthropic_builtin_tool_with_executor_synthesised/1
 ]).
 
 %%====================================================================
@@ -194,7 +200,12 @@ all() ->
         stream_options_include_usage_parsed,
         parallel_tool_calls_parsed,
         chat_final_chunk_usage_null,
-        usage_chunk_has_empty_choices_and_usage
+        usage_chunk_has_empty_choices_and_usage,
+        chat_builtin_tool_dropped,
+        chat_builtin_tool_with_executor_synthesised,
+        anthropic_custom_tool_kept,
+        anthropic_builtin_tool_dropped,
+        anthropic_builtin_tool_with_executor_synthesised
     ].
 
 %%====================================================================
@@ -1502,6 +1513,100 @@ responses_input_builtin_item_dropped(_Cfg) ->
         [#{role => <<"user">>, content => <<"hi">>}],
         R#erllama_request.messages
     ).
+
+%% --- cross-surface builtin classification ---
+
+chat_builtin_tool_dropped(_Cfg) ->
+    persistent_term:erase({erllama_server_config, builtin_tool_executors}),
+    Body = (base_chat())#{
+        <<"tools">> => [
+            #{
+                <<"type">> => <<"function">>,
+                <<"function">> => #{<<"name">> => <<"f">>, <<"parameters">> => #{}}
+            },
+            #{<<"type">> => <<"web_search">>}
+        ]
+    },
+    {ok, R} = erllama_server_translate:openai_chat_to_internal(Body),
+    ?assertEqual([<<"f">>], [maps:get(name, T) || T <- R#erllama_request.tools]),
+    ?assertEqual(#{}, R#erllama_request.server_tools).
+
+chat_builtin_tool_with_executor_synthesised(_Cfg) ->
+    with_stub_executor(fun() ->
+        Body = (base_chat())#{<<"tools">> => [#{<<"type">> => <<"web_search">>}]},
+        {ok, R} = erllama_server_translate:openai_chat_to_internal(Body),
+        ?assertMatch([#{name := <<"web_search">>}], R#erllama_request.tools),
+        ?assertMatch(
+            #{<<"web_search">> := #{module := erllama_server_tool_executor_stub}},
+            R#erllama_request.server_tools
+        )
+    end).
+
+anthropic_custom_tool_kept(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"claude">>,
+        <<"max_tokens">> => 8,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
+        <<"tools">> => [
+            #{
+                <<"name">> => <<"get_weather">>,
+                <<"input_schema">> => #{<<"type">> => <<"object">>}
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertMatch([#{name := <<"get_weather">>, schema := _}], R#erllama_request.tools),
+    ?assertEqual(#{}, R#erllama_request.server_tools).
+
+anthropic_builtin_tool_dropped(_Cfg) ->
+    persistent_term:erase({erllama_server_config, builtin_tool_executors}),
+    Body = #{
+        <<"model">> => <<"claude">>,
+        <<"max_tokens">> => 8,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
+        <<"tools">> => [
+            #{<<"type">> => <<"web_search_20250305">>, <<"name">> => <<"web_search">>}
+        ]
+    },
+    {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+    ?assertEqual([], R#erllama_request.tools),
+    ?assertEqual(#{}, R#erllama_request.server_tools).
+
+anthropic_builtin_tool_with_executor_synthesised(_Cfg) ->
+    %% The versioned Anthropic type normalises to the canonical
+    %% registry key (web_search_20250305 -> web_search).
+    with_stub_executor(fun() ->
+        Body = #{
+            <<"model">> => <<"claude">>,
+            <<"max_tokens">> => 8,
+            <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
+            <<"tools">> => [
+                #{<<"type">> => <<"web_search_20250305">>, <<"name">> => <<"web_search">>}
+            ]
+        },
+        {ok, R} = erllama_server_translate:anthropic_messages_to_internal(Body),
+        ?assertMatch([#{name := <<"web_search">>}], R#erllama_request.tools),
+        ?assertMatch(
+            #{<<"web_search">> := #{module := erllama_server_tool_executor_stub}},
+            R#erllama_request.server_tools
+        )
+    end).
+
+with_stub_executor(Fun) ->
+    persistent_term:put(
+        {erllama_server_config, builtin_tool_executors},
+        #{
+            <<"web_search">> => #{
+                module => erllama_server_tool_executor_stub,
+                type => <<"web_search">>
+            }
+        }
+    ),
+    try
+        Fun()
+    after
+        persistent_term:erase({erllama_server_config, builtin_tool_executors})
+    end.
 
 stream_options_include_usage_parsed(_Cfg) ->
     Off = base_chat(),

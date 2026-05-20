@@ -111,7 +111,11 @@
     %% only).
     tool_format = undefined :: undefined | erllama_server_tool_format:spec(),
     captured_tool_use = undefined ::
-        undefined | #{id := binary(), name := binary(), input := map()}
+        undefined | #{id := binary(), name := binary(), input := map()},
+    %% Built-in tools the server executes in-process, keyed by the
+    %% model-facing name. Empty unless an executor is registered;
+    %% reserved for the cross-surface continue-loop port.
+    server_tools = #{} :: #{binary() => erllama_server_tool_executor:spec()}
 }).
 
 %%====================================================================
@@ -307,7 +311,8 @@ init_state(R, Requested, Worker, Mon) ->
         thinking_display = R#erllama_request.thinking_display,
         user_id = R#erllama_request.user_id,
         session_id = R#erllama_request.session_id,
-        tool_format = resolve_tool_format(R#erllama_request.model_id)
+        tool_format = resolve_tool_format(R#erllama_request.model_id),
+        server_tools = R#erllama_request.server_tools
     }.
 
 resolve_tool_format(ModelId) ->

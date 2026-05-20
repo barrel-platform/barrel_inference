@@ -94,7 +94,7 @@ openai_chat_to_internal(Body) when is_map(Body) ->
         MessagesIn = required_list(Body, <<"messages">>),
         check_messages_cap(MessagesIn),
         {System, Messages} = split_system(MessagesIn),
-        Tools = parse_openai_tools(Body),
+        {Tools, ServerTools} = parse_openai_tools(Body),
         check_tools_cap(Tools),
         ToolChoice = parse_openai_tool_choice(Body),
         RF = parse_response_format_openai(maps:get(<<"response_format">>, Body, undefined)),
@@ -106,7 +106,8 @@ openai_chat_to_internal(Body) when is_map(Body) ->
             system = System,
             tools = Tools,
             tool_choice = ToolChoice,
-            response_format = RF
+            response_format = RF,
+            server_tools = ServerTools
         }}
     catch
         throw:{error, _} = E -> E
@@ -409,7 +410,7 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
         SystemRaw = maps:get(<<"system">>, Body, undefined),
         System = parse_anthropic_system(SystemRaw),
         Messages = [normalise_message(M) || M <- MessagesIn],
-        Tools = parse_anthropic_tools(Body),
+        {Tools, ServerTools} = parse_anthropic_tools(Body),
         check_tools_cap(Tools),
         ToolChoice = parse_anthropic_tool_choice(Body),
         Thinking = parse_anthropic_thinking(Body),
@@ -432,7 +433,8 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
             stop = parse_stop_sequences(Body),
             user_id = parse_metadata_user_id(Body),
             thinking_display = parse_anthropic_thinking_display(Body),
-            thinking_budget = parse_anthropic_thinking_budget(Body)
+            thinking_budget = parse_anthropic_thinking_budget(Body),
+            server_tools = ServerTools
         }}
     catch
         throw:{error, _} = E -> E
@@ -1572,22 +1574,36 @@ parse_anthropic_system(L) when is_list(L) ->
     ).
 
 %% OpenAI tools: [{type:"function", function:{name, description, parameters}}]
+%% OpenAI chat tools. Returns `{Tools, ServerTools}' like the Responses
+%% parser: keep function tools, and classify any built-in via the
+%% shared `classify_builtin/1' (offer + run server-side if an executor
+%% is registered, else drop). No MCP `namespace' on the chat surface.
 parse_openai_tools(Body) ->
     case maps:get(<<"tools">>, Body, undefined) of
-        undefined ->
-            undefined;
         Tools when is_list(Tools) ->
-            [
-                #{
-                    name => maps:get(<<"name">>, F),
-                    description => maps:get(<<"description">>, F, <<>>),
-                    schema => maps:get(<<"parameters">>, F, #{})
-                }
-             || #{<<"type">> := <<"function">>, <<"function">> := F} <- Tools
-            ];
+            {RevTools, ServerTools} = lists:foldl(
+                fun classify_openai_tool/2, {[], #{}}, Tools
+            ),
+            {lists:reverse(RevTools), ServerTools};
         _ ->
-            undefined
+            {undefined, #{}}
     end.
+
+classify_openai_tool(#{<<"type">> := <<"function">>, <<"function">> := F}, Acc) when
+    is_map(F)
+->
+    push_tool(function_tool(F), Acc);
+classify_openai_tool(#{<<"type">> := Type}, {ToolsRev, ServerTools} = Acc) when
+    is_binary(Type)
+->
+    case classify_builtin(Type) of
+        {server_tool, Tool, Spec} ->
+            {[Tool | ToolsRev], ServerTools#{maps:get(name, Tool) => Spec}};
+        drop ->
+            Acc
+    end;
+classify_openai_tool(_, Acc) ->
+    Acc.
 
 parse_openai_tool_choice(Body) ->
     case maps:get(<<"tool_choice">>, Body, undefined) of
@@ -1608,22 +1624,60 @@ parse_openai_tool_choice(Body) ->
             auto
     end.
 
-%% Anthropic tools: [{name, description, input_schema}]
+%% Anthropic tools. Custom tools are `{name, description,
+%% input_schema}` (no `type`, or a custom `type`). Built-in tools
+%% carry a versioned `type` (`web_search_20250305`,
+%% `bash_20250124`, ...); normalise to the canonical registry key and
+%% classify via the shared `classify_builtin/1' (offer + run
+%% server-side if an executor is registered, else drop). Returns
+%% `{Tools, ServerTools}'.
 parse_anthropic_tools(Body) ->
     case maps:get(<<"tools">>, Body, undefined) of
-        undefined ->
-            undefined;
         Tools when is_list(Tools) ->
-            [
-                #{
-                    name => maps:get(<<"name">>, T),
-                    description => maps:get(<<"description">>, T, <<>>),
-                    schema => maps:get(<<"input_schema">>, T, #{})
-                }
-             || T <- Tools
-            ];
+            {RevTools, ServerTools} = lists:foldl(
+                fun classify_anthropic_tool/2, {[], #{}}, Tools
+            ),
+            {lists:reverse(RevTools), ServerTools};
         _ ->
-            undefined
+            {undefined, #{}}
+    end.
+
+classify_anthropic_tool(#{<<"type">> := <<"custom">>} = T, Acc) ->
+    %% Explicit custom tool (newer Anthropic shape).
+    push_tool(anthropic_tool(T), Acc);
+classify_anthropic_tool(#{<<"type">> := Type}, {ToolsRev, ServerTools} = Acc) when
+    is_binary(Type)
+->
+    %% A versioned built-in type (web_search_20250305, ...). Built-ins
+    %% carry a `name` too, so they must NOT fall back to a function
+    %% tool: offer + run server-side if registered, else drop.
+    case classify_builtin(anthropic_builtin_type(Type)) of
+        {server_tool, Tool, Spec} ->
+            {[Tool | ToolsRev], ServerTools#{maps:get(name, Tool) => Spec}};
+        drop ->
+            Acc
+    end;
+classify_anthropic_tool(T, Acc) when is_map(T) ->
+    %% No `type`: a custom tool (`name` + `input_schema`).
+    push_tool(anthropic_tool(T), Acc);
+classify_anthropic_tool(_, Acc) ->
+    Acc.
+
+anthropic_tool(T) ->
+    #{
+        name => maps:get(<<"name">>, T),
+        description => maps:get(<<"description">>, T, <<>>),
+        schema => maps:get(<<"input_schema">>, T, #{})
+    }.
+
+%% Normalise an Anthropic versioned built-in tool type to the
+%% canonical registry key by stripping a trailing `_YYYYMMDD' date
+%% suffix (e.g. `web_search_20250305' -> `web_search',
+%% `bash_20250124' -> `bash').
+anthropic_builtin_type(Type) ->
+    case re:run(Type, <<"^(.*)_[0-9]{8}$">>, [{capture, all_but_first, binary}]) of
+        {match, [Base]} -> Base;
+        nomatch -> Type
     end.
 
 %% Anthropic prompt-caching markers can appear on:
