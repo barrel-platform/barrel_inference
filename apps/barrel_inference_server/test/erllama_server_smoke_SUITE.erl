@@ -39,6 +39,7 @@
     responses_emits_response_id_header/1,
     responses_streaming_unknown_model_emits_event_error/1,
     responses_413_returns_request_too_large_type/1,
+    responses_codex_envelope_accepted/1,
     request_id_minted_when_absent/1,
     request_id_echoed_when_present/1,
     cors_disabled_by_default/1,
@@ -78,6 +79,7 @@ all() ->
         responses_emits_response_id_header,
         responses_streaming_unknown_model_emits_event_error,
         responses_413_returns_request_too_large_type,
+        responses_codex_envelope_accepted,
         request_id_minted_when_absent,
         request_id_echoed_when_present,
         cors_disabled_by_default,
@@ -616,3 +618,37 @@ responses_413_returns_request_too_large_type(Cfg) ->
     ?assertEqual(413, Status),
     Decoded = json:decode(list_to_binary(RespBody)),
     ?assertMatch(#{<<"error">> := #{<<"code">> := <<"request_too_large">>}}, Decoded).
+
+%% Codex sends the Responses request as an `input` array of message
+%% items (content as `input_text` parts) plus a top-level
+%% `instructions` string and `stream: true`. Assert that envelope is
+%% accepted and routed (an unknown model reaches the streaming
+%% `response.failed` path) rather than rejected as a 400 parse error.
+responses_codex_envelope_accepted(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"instructions">> => <<"You are a coding agent.">>,
+        <<"input">> => [
+            #{
+                <<"type">> => <<"message">>,
+                <<"role">> => <<"user">>,
+                <<"content">> => [
+                    #{<<"type">> => <<"input_text">>, <<"text">> => <<"write a function">>}
+                ]
+            }
+        ],
+        <<"stream">> => true,
+        <<"max_output_tokens">> => 8
+    }),
+    {ok, {{_, Status, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Bin = list_to_binary(RespBody),
+    %% Not a 400: the array-input + instructions envelope parsed. An
+    %% unknown model then fails at load, which on the streaming path
+    %% surfaces as a `response.failed` SSE event (HTTP 200).
+    ?assertNotEqual(400, Status),
+    case Status of
+        200 -> ?assert(binary:match(Bin, <<"event: response.failed">>) =/= nomatch);
+        _ -> ?assert(is_binary(Bin))
+    end.

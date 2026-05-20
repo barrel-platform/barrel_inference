@@ -37,7 +37,8 @@
     messages_streaming_runs/1,
     messages_non_streaming_runs/1,
     embeddings_runs/1,
-    multi_turn_cache_delta_profile/1
+    multi_turn_cache_delta_profile/1,
+    responses_previous_response_id_continues/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -55,7 +56,8 @@ all() ->
         messages_streaming_runs,
         messages_non_streaming_runs,
         embeddings_runs,
-        multi_turn_cache_delta_profile
+        multi_turn_cache_delta_profile,
+        responses_previous_response_id_continues
     ].
 
 %%====================================================================
@@ -481,6 +483,65 @@ multi_turn_cache_delta_profile(Cfg) ->
     Read3 = maps:get(<<"cache_read_input_tokens">>, Usage3, 0),
     ?assert(Read2 > 0),
     ?assert(Read3 > Read2).
+
+%% Two-turn /v1/responses conversation chained via
+%% previous_response_id. Turn 1 states a fact and yields a resp_ id;
+%% the continued turn sends only the new question plus that id. The
+%% mechanistic check is that continuation folds the prior turn into
+%% the prompt, so the continued request reports strictly more
+%% input_tokens than the same question asked cold. The model's recall
+%% of the fact is logged for a human to eyeball but not asserted (a
+%% tiny test model is not reliable enough to gate CI on).
+responses_previous_response_id_continues(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    {Id, _T1, _U1} = responses_turn(Url, #{
+        <<"model">> => <<"real">>,
+        <<"input">> => <<"Remember this fact: my name is Sam.">>,
+        <<"max_output_tokens">> => 16,
+        <<"stream">> => false
+    }),
+    ?assert(is_binary(Id) andalso byte_size(Id) > 0),
+    %% Control: ask the follow-up cold (no previous_response_id).
+    {_BareId, _BareText, BareUsage} = responses_turn(Url, #{
+        <<"model">> => <<"real">>,
+        <<"input">> => <<"What is my name?">>,
+        <<"max_output_tokens">> => 16,
+        <<"stream">> => false
+    }),
+    %% Continued: same question, chained to turn 1.
+    {_ContId, ContText, ContUsage} = responses_turn(Url, #{
+        <<"model">> => <<"real">>,
+        <<"input">> => <<"What is my name?">>,
+        <<"previous_response_id">> => Id,
+        <<"max_output_tokens">> => 16,
+        <<"stream">> => false
+    }),
+    BareIn = maps:get(<<"input_tokens">>, BareUsage, 0),
+    ContIn = maps:get(<<"input_tokens">>, ContUsage, 0),
+    ct:log(
+        "bare input_tokens=~B continued input_tokens=~B continued_text=~ts",
+        [BareIn, ContIn, ContText]
+    ),
+    ?assert(ContIn > BareIn),
+    ?assert(byte_size(ContText) > 0).
+
+responses_turn(Url, Body) ->
+    {ok, {{_, 200, _}, _, Resp}} = httpc:request(
+        post,
+        {Url, [], "application/json", json:encode(Body)},
+        [{timeout, 120000}],
+        []
+    ),
+    Decoded = json:decode(list_to_binary(Resp)),
+    Id = maps:get(<<"id">>, Decoded),
+    Usage = maps:get(<<"usage">>, Decoded),
+    {Id, responses_output_text(Decoded), Usage}.
+
+responses_output_text(Decoded) ->
+    case maps:get(<<"output">>, Decoded, []) of
+        [#{<<"content">> := [#{<<"text">> := T} | _]} | _] when is_binary(T) -> T;
+        _ -> <<>>
+    end.
 
 log_usage(TurnN, Usage) ->
     Input = maps:get(<<"input_tokens">>, Usage, 0),

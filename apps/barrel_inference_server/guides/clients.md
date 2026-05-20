@@ -324,20 +324,71 @@ curl -N -sX POST http://127.0.0.1:8080/v1/responses \
 Supported request fields: `model`, `input` (string or input-item
 array), `instructions`, `tools` (custom functions), `tool_choice`,
 `stream`, `max_output_tokens`, `temperature`, `top_p`,
-`parallel_tool_calls`, `metadata`. Function tool calls flow through
-the same wire-driven path as the other surfaces (auto-detected
-`tool_call_markers`), so a model that emits tool calls produces
-proper `function_call` output items.
+`parallel_tool_calls`, `previous_response_id`, `response_format`,
+`metadata`. Function tool calls flow through the same wire-driven
+path as the other surfaces (auto-detected `tool_call_markers`), so a
+model that emits tool calls produces proper `function_call` output
+items.
+
+`previous_response_id` continues a prior turn server-side. Each
+response is kept in a RAM-backed store (keyed on the `resp_<id>`)
+holding the full conversation; a follow-up request that sends only
+the new `input` plus `previous_response_id` resumes where the last
+turn left off:
+
+```sh
+# Turn 1 - capture the id.
+ID=$(curl -sX POST http://127.0.0.1:8080/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","input":"My name is Sam.","stream":false,"max_output_tokens":32}' \
+  | jq -r .id)
+
+# Turn 2 - continue without resending history.
+curl -sX POST http://127.0.0.1:8080/v1/responses \
+  -H 'content-type: application/json' \
+  -d "{\"model\":\"gpt-4o\",\"input\":\"What is my name?\",\"previous_response_id\":\"$ID\",\"stream\":false,\"max_output_tokens\":32}" \
+  | jq -r '.output[0].content[0].text'   # references "Sam"
+```
+
+The store is RAM only and TTL-bounded (`responses_store_ttl_ms`,
+default 1h), so a server restart or an expired id is not an error:
+the lookup misses and the turn proceeds from the `input` it was
+given. Codex replays the conversation in `input` regardless, so it
+keeps working either way.
+
+`response_format` installs a GBNF grammar that constrains the output
+to the schema (`{"type":"json_schema", ...}` or `json_object`),
+identical to `/v1/chat/completions`.
+
+`parallel_tool_calls` defaults to `true`, but the grammar emits a
+single tool call per turn: `false` is honoured exactly, and `true`
+is best-effort single (most local models call one tool at a time).
 
 Not yet wired (returns a clean error rather than silently ignoring):
 
-- `previous_response_id` — server-side stateful continuation. Codex
-  still works because it replays the full conversation in `input`;
-  the daemon logs a notice when it sees the field. (Follow-up: an
-  ETS-backed response store keyed on `resp_<id>`.)
 - Built-in tools (`web_search`, `file_search`, `computer_use`) —
   `501 feature_not_supported`.
 - `n > 1`, audio / image input parts, `prediction` — out of scope.
+
+## OpenCode
+
+OpenCode speaks `/v1/chat/completions` by default. Point it at the
+daemon with the standard OpenAI env vars and use one of your
+`model_aliases` as the model name:
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=not-used     # any value when the allowlist is empty
+opencode --model gpt-4o
+```
+
+Or via OpenCode's config, register a custom OpenAI-compatible
+provider whose `baseURL` is `http://127.0.0.1:8080/v1` and list the
+alias under `models`. The chat surface supports streaming with
+`stream_options.include_usage` (a trailing usage chunk with empty
+`choices`), `response_format` for structured edits, function
+`tools`, and `tool_choice` — the same fields documented under the
+OpenAI SDK section above.
 
 ## Claude Code as a local backend
 
