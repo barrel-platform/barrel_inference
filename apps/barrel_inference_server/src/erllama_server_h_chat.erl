@@ -82,6 +82,9 @@
     %% mode (text vs tool-call buffering)
     mode :: text | tool_buffer,
     grammar_set :: boolean(),
+    %% OpenAI stream_options.include_usage: when true, the streaming
+    %% finish emits a trailing usage-only chunk before [DONE].
+    include_usage = false :: boolean(),
     %% true once stream_reply/3 has fired. Separate from `ref` because
     %% a loading keepalive can open the stream before admission.
     stream_started = false :: boolean(),
@@ -181,6 +184,7 @@ init_state(R, Requested, Api, Worker, Mon) ->
         buf_reason = [],
         mode = text,
         grammar_set = grammar_active(R),
+        include_usage = R#erllama_request.include_usage,
         session_id = R#erllama_request.session_id,
         tool_format = resolve_tool_format(R#erllama_request.model_id)
     }.
@@ -471,7 +475,7 @@ finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
         Stats, S#st.req_id, S#st.requested
     ),
     cowboy_req:stream_body(
-        [<<"data: ">>, Final, <<"\n\n">>, <<"data: [DONE]\n\n">>],
+        [<<"data: ">>, Final, <<"\n\n">>, usage_chunk(S, Stats), <<"data: [DONE]\n\n">>],
         fin,
         Req0
     ),
@@ -480,9 +484,10 @@ finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
 finish_ok(Req0, S = #st{stream = true, mode = tool_buffer}, Stats) ->
     %% Emit one chat.completion.chunk with tool_calls populated, then
     %% [DONE]. v0.1 packs the entire JSON into a single delta entry.
+    ToolStats = maps:put(finish_reason, tool_call, Stats),
     Final = openai_tool_call_chunk(S, iolist_to_binary(S#st.buf_text)),
     Stop = erllama_server_translate:internal_to_openai_chat_final(
-        maps:put(finish_reason, tool_call, Stats),
+        ToolStats,
         S#st.req_id,
         S#st.requested
     ),
@@ -494,6 +499,7 @@ finish_ok(Req0, S = #st{stream = true, mode = tool_buffer}, Stats) ->
             <<"data: ">>,
             Stop,
             <<"\n\n">>,
+            usage_chunk(S, ToolStats),
             <<"data: [DONE]\n\n">>
         ],
         fin,
@@ -827,6 +833,17 @@ is_tool_first_byte(<<>>) -> false;
 is_tool_first_byte(<<C, _/binary>>) when C =:= $\s; C =:= $\t; C =:= $\r; C =:= $\n -> false;
 is_tool_first_byte(<<${, _/binary>>) -> true;
 is_tool_first_byte(_) -> false.
+
+%% Trailing `stream_options.include_usage` chunk + its `data:`
+%% framing, or empty iodata when the client didn't opt in. Slotted
+%% into the finish stream just before `[DONE]`.
+usage_chunk(#st{include_usage = false}, _Stats) ->
+    [];
+usage_chunk(S = #st{include_usage = true}, Stats) ->
+    Chunk = erllama_server_translate:internal_to_openai_usage_chunk(
+        Stats, S#st.req_id, S#st.requested
+    ),
+    [<<"data: ">>, Chunk, <<"\n\n">>].
 
 openai_tool_call_chunk(S, JsonBin) ->
     {Name, ArgsJson, ToolId} = extract_tool_call(S, JsonBin),

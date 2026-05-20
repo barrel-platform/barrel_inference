@@ -103,7 +103,19 @@
     %% out-of-box Claude Code requests cache-warm without requiring
     %% the SDK to send an explicit conversation id. Forwarded to
     %% `erllama:infer/4' on the `Params.session_id' key.
-    session_id = undefined :: undefined | binary()
+    session_id = undefined :: undefined | binary(),
+    %% OpenAI `stream_options.include_usage'. When true, the
+    %% streaming response carries a trailing chunk with empty
+    %% `choices' and a populated `usage' before `[DONE]'. When false
+    %% (default) no usage is emitted on the stream. Non-streaming
+    %% and the Responses surface always carry usage on the terminal
+    %% frame regardless.
+    include_usage = false :: boolean(),
+    %% OpenAI `parallel_tool_calls'. Default true (OpenAI's default).
+    %% The GBNF grammar emits a single tool call per turn, so `false'
+    %% is honoured exactly and `true' is best-effort single until a
+    %% multi-call grammar lands.
+    parallel_tool_calls = true :: boolean()
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

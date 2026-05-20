@@ -44,6 +44,7 @@
     internal_to_openai_chat_chunk/3,
     internal_to_openai_reasoning_chunk/3,
     internal_to_openai_chat_final/3,
+    internal_to_openai_usage_chunk/3,
     internal_to_openai_completion_response/3,
     internal_to_openai_embedding_response/3,
     internal_to_anthropic_messages_response/3,
@@ -463,15 +464,19 @@ internal_to_openai_reasoning_chunk(Token, ReqId, Model) ->
     },
     json:encode(Chunk).
 
-%% Final SSE frame for an OpenAI chat completion. Emits an empty
-%% delta with finish_reason set; the caller appends `[DONE]` after.
+%% Final SSE frame for an OpenAI chat completion: an empty delta
+%% with finish_reason set and `usage: null`. Per the OpenAI wire
+%% contract every chunk (including this one) carries `usage: null`;
+%% the real usage rides a separate trailing chunk emitted only when
+%% the client set `stream_options.include_usage` (see
+%% `internal_to_openai_usage_chunk/3'). The caller appends the
+%% optional usage chunk and `[DONE]` after.
 -spec internal_to_openai_chat_final(map(), binary(), binary()) -> iodata().
 internal_to_openai_chat_final(Stats, ReqId, Model) ->
-    Created = unix_seconds(),
     Final = #{
         <<"id">> => ReqId,
         <<"object">> => <<"chat.completion.chunk">>,
-        <<"created">> => Created,
+        <<"created">> => unix_seconds(),
         <<"model">> => Model,
         <<"choices">> => [
             #{
@@ -480,9 +485,24 @@ internal_to_openai_chat_final(Stats, ReqId, Model) ->
                 <<"finish_reason">> => finish_reason_atom(Stats)
             }
         ],
-        <<"usage">> => usage_map(Stats)
+        <<"usage">> => null
     },
     json:encode(Final).
+
+%% Trailing usage-only chunk for `stream_options.include_usage`.
+%% Empty `choices`, populated `usage`. Emitted just before
+%% `[DONE]', and only when the client opted in.
+-spec internal_to_openai_usage_chunk(map(), binary(), binary()) -> iodata().
+internal_to_openai_usage_chunk(Stats, ReqId, Model) ->
+    Chunk = #{
+        <<"id">> => ReqId,
+        <<"object">> => <<"chat.completion.chunk">>,
+        <<"created">> => unix_seconds(),
+        <<"model">> => Model,
+        <<"choices">> => [],
+        <<"usage">> => usage_map(Stats)
+    },
+    json:encode(Chunk).
 
 %% Non-streaming OpenAI chat response.
 -spec internal_to_openai_chat_response(binary(), map(), binary()) -> map().
@@ -942,8 +962,20 @@ base_request(Body, Api) ->
         stream = parse_bool(Body, <<"stream">>, false),
         thinking = disabled,
         api = Api,
-        request_id = make_id(prefix_for(Api))
+        request_id = make_id(prefix_for(Api)),
+        include_usage = parse_include_usage(Body),
+        parallel_tool_calls = parse_bool(Body, <<"parallel_tool_calls">>, true)
     }.
+
+%% OpenAI `stream_options: {"include_usage": true}`. Absent or
+%% malformed -> false. Only meaningful on the streaming path.
+parse_include_usage(Body) ->
+    case maps:get(<<"stream_options">>, Body, undefined) of
+        Opts when is_map(Opts) ->
+            parse_bool(Opts, <<"include_usage">>, false);
+        _ ->
+            false
+    end.
 
 prefix_for(openai) -> <<"chatcmpl-">>;
 prefix_for(anthropic) -> <<"msg_">>;

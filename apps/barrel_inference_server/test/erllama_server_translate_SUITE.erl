@@ -90,7 +90,12 @@
     responses_array_input_passes_through/1,
     responses_instructions_prepends_to_system/1,
     responses_tool_choice_required_overrides_default/1,
-    responses_builtin_tool_returns_error/1
+    responses_builtin_tool_returns_error/1,
+    %% openai stream usage + tool flags
+    stream_options_include_usage_parsed/1,
+    parallel_tool_calls_parsed/1,
+    chat_final_chunk_usage_null/1,
+    usage_chunk_has_empty_choices_and_usage/1
 ]).
 
 %%====================================================================
@@ -179,7 +184,11 @@ all() ->
         responses_array_input_passes_through,
         responses_instructions_prepends_to_system,
         responses_tool_choice_required_overrides_default,
-        responses_builtin_tool_returns_error
+        responses_builtin_tool_returns_error,
+        stream_options_include_usage_parsed,
+        parallel_tool_calls_parsed,
+        chat_final_chunk_usage_null,
+        usage_chunk_has_empty_choices_and_usage
     ].
 
 %%====================================================================
@@ -1054,13 +1063,10 @@ openai_chat_final_shape(_Cfg) ->
     [Ch] = maps:get(<<"choices">>, Decoded),
     ?assertEqual(<<"length">>, maps:get(<<"finish_reason">>, Ch)),
     ?assertEqual(#{}, maps:get(<<"delta">>, Ch)),
-    ?assertEqual(
-        3,
-        maps:get(
-            <<"total_tokens">>,
-            maps:get(<<"usage">>, Decoded)
-        )
-    ).
+    %% Per the OpenAI streaming contract the finish chunk carries
+    %% usage: null; real usage rides the separate trailing chunk
+    %% (see usage_chunk_has_empty_choices_and_usage).
+    ?assertEqual(null, maps:get(<<"usage">>, Decoded)).
 
 openai_completion_response_shape(_Cfg) ->
     R = erllama_server_translate:internal_to_openai_completion_response(
@@ -1403,6 +1409,47 @@ responses_builtin_tool_returns_error(_Cfg) ->
         {error, {builtin_tool_not_supported, <<"web_search">>}},
         erllama_server_translate:openai_responses_to_internal(Body)
     ).
+
+stream_options_include_usage_parsed(_Cfg) ->
+    Off = base_chat(),
+    {ok, R0} = erllama_server_translate:openai_chat_to_internal(Off),
+    ?assertEqual(false, R0#erllama_request.include_usage),
+    On = (base_chat())#{
+        <<"stream">> => true,
+        <<"stream_options">> => #{<<"include_usage">> => true}
+    },
+    {ok, R1} = erllama_server_translate:openai_chat_to_internal(On),
+    ?assertEqual(true, R1#erllama_request.include_usage).
+
+parallel_tool_calls_parsed(_Cfg) ->
+    {ok, RDefault} = erllama_server_translate:openai_chat_to_internal(base_chat()),
+    ?assertEqual(true, RDefault#erllama_request.parallel_tool_calls),
+    Off = (base_chat())#{<<"parallel_tool_calls">> => false},
+    {ok, ROff} = erllama_server_translate:openai_chat_to_internal(Off),
+    ?assertEqual(false, ROff#erllama_request.parallel_tool_calls).
+
+chat_final_chunk_usage_null(_Cfg) ->
+    Stats = #{prompt_tokens => 3, completion_tokens => 5, finish_reason => stop},
+    Io = erllama_server_translate:internal_to_openai_chat_final(
+        Stats, <<"chatcmpl-1">>, <<"gpt-4o">>
+    ),
+    Decoded = json:decode(iolist_to_binary(Io)),
+    %% Per OpenAI: every chunk (incl. finish) carries usage: null;
+    %% the real usage rides the separate trailing chunk.
+    ?assertEqual(null, maps:get(<<"usage">>, Decoded)),
+    [Choice] = maps:get(<<"choices">>, Decoded),
+    ?assertEqual(<<"stop">>, maps:get(<<"finish_reason">>, Choice)).
+
+usage_chunk_has_empty_choices_and_usage(_Cfg) ->
+    Stats = #{prompt_tokens => 3, completion_tokens => 5},
+    Io = erllama_server_translate:internal_to_openai_usage_chunk(
+        Stats, <<"chatcmpl-1">>, <<"gpt-4o">>
+    ),
+    Decoded = json:decode(iolist_to_binary(Io)),
+    ?assertEqual([], maps:get(<<"choices">>, Decoded)),
+    Usage = maps:get(<<"usage">>, Decoded),
+    ?assertEqual(3, maps:get(<<"prompt_tokens">>, Usage)),
+    ?assertEqual(5, maps:get(<<"completion_tokens">>, Usage)).
 
 %%====================================================================
 %% Helpers
