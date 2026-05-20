@@ -27,6 +27,8 @@
     tool_replay_dir/0,
     tool_replay_ttl_ms/0,
     tool_replay_gc_interval_ms/0,
+    responses_store_ttl_ms/0,
+    responses_store_gc_interval_ms/0,
     pool_policy_for/1,
     tracing_config/0,
     cors/0,
@@ -218,6 +220,24 @@ tool_replay_gc_interval_ms() ->
         60 * 60 * 1000
     ).
 
+%% TTL on stored Responses-API conversations for `previous_response_id'
+%% continuation. Defaults to 1h: long enough for an interactive Codex
+%% session, short enough that the RAM-only map stays bounded.
+-spec responses_store_ttl_ms() -> pos_integer().
+responses_store_ttl_ms() ->
+    persistent_term:get(
+        {?MODULE, responses_store_ttl_ms},
+        60 * 60 * 1000
+    ).
+
+%% Cadence of the periodic gc that evicts expired stored responses.
+-spec responses_store_gc_interval_ms() -> pos_integer().
+responses_store_gc_interval_ms() ->
+    persistent_term:get(
+        {?MODULE, responses_store_gc_interval_ms},
+        10 * 60 * 1000
+    ).
+
 ensure_string(B) when is_binary(B) -> binary_to_list(B);
 ensure_string(L) when is_list(L) -> L.
 
@@ -349,6 +369,14 @@ init([]) ->
     persistent_term:put(
         {?MODULE, tool_replay_gc_interval_ms},
         app_env(tool_replay_gc_interval_ms, 60 * 60 * 1000)
+    ),
+    persistent_term:put(
+        {?MODULE, responses_store_ttl_ms},
+        app_env(responses_store_ttl_ms, 60 * 60 * 1000)
+    ),
+    persistent_term:put(
+        {?MODULE, responses_store_gc_interval_ms},
+        app_env(responses_store_gc_interval_ms, 10 * 60 * 1000)
     ),
     {ok, #state{
         aliases = Aliases,

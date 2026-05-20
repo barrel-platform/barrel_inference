@@ -52,6 +52,13 @@ init([]) ->
         },
 
         #{
+            id => erllama_server_response_store,
+            start => {erllama_server_response_store, start_link, []},
+            type => worker,
+            shutdown => 5000
+        },
+
+        #{
             id => erllama_server_loaders_sup,
             start => {erllama_server_loaders_sup, start_link, []},
             type => supervisor,

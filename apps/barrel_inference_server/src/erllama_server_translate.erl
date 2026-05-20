@@ -140,7 +140,6 @@ openai_responses_to_internal(Body) when is_map(Body) ->
         RF = parse_response_format_openai(
             maps:get(<<"response_format">>, Body, undefined)
         ),
-        maybe_warn_previous_response_id(Body),
         Base = base_request(Body, openai),
         Base1 = Base#erllama_request{
             max_tokens = responses_max_tokens(Body, Base#erllama_request.max_tokens),
@@ -306,23 +305,6 @@ responses_max_tokens(Body, Default) ->
     case maps:get(<<"max_output_tokens">>, Body, undefined) of
         N when is_integer(N), N > 0 -> N;
         _ -> Default
-    end.
-
-%% `previous_response_id` deferred to a follow-up. Surface a notice so
-%% operators see early adopters who hit the future-feature wall.
-maybe_warn_previous_response_id(Body) ->
-    case maps:get(<<"previous_response_id">>, Body, undefined) of
-        undefined ->
-            ok;
-        null ->
-            ok;
-        _Id ->
-            logger:notice(#{
-                event => responses_previous_response_id_ignored,
-                message =>
-                    <<"previous_response_id is not yet supported; the client should replay input">>
-            }),
-            ok
     end.
 
 -spec openai_completion_to_internal(map()) ->

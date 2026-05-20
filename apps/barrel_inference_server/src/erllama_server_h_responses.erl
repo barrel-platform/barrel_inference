@@ -63,6 +63,10 @@
     stream_started = false :: boolean(),
     received_done = false :: boolean(),
     session_id = undefined :: undefined | binary(),
+    %% Full input conversation (post previous_response_id expansion),
+    %% in internal `#{role, content}' shape. The assistant reply is
+    %% appended and the whole thing stored for the next turn's lookup.
+    conv = [] :: [map()],
     %% Responses-specific state
     response_id :: binary() | undefined,
     msg_id :: binary() | undefined,
@@ -110,15 +114,37 @@ fast_phase(Body, Req0, Opts) ->
 
 translate(Map, Api, Req0) ->
     case erllama_server_translate:openai_responses_to_internal(Map) of
-        {ok, R} ->
-            R1 = R#erllama_request{
-                session_id = erllama_server_session:derive(Req0, R)
+        {ok, R0} ->
+            R1 = expand_previous_response(Map, R0),
+            R2 = R1#erllama_request{
+                session_id = erllama_server_session:derive(Req0, R1)
             },
-            start_pipeline(R1, Api, Req0);
+            start_pipeline(R2, Api, Req0);
         {error, {builtin_tool_not_supported, _} = Reason} ->
             reply_json_error(501, Reason, Req0);
         {error, Reason} ->
             reply_json_error(400, Reason, Req0)
+    end.
+
+%% Prepend the stored conversation for `previous_response_id' so the
+%% chat template renders the full history. A miss (TTL evict, restart,
+%% unknown id) proceeds without expansion - the client's `input'
+%% already replays the conversation in that case.
+expand_previous_response(Map, R) ->
+    case maps:get(<<"previous_response_id">>, Map, undefined) of
+        Id when is_binary(Id), Id =/= <<>> ->
+            case erllama_server_response_store:get(Id) of
+                {ok, {_Model, Prior}} ->
+                    R#erllama_request{messages = Prior ++ R#erllama_request.messages};
+                not_found ->
+                    logger:notice(#{
+                        event => responses_previous_response_id_miss,
+                        previous_response_id => Id
+                    }),
+                    R
+            end;
+        _ ->
+            R
     end.
 
 start_pipeline(R0, Api, Req0) ->
@@ -154,6 +180,7 @@ init_state(R, Requested, Api, Worker, Mon) ->
         mode = text,
         grammar_set = grammar_active(R),
         session_id = R#erllama_request.session_id,
+        conv = R#erllama_request.messages,
         response_id = erllama_server_translate:make_id(<<"resp_">>),
         msg_id = erllama_server_translate:make_id(<<"msg_">>),
         tool_format = resolve_tool_format(R#erllama_request.model_id)
@@ -553,6 +580,7 @@ finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
     ),
     cowboy_req:stream_body(Frame, fin, Req0),
     record_success(S1, Stats),
+    store_response(S1, Items),
     {stop, Req0, S1};
 finish_ok(Req0, S = #st{stream = true, mode = tool_buffer}, Stats0) ->
     %% Legacy first-byte tool buffering: the captured JSON is in buf_text.
@@ -610,6 +638,7 @@ finish_ok(Req0, S = #st{stream = true, mode = tool_buffer}, Stats0) ->
     ),
     cowboy_req:stream_body(Frame, fin, Req0),
     record_success(S1, Stats),
+    store_response(S1, Items),
     {stop, Req0, S1#st{out_index = OutIdx + 1}};
 finish_ok(Req0, S = #st{stream = false}, Stats0) ->
     Text = iolist_to_binary(S#st.buf_text),
@@ -624,7 +653,40 @@ finish_ok(Req0, S = #st{stream = false}, Stats0) ->
         Req0
     ),
     record_success(S, Stats),
+    store_response(S, Items),
     {stop, Req1, S}.
+
+%% Persist the full conversation (input + this turn's reply) under the
+%% response id so a later `previous_response_id' continues the chain.
+store_response(#st{response_id = undefined}, _Items) ->
+    ok;
+store_response(S = #st{response_id = ResponseId, model = Model}, Items) ->
+    Conv = S#st.conv ++ items_to_messages(Items),
+    erllama_server_response_store:put(ResponseId, Model, Conv).
+
+%% Convert the response `output' array into internal assistant
+%% messages. Text items become an assistant message; function_call
+%% items become a stable marker matching the replay shape the
+%% translator emits for prior tool calls.
+items_to_messages(Items) ->
+    [item_to_message(I) || I <- Items].
+
+item_to_message(#{<<"type">> := <<"message">>, <<"content">> := Content}) ->
+    #{role => <<"assistant">>, content => output_text(Content)};
+item_to_message(#{<<"type">> := <<"function_call">>} = Item) ->
+    Name = maps:get(<<"name">>, Item, <<"unknown">>),
+    Id = maps:get(<<"id">>, Item, <<>>),
+    #{
+        role => <<"assistant">>,
+        content => <<"[tool_call name=", Name/binary, " id=", Id/binary, "]">>
+    }.
+
+output_text([#{<<"type">> := <<"output_text">>, <<"text">> := Text} | _]) when
+    is_binary(Text)
+->
+    Text;
+output_text(_) ->
+    <<>>.
 
 %% Build the final output array for streaming `response.completed`. The
 %% text message item is rebuilt from buf_text + msg_id; function_call
