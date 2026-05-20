@@ -84,7 +84,13 @@
     anthropic_event_message_delta_emits_cache_read_on_exact_hit/1,
     anthropic_event_message_delta_emits_cache_creation_on_cold/1,
     anthropic_event_message_delta_emits_cache_creation_nested_5m/1,
-    anthropic_event_message_delta_emits_cache_creation_nested_1h/1
+    anthropic_event_message_delta_emits_cache_creation_nested_1h/1,
+    %% openai responses
+    responses_string_input_normalises_to_single_user_message/1,
+    responses_array_input_passes_through/1,
+    responses_instructions_prepends_to_system/1,
+    responses_tool_choice_required_overrides_default/1,
+    responses_builtin_tool_returns_error/1
 ]).
 
 %%====================================================================
@@ -168,7 +174,12 @@ all() ->
         anthropic_event_message_delta_emits_cache_read_on_exact_hit,
         anthropic_event_message_delta_emits_cache_creation_on_cold,
         anthropic_event_message_delta_emits_cache_creation_nested_5m,
-        anthropic_event_message_delta_emits_cache_creation_nested_1h
+        anthropic_event_message_delta_emits_cache_creation_nested_1h,
+        responses_string_input_normalises_to_single_user_message,
+        responses_array_input_passes_through,
+        responses_instructions_prepends_to_system,
+        responses_tool_choice_required_overrides_default,
+        responses_builtin_tool_returns_error
     ].
 
 %%====================================================================
@@ -1309,6 +1320,89 @@ anthropic_event_message_delta_emits_cache_creation_nested_1h(_Cfg) ->
     Bin = iolist_to_binary(Iolist),
     ?assert(binary:match(Bin, <<"\"ephemeral_5m_input_tokens\":0">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"ephemeral_1h_input_tokens\":64">>) =/= nomatch).
+
+%%====================================================================
+%% OpenAI Responses (/v1/responses)
+%%====================================================================
+
+responses_string_input_normalises_to_single_user_message(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"gpt-4o">>,
+        <<"input">> => <<"hello">>
+    },
+    {ok, R} = erllama_server_translate:openai_responses_to_internal(Body),
+    ?assertEqual(<<"gpt-4o">>, R#erllama_request.model_id),
+    ?assertEqual(openai, R#erllama_request.api),
+    ?assertEqual(
+        [#{role => <<"user">>, content => <<"hello">>}],
+        R#erllama_request.messages
+    ),
+    ?assertEqual(undefined, R#erllama_request.system).
+
+responses_array_input_passes_through(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"gpt-4o">>,
+        <<"input">> => [
+            #{<<"role">> => <<"user">>, <<"content">> => <<"a">>},
+            #{<<"role">> => <<"assistant">>, <<"content">> => <<"b">>},
+            #{<<"role">> => <<"user">>, <<"content">> => <<"c">>}
+        ]
+    },
+    {ok, R} = erllama_server_translate:openai_responses_to_internal(Body),
+    ?assertEqual(
+        [
+            #{role => <<"user">>, content => <<"a">>},
+            #{role => <<"assistant">>, content => <<"b">>},
+            #{role => <<"user">>, content => <<"c">>}
+        ],
+        R#erllama_request.messages
+    ).
+
+responses_instructions_prepends_to_system(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"gpt-4o">>,
+        <<"instructions">> => <<"You are a helpful assistant.">>,
+        <<"input">> => [
+            #{<<"role">> => <<"system">>, <<"content">> => <<"Speak French.">>},
+            #{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}
+        ]
+    },
+    {ok, R} = erllama_server_translate:openai_responses_to_internal(Body),
+    ?assertEqual(
+        <<"You are a helpful assistant.\n\nSpeak French.">>,
+        R#erllama_request.system
+    ).
+
+responses_tool_choice_required_overrides_default(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"gpt-4o">>,
+        <<"input">> => <<"hi">>,
+        <<"tool_choice">> => <<"required">>,
+        <<"tools">> => [
+            #{
+                <<"type">> => <<"function">>,
+                <<"function">> => #{
+                    <<"name">> => <<"search">>,
+                    <<"parameters">> => #{<<"type">> => <<"object">>}
+                }
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:openai_responses_to_internal(Body),
+    ?assertEqual(required, R#erllama_request.tool_choice),
+    [Tool] = R#erllama_request.tools,
+    ?assertEqual(<<"search">>, maps:get(name, Tool)).
+
+responses_builtin_tool_returns_error(_Cfg) ->
+    Body = #{
+        <<"model">> => <<"gpt-4o">>,
+        <<"input">> => <<"hi">>,
+        <<"tools">> => [#{<<"type">> => <<"web_search">>}]
+    },
+    ?assertMatch(
+        {error, {builtin_tool_not_supported, <<"web_search">>}},
+        erllama_server_translate:openai_responses_to_internal(Body)
+    ).
 
 %%====================================================================
 %% Helpers

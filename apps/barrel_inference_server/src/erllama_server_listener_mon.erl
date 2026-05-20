@@ -113,6 +113,7 @@ routes() ->
         {'_', [
             {"/v1/chat/completions", erllama_server_h_chat, #{api => openai}},
             {"/v1/completions", erllama_server_h_chat, #{api => openai_legacy}},
+            {"/v1/responses", erllama_server_h_responses, #{api => openai}},
             {"/v1/messages", erllama_server_h_messages, #{}},
             {"/v1/messages/count_tokens", erllama_server_h_messages, #{op => count_tokens}},
             {"/v1/embeddings", erllama_server_h_embeddings, #{}},

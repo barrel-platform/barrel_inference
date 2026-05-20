@@ -32,6 +32,7 @@
     %% request: in
     openai_chat_to_internal/1,
     openai_completion_to_internal/1,
+    openai_responses_to_internal/1,
     openai_embeddings_to_internal/1,
     anthropic_messages_to_internal/1,
     ollama_generate_to_internal/1,
@@ -56,7 +57,24 @@
     ollama_preload_response/4,
     internal_to_ollama_embed_response/4,
     internal_to_ollama_embeddings_legacy_response/3,
+    %% openai responses
+    internal_to_responses_object/5,
+    internal_to_responses_completed/5,
+    internal_to_responses_partial/2,
+    internal_to_responses_message_added/2,
+    internal_to_responses_content_added/2,
+    internal_to_responses_text_delta/3,
+    internal_to_responses_text_done/3,
+    internal_to_responses_content_done/3,
+    internal_to_responses_message_done/3,
+    internal_to_responses_function_call_added/4,
+    internal_to_responses_function_args_delta/2,
+    internal_to_responses_function_args_done/2,
+    internal_to_responses_function_call_done/4,
+    internal_to_responses_failed/4,
+    responses_event/2,
     %% helpers
+    make_id/1,
     parse_keep_alive/1,
     parse_response_format_openai/1,
     parse_response_format_ollama/1,
@@ -94,6 +112,217 @@ openai_chat_to_internal(Body) when is_map(Body) ->
     end;
 openai_chat_to_internal(_) ->
     {error, invalid_json}.
+
+%% OpenAI /v1/responses request body. `input` is either a string or a
+%% list of input items. `instructions` is prepended to any system
+%% message. Built-in tools (`web_search`, `file_search`,
+%% `computer_use_preview`) raise `{error, {builtin_tool_not_supported, _}}`
+%% so the handler can answer 501. `max_output_tokens` is the Responses
+%% naming for the chat-completions `max_tokens` cap.
+-spec openai_responses_to_internal(map()) ->
+    {ok, #erllama_request{}} | {error, term()}.
+openai_responses_to_internal(Body) when is_map(Body) ->
+    try
+        Model = required_binary(Body, <<"model">>),
+        InputRaw =
+            case maps:get(<<"input">>, Body, undefined) of
+                undefined -> throw({error, {missing_field, <<"input">>}});
+                V -> V
+            end,
+        {SystemFromInput, MessagesIn} = parse_responses_input(InputRaw),
+        check_messages_cap(MessagesIn),
+        Instructions = parse_responses_instructions(Body),
+        System = merge_instructions_system(Instructions, SystemFromInput),
+        Tools = parse_responses_tools(Body),
+        check_tools_cap(Tools),
+        ToolChoice = parse_openai_tool_choice(Body),
+        RF = parse_response_format_openai(
+            maps:get(<<"response_format">>, Body, undefined)
+        ),
+        maybe_warn_previous_response_id(Body),
+        Base = base_request(Body, openai),
+        Base1 = Base#erllama_request{
+            max_tokens = responses_max_tokens(Body, Base#erllama_request.max_tokens),
+            user_id = parse_metadata_user_id(Body)
+        },
+        {ok, Base1#erllama_request{
+            model_id = Model,
+            messages = MessagesIn,
+            prompt = undefined,
+            system = System,
+            tools = Tools,
+            tool_choice = ToolChoice,
+            response_format = RF
+        }}
+    catch
+        throw:{error, _} = E -> E
+    end;
+openai_responses_to_internal(_) ->
+    {error, invalid_json}.
+
+%% Parse the Responses `input` field. A bare string maps to a single
+%% user message. A list normalises each item to the internal message
+%% shape. We tolerate a "message"-typed wrapper (the Responses API
+%% sometimes wraps role/content in `{"type":"message", ...}`) and a
+%% plain `{"role":..., "content":...}` form. The split returns any
+%% `system`-role messages separately so a top-level `instructions`
+%% field can be prepended.
+parse_responses_input(B) when is_binary(B) ->
+    {undefined, [#{role => <<"user">>, content => B}]};
+parse_responses_input(L) when is_list(L) ->
+    Normalised = [normalise_responses_input_item(I) || I <- L],
+    {Sys, Rest} = split_responses_system(Normalised),
+    {Sys, Rest};
+parse_responses_input(_) ->
+    throw({error, {invalid_field, <<"input">>}}).
+
+normalise_responses_input_item(B) when is_binary(B) ->
+    #{role => <<"user">>, content => B};
+normalise_responses_input_item(#{<<"type">> := Type} = Item) when is_binary(Type) ->
+    %% A handful of `type` values are valid wrappers: "message",
+    %% "input_text" (used for vision-shaped content blocks). The
+    %% built-in server tool items show up here as e.g. "web_search",
+    %% "file_search", "computer_use_preview" and must be rejected
+    %% with 501.
+    case Type of
+        <<"message">> ->
+            normalise_responses_message(Item);
+        <<"input_text">> ->
+            #{
+                role => <<"user">>,
+                content => content_value(maps:get(<<"text">>, Item, <<>>))
+            };
+        <<"function_call">> ->
+            %% Replayed assistant tool_call from a prior turn. Treat as
+            %% an assistant message with a stable marker so the inference
+            %% context preserves the call.
+            Name = maps:get(<<"name">>, Item, <<"unknown">>),
+            Id = maps:get(<<"id">>, Item, <<>>),
+            Marker = <<"[tool_call name=", Name/binary, " id=", Id/binary, "]">>,
+            #{role => <<"assistant">>, content => Marker};
+        <<"function_call_output">> ->
+            CallId = maps:get(<<"call_id">>, Item, <<>>),
+            Output = maps:get(<<"output">>, Item, <<>>),
+            Body = content_value(Output),
+            #{
+                role => <<"tool">>,
+                content => <<"[tool_result id=", CallId/binary, "]: ", Body/binary>>
+            };
+        Builtin when
+            Builtin =:= <<"web_search">>;
+            Builtin =:= <<"file_search">>;
+            Builtin =:= <<"computer_use_preview">>;
+            Builtin =:= <<"code_interpreter">>
+        ->
+            throw({error, {builtin_tool_not_supported, Builtin}});
+        Other ->
+            throw({error, {unsupported_input_part, Other}})
+    end;
+normalise_responses_input_item(#{<<"role">> := _} = Msg) ->
+    normalise_responses_message(Msg);
+normalise_responses_input_item(_) ->
+    throw({error, {invalid_field, <<"input">>}}).
+
+normalise_responses_message(#{<<"role">> := Role} = M) ->
+    #{role => Role, content => content_value(maps:get(<<"content">>, M, <<>>))};
+normalise_responses_message(_) ->
+    throw({error, {invalid_field, <<"input">>}}).
+
+split_responses_system(Items) ->
+    {SysParts, Rest} =
+        lists:partition(
+            fun
+                (#{role := <<"system">>}) -> true;
+                (_) -> false
+            end,
+            Items
+        ),
+    System =
+        case SysParts of
+            [] -> undefined;
+            _ -> binary_join([sys_text(M) || M <- SysParts], <<"\n\n">>)
+        end,
+    {System, Rest}.
+
+sys_text(#{content := B}) when is_binary(B) -> B.
+
+parse_responses_instructions(Body) ->
+    case maps:get(<<"instructions">>, Body, undefined) of
+        undefined -> undefined;
+        null -> undefined;
+        B when is_binary(B), B =/= <<>> -> B;
+        _ -> undefined
+    end.
+
+%% `instructions` is prepended to the system message; when the input
+%% has no system part the instructions become the system text.
+merge_instructions_system(undefined, System) ->
+    System;
+merge_instructions_system(Instructions, undefined) ->
+    Instructions;
+merge_instructions_system(Instructions, System) ->
+    <<Instructions/binary, "\n\n", System/binary>>.
+
+%% Responses-shape tools. The Responses API accepts the same function
+%% shape as Chat Completions (under `{"type":"function", "function":
+%% {...}}`) plus built-in server tools. We accept the function form
+%% and reject anything else with a 501-mapped error so the handler can
+%% answer with the right HTTP status.
+parse_responses_tools(Body) ->
+    case maps:get(<<"tools">>, Body, undefined) of
+        undefined ->
+            undefined;
+        Tools when is_list(Tools) ->
+            [parse_responses_tool(T) || T <- Tools];
+        _ ->
+            undefined
+    end.
+
+parse_responses_tool(#{<<"type">> := <<"function">>, <<"function">> := F}) when
+    is_map(F)
+->
+    #{
+        name => maps:get(<<"name">>, F),
+        description => maps:get(<<"description">>, F, <<>>),
+        schema => maps:get(<<"parameters">>, F, #{})
+    };
+parse_responses_tool(#{<<"type">> := <<"function">>} = F) ->
+    %% Some Responses-shape callers flatten function fields onto the
+    %% tool object directly (no nested `function` key).
+    #{
+        name => maps:get(<<"name">>, F),
+        description => maps:get(<<"description">>, F, <<>>),
+        schema => maps:get(<<"parameters">>, F, #{})
+    };
+parse_responses_tool(#{<<"type">> := Type}) when is_binary(Type) ->
+    throw({error, {builtin_tool_not_supported, Type}});
+parse_responses_tool(_) ->
+    throw({error, {invalid_field, <<"tools">>}}).
+
+%% Responses uses `max_output_tokens` instead of `max_tokens`. When
+%% both are present, `max_output_tokens` wins.
+responses_max_tokens(Body, Default) ->
+    case maps:get(<<"max_output_tokens">>, Body, undefined) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> Default
+    end.
+
+%% `previous_response_id` deferred to a follow-up. Surface a notice so
+%% operators see early adopters who hit the future-feature wall.
+maybe_warn_previous_response_id(Body) ->
+    case maps:get(<<"previous_response_id">>, Body, undefined) of
+        undefined ->
+            ok;
+        null ->
+            ok;
+        _Id ->
+            logger:notice(#{
+                event => responses_previous_response_id_ignored,
+                message =>
+                    <<"previous_response_id is not yet supported; the client should replay input">>
+            }),
+            ok
+    end.
 
 -spec openai_completion_to_internal(map()) ->
     {ok, #erllama_request{}} | {error, term()}.
@@ -293,6 +522,229 @@ internal_to_openai_completion_response(Text, Stats, Model) ->
             }
         ],
         <<"usage">> => usage_map(Stats)
+    }.
+
+%%====================================================================
+%% OpenAI Responses (/v1/responses)
+%%
+%% Non-streaming returns one JSON envelope. Streaming emits a series of
+%% named SSE events; the handler owns the index bookkeeping (one
+%% `output_index` per top-level output item, one `content_index` per
+%% content part inside a message item).
+%%====================================================================
+
+%% Non-streaming /v1/responses response object. `Items` is the list of
+%% complete output items already shaped by the handler (one message
+%% item with `output_text` parts and zero or more function_call items).
+-spec internal_to_responses_object(
+    binary(), binary(), [map()], map(), binary()
+) -> map().
+internal_to_responses_object(ResponseId, _MsgId, Items, Stats, Model) when
+    is_list(Items)
+->
+    #{
+        <<"id">> => ResponseId,
+        <<"object">> => <<"response">>,
+        <<"created_at">> => unix_seconds(),
+        <<"status">> => <<"completed">>,
+        <<"model">> => Model,
+        <<"output">> => Items,
+        <<"usage">> => usage_map_responses(Stats),
+        <<"metadata">> => #{}
+    }.
+
+%% Streaming counterpart: payload for the `response.completed` event.
+-spec internal_to_responses_completed(
+    binary(), binary(), [map()], map(), binary()
+) -> map().
+internal_to_responses_completed(ResponseId, MsgId, Items, Stats, Model) ->
+    #{
+        <<"response">> =>
+            internal_to_responses_object(ResponseId, MsgId, Items, Stats, Model)
+    }.
+
+%% Streaming `response.created` payload. Partial response object with
+%% `status: in_progress` and an empty output array. The streaming
+%% handler emits this immediately after `stream_reply/3`.
+-spec internal_to_responses_partial(binary(), binary()) -> map().
+internal_to_responses_partial(ResponseId, Model) ->
+    #{
+        <<"response">> => #{
+            <<"id">> => ResponseId,
+            <<"object">> => <<"response">>,
+            <<"created_at">> => unix_seconds(),
+            <<"status">> => <<"in_progress">>,
+            <<"model">> => Model,
+            <<"output">> => [],
+            <<"metadata">> => #{}
+        }
+    }.
+
+%% `response.output_item.added` for the assistant message item. The
+%% item is partial: status=in_progress, empty content array; content
+%% parts are streamed in as `response.content_part.added`.
+-spec internal_to_responses_message_added(non_neg_integer(), binary()) -> map().
+internal_to_responses_message_added(OutIndex, MsgId) ->
+    #{
+        <<"output_index">> => OutIndex,
+        <<"item">> => #{
+            <<"type">> => <<"message">>,
+            <<"id">> => MsgId,
+            <<"role">> => <<"assistant">>,
+            <<"status">> => <<"in_progress">>,
+            <<"content">> => []
+        }
+    }.
+
+%% `response.content_part.added` for an output_text part.
+-spec internal_to_responses_content_added(
+    non_neg_integer(), non_neg_integer()
+) -> map().
+internal_to_responses_content_added(OutIndex, ContentIndex) ->
+    #{
+        <<"output_index">> => OutIndex,
+        <<"content_index">> => ContentIndex,
+        <<"part">> => #{<<"type">> => <<"output_text">>, <<"text">> => <<>>}
+    }.
+
+%% `response.output_text.delta` per token chunk.
+-spec internal_to_responses_text_delta(
+    non_neg_integer(), non_neg_integer(), binary()
+) -> map().
+internal_to_responses_text_delta(OutIndex, ContentIndex, Delta) ->
+    #{
+        <<"output_index">> => OutIndex,
+        <<"content_index">> => ContentIndex,
+        <<"delta">> => Delta
+    }.
+
+%% `response.output_text.done` carrying the full text emitted into the
+%% part.
+-spec internal_to_responses_text_done(
+    non_neg_integer(), non_neg_integer(), binary()
+) -> map().
+internal_to_responses_text_done(OutIndex, ContentIndex, Text) ->
+    #{
+        <<"output_index">> => OutIndex,
+        <<"content_index">> => ContentIndex,
+        <<"text">> => Text
+    }.
+
+%% `response.content_part.done` closing the part with its full text.
+-spec internal_to_responses_content_done(
+    non_neg_integer(), non_neg_integer(), binary()
+) -> map().
+internal_to_responses_content_done(OutIndex, ContentIndex, Text) ->
+    #{
+        <<"output_index">> => OutIndex,
+        <<"content_index">> => ContentIndex,
+        <<"part">> => #{<<"type">> => <<"output_text">>, <<"text">> => Text}
+    }.
+
+%% `response.output_item.done` for the assistant message item, with the
+%% complete content array (one or more output_text parts).
+-spec internal_to_responses_message_done(
+    non_neg_integer(), binary(), binary()
+) -> map().
+internal_to_responses_message_done(OutIndex, MsgId, Text) ->
+    #{
+        <<"output_index">> => OutIndex,
+        <<"item">> => #{
+            <<"type">> => <<"message">>,
+            <<"id">> => MsgId,
+            <<"role">> => <<"assistant">>,
+            <<"status">> => <<"completed">>,
+            <<"content">> => [
+                #{<<"type">> => <<"output_text">>, <<"text">> => Text}
+            ]
+        }
+    }.
+
+%% `response.output_item.added` for a function_call item. Partial:
+%% name is known, arguments are empty until the deltas finish.
+-spec internal_to_responses_function_call_added(
+    non_neg_integer(), binary(), binary(), binary()
+) -> map().
+internal_to_responses_function_call_added(OutIndex, FcId, CallId, Name) ->
+    #{
+        <<"output_index">> => OutIndex,
+        <<"item">> => #{
+            <<"type">> => <<"function_call">>,
+            <<"id">> => FcId,
+            <<"call_id">> => CallId,
+            <<"name">> => Name,
+            <<"arguments">> => <<>>,
+            <<"status">> => <<"in_progress">>
+        }
+    }.
+
+%% `response.function_call_arguments.delta` carrying a JSON chunk.
+-spec internal_to_responses_function_args_delta(
+    non_neg_integer(), binary()
+) -> map().
+internal_to_responses_function_args_delta(OutIndex, Delta) ->
+    #{<<"output_index">> => OutIndex, <<"delta">> => Delta}.
+
+%% `response.function_call_arguments.done` with the full arguments
+%% JSON string.
+-spec internal_to_responses_function_args_done(
+    non_neg_integer(), binary()
+) -> map().
+internal_to_responses_function_args_done(OutIndex, Arguments) ->
+    #{<<"output_index">> => OutIndex, <<"arguments">> => Arguments}.
+
+%% `response.output_item.done` for a function_call item.
+-spec internal_to_responses_function_call_done(
+    non_neg_integer(), binary(), binary(), binary()
+) -> map().
+internal_to_responses_function_call_done(OutIndex, FcId, CallId, Name) ->
+    %% Arguments are passed by the caller as a JSON string already
+    %% built from the captured tool_use input. We fold them into the
+    %% Name arg slot for simplicity.
+    #{
+        <<"output_index">> => OutIndex,
+        <<"item">> => #{
+            <<"type">> => <<"function_call">>,
+            <<"id">> => FcId,
+            <<"call_id">> => CallId,
+            <<"name">> => Name,
+            <<"status">> => <<"completed">>
+        }
+    }.
+
+%% `response.failed` payload: a response object stamped with
+%% status=failed and an error envelope. Used by the streaming handler
+%% on post-stream errors.
+-spec internal_to_responses_failed(
+    binary(), binary(), binary(), binary()
+) -> map().
+internal_to_responses_failed(ResponseId, Model, Code, Message) ->
+    #{
+        <<"response">> => #{
+            <<"id">> => ResponseId,
+            <<"object">> => <<"response">>,
+            <<"created_at">> => unix_seconds(),
+            <<"status">> => <<"failed">>,
+            <<"model">> => Model,
+            <<"output">> => [],
+            <<"error">> => #{<<"code">> => Code, <<"message">> => Message}
+        }
+    }.
+
+%% SSE renderer for /v1/responses events. Same wire shape as sse/2.
+-spec responses_event(binary(), map()) -> iodata().
+responses_event(EventName, Payload) ->
+    sse(EventName, Payload).
+
+%% Responses uses input_tokens / output_tokens / total_tokens (not the
+%% chat-completions prompt_tokens / completion_tokens).
+usage_map_responses(Stats) ->
+    PromptTokens = maps:get(prompt_tokens, Stats, 0),
+    CompletionTokens = maps:get(completion_tokens, Stats, 0),
+    #{
+        <<"input_tokens">> => PromptTokens,
+        <<"output_tokens">> => CompletionTokens,
+        <<"total_tokens">> => PromptTokens + CompletionTokens
     }.
 
 %% OpenAI embeddings response. `Vectors` is a list of float-lists in

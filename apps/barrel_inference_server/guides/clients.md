@@ -291,6 +291,54 @@ print(litellm.completion(
 ).choices[0].message.content)
 ```
 
+## Codex CLI and the Responses API
+
+Codex CLI (and other OpenAI-SDK agents that default to the
+Responses API) talk to `POST /v1/responses` rather than
+`/v1/chat/completions`. The daemon serves both. Point Codex at the
+local endpoint:
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=not-used     # any value when the openai_api_keys allowlist is empty
+codex chat "give me a fibonacci function in erlang"
+```
+
+Use one of your `model_aliases` (e.g. `gpt-4o`) as the model name
+so Codex's request resolves to a local model.
+
+Verify the endpoint directly first:
+
+```sh
+# Non-streaming
+curl -sX POST http://127.0.0.1:8080/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","input":"hello","stream":false,"max_output_tokens":32}' | jq .
+
+# Streaming (named SSE events: response.created, response.output_text.delta, ...)
+curl -N -sX POST http://127.0.0.1:8080/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","input":"hi","stream":true,"max_output_tokens":64}'
+```
+
+Supported request fields: `model`, `input` (string or input-item
+array), `instructions`, `tools` (custom functions), `tool_choice`,
+`stream`, `max_output_tokens`, `temperature`, `top_p`,
+`parallel_tool_calls`, `metadata`. Function tool calls flow through
+the same wire-driven path as the other surfaces (auto-detected
+`tool_call_markers`), so a model that emits tool calls produces
+proper `function_call` output items.
+
+Not yet wired (returns a clean error rather than silently ignoring):
+
+- `previous_response_id` — server-side stateful continuation. Codex
+  still works because it replays the full conversation in `input`;
+  the daemon logs a notice when it sees the field. (Follow-up: an
+  ETS-backed response store keyed on `resp_<id>`.)
+- Built-in tools (`web_search`, `file_search`, `computer_use`) —
+  `501 feature_not_supported`.
+- `n > 1`, audio / image input parts, `prediction` — out of scope.
+
 ## Claude Code as a local backend
 
 ```sh

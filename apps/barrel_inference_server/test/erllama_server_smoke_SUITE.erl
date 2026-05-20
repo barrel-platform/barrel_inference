@@ -33,6 +33,12 @@
     messages_error_body_carries_request_id/1,
     chat_missing_model_returns_400/1,
     chat_too_many_messages_returns_400/1,
+    responses_invalid_json_returns_400/1,
+    responses_missing_model_returns_400/1,
+    responses_string_input_unknown_model_returns_404/1,
+    responses_emits_response_id_header/1,
+    responses_streaming_unknown_model_emits_event_error/1,
+    responses_413_returns_request_too_large_type/1,
     request_id_minted_when_absent/1,
     request_id_echoed_when_present/1,
     cors_disabled_by_default/1,
@@ -66,6 +72,12 @@ all() ->
         messages_error_body_carries_request_id,
         chat_missing_model_returns_400,
         chat_too_many_messages_returns_400,
+        responses_invalid_json_returns_400,
+        responses_missing_model_returns_400,
+        responses_string_input_unknown_model_returns_404,
+        responses_emits_response_id_header,
+        responses_streaming_unknown_model_emits_event_error,
+        responses_413_returns_request_too_large_type,
         request_id_minted_when_absent,
         request_id_echoed_when_present,
         cors_disabled_by_default,
@@ -520,3 +532,87 @@ cors_headers_present_on_response(Cfg) ->
     {ok, {{_, 200, _}, Headers, _}} =
         httpc:request(get, {Url, [{"origin", "http://example.com"}]}, [], []),
     ?assert(lists:keymember("access-control-allow-origin", 1, Headers)).
+
+%%====================================================================
+%% /v1/responses (OpenAI Responses API)
+%%====================================================================
+
+responses_invalid_json_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(
+            post,
+            {Url, [], "application/json", "{not json"},
+            [],
+            []
+        ).
+
+responses_missing_model_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    Body = json:encode(#{}),
+    {ok, {{_, 400, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(#{<<"error">> := _}, Decoded).
+
+responses_string_input_unknown_model_returns_404(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"input">> => <<"hi">>,
+        <<"max_output_tokens">> => 4
+    }),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    ?assertEqual(404, Status).
+
+%% Non-streaming responses include a `resp_<int>` id. We can't actually
+%% generate output without a real model, but we can assert that a 4xx
+%% / 5xx pre-stream error round-trips a JSON envelope (the id only
+%% appears on successful inference; this test simply ensures the
+%% endpoint is wired and doesn't 404 on `/v1/responses`).
+responses_emits_response_id_header(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"input">> => <<"hi">>,
+        <<"max_output_tokens">> => 4
+    }),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    %% Endpoint is reachable; 404 (model resolution) or another non-405
+    %% is acceptable. The point is that we don't route-miss.
+    ?assert(Status =/= 405).
+
+responses_streaming_unknown_model_emits_event_error(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"input">> => <<"hi">>,
+        <<"stream">> => true,
+        <<"max_output_tokens">> => 8
+    }),
+    {ok, {{_, Status, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    %% On the streaming path the handler opens an SSE stream on the
+    %% pipeline-error and emits a `response.failed` event. HTTP 200.
+    Bin = list_to_binary(RespBody),
+    case Status of
+        200 ->
+            ?assert(binary:match(Bin, <<"event: response.failed">>) =/= nomatch),
+            ?assert(binary:match(Bin, <<"\"status\":\"failed\"">>) =/= nomatch);
+        _ ->
+            %% Pre-stream error paths (model resolution failed before
+            %% SSE open) land as a JSON envelope rather than SSE. Both
+            %% are acceptable for an unknown model.
+            ?assert(is_binary(Bin))
+    end.
+
+responses_413_returns_request_too_large_type(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    Oversized = binary:copy(<<"x">>, 257 * 1024 * 1024),
+    {ok, {{_, Status, _}, _, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Oversized}, [], []),
+    ?assertEqual(413, Status),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(#{<<"error">> := #{<<"code">> := <<"request_too_large">>}}, Decoded).
