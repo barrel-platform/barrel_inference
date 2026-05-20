@@ -79,7 +79,11 @@
     %% block (mirrors h_chat / h_messages).
     tool_format = undefined :: undefined | erllama_server_tool_format:spec(),
     captured_tool_use = undefined ::
-        undefined | #{id := binary(), name := binary(), input := map()}
+        undefined | #{id := binary(), name := binary(), input := map()},
+    %% Built-in tools the server executes in-process, keyed by the
+    %% model-facing name. Empty unless an executor is registered for a
+    %% requested built-in; drives the agentic continue-loop.
+    server_tools = #{} :: #{binary() => erllama_server_tool_executor:spec()}
 }).
 
 %%====================================================================
@@ -120,8 +124,6 @@ translate(Map, Api, Req0) ->
                 session_id = erllama_server_session:derive(Req0, R1)
             },
             start_pipeline(R2, Api, Req0);
-        {error, {builtin_tool_not_supported, _} = Reason} ->
-            reply_json_error(501, Reason, Req0);
         {error, Reason} ->
             reply_json_error(400, Reason, Req0)
     end.
@@ -183,7 +185,8 @@ init_state(R, Requested, Api, Worker, Mon) ->
         conv = R#erllama_request.messages,
         response_id = erllama_server_translate:make_id(<<"resp_">>),
         msg_id = erllama_server_translate:make_id(<<"msg_">>),
-        tool_format = resolve_tool_format(R#erllama_request.model_id)
+        tool_format = resolve_tool_format(R#erllama_request.model_id),
+        server_tools = R#erllama_request.server_tools
     }.
 
 resolve_tool_format(ModelId) ->
@@ -988,13 +991,10 @@ error_message({context_overflow, Tokens, Ctx}) ->
             [Tokens, Ctx]
         )
     );
-error_message({builtin_tool_not_supported, Type}) when is_binary(Type) ->
-    <<"built-in tool not supported: ", Type/binary>>;
 error_message(Reason) ->
     to_bin(Reason).
 
 error_code({context_overflow, _, _}) -> <<"context_length_exceeded">>;
-error_code({builtin_tool_not_supported, _}) -> <<"feature_not_supported">>;
 error_code(Reason) -> to_bin(Reason).
 
 error_type(400) -> <<"invalid_request_error">>;

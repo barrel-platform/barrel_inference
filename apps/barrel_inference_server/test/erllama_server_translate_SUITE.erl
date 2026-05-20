@@ -90,7 +90,10 @@
     responses_array_input_passes_through/1,
     responses_instructions_prepends_to_system/1,
     responses_tool_choice_required_overrides_default/1,
-    responses_builtin_tool_returns_error/1,
+    responses_builtin_tool_dropped/1,
+    responses_namespace_tools_flattened/1,
+    responses_builtin_tool_with_executor_synthesised/1,
+    responses_input_builtin_item_dropped/1,
     %% openai stream usage + tool flags
     stream_options_include_usage_parsed/1,
     parallel_tool_calls_parsed/1,
@@ -184,7 +187,10 @@ all() ->
         responses_array_input_passes_through,
         responses_instructions_prepends_to_system,
         responses_tool_choice_required_overrides_default,
-        responses_builtin_tool_returns_error,
+        responses_builtin_tool_dropped,
+        responses_namespace_tools_flattened,
+        responses_builtin_tool_with_executor_synthesised,
+        responses_input_builtin_item_dropped,
         stream_options_include_usage_parsed,
         parallel_tool_calls_parsed,
         chat_final_chunk_usage_null,
@@ -1399,15 +1405,102 @@ responses_tool_choice_required_overrides_default(_Cfg) ->
     [Tool] = R#erllama_request.tools,
     ?assertEqual(<<"search">>, maps:get(name, Tool)).
 
-responses_builtin_tool_returns_error(_Cfg) ->
+responses_builtin_tool_dropped(_Cfg) ->
+    %% No executor registered for web_search => the built-in is dropped
+    %% from the model-facing tools and recorded nowhere, rather than
+    %% 501ing the whole request.
+    persistent_term:erase({erllama_server_config, builtin_tool_executors}),
     Body = #{
         <<"model">> => <<"gpt-4o">>,
         <<"input">> => <<"hi">>,
         <<"tools">> => [#{<<"type">> => <<"web_search">>}]
     },
-    ?assertMatch(
-        {error, {builtin_tool_not_supported, <<"web_search">>}},
-        erllama_server_translate:openai_responses_to_internal(Body)
+    {ok, R} = erllama_server_translate:openai_responses_to_internal(Body),
+    ?assertEqual([], R#erllama_request.tools),
+    ?assertEqual(#{}, R#erllama_request.server_tools).
+
+responses_namespace_tools_flattened(_Cfg) ->
+    %% An MCP `namespace` tool inlines its own function tools (Codex's
+    %% mcp__codex_apps__github). They flatten into the model-facing
+    %% list as ordinary client-executed function tools.
+    Body = #{
+        <<"model">> => <<"gpt-4o">>,
+        <<"input">> => <<"hi">>,
+        <<"tools">> => [
+            #{
+                <<"type">> => <<"function">>,
+                <<"name">> => <<"shell">>,
+                <<"parameters">> => #{<<"type">> => <<"object">>}
+            },
+            #{
+                <<"type">> => <<"namespace">>,
+                <<"name">> => <<"mcp__github">>,
+                <<"tools">> => [
+                    #{
+                        <<"type">> => <<"function">>,
+                        <<"name">> => <<"add_comment">>,
+                        <<"parameters">> => #{<<"type">> => <<"object">>}
+                    },
+                    #{
+                        <<"type">> => <<"function">>,
+                        <<"name">> => <<"add_labels">>,
+                        <<"parameters">> => #{<<"type">> => <<"object">>}
+                    }
+                ]
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:openai_responses_to_internal(Body),
+    Names = [maps:get(name, T) || T <- R#erllama_request.tools],
+    ?assertEqual([<<"shell">>, <<"add_comment">>, <<"add_labels">>], Names),
+    ?assertEqual(#{}, R#erllama_request.server_tools).
+
+responses_builtin_tool_with_executor_synthesised(_Cfg) ->
+    %% A built-in with a registered executor is synthesised into a
+    %% model-facing tool (from declare/0) AND recorded in server_tools.
+    persistent_term:put(
+        {erllama_server_config, builtin_tool_executors},
+        #{
+            <<"web_search">> => #{
+                module => erllama_server_tool_executor_stub,
+                type => <<"web_search">>
+            }
+        }
+    ),
+    try
+        Body = #{
+            <<"model">> => <<"gpt-4o">>,
+            <<"input">> => <<"hi">>,
+            <<"tools">> => [#{<<"type">> => <<"web_search">>}]
+        },
+        {ok, R} = erllama_server_translate:openai_responses_to_internal(Body),
+        ?assertMatch([#{name := <<"web_search">>, schema := _}], R#erllama_request.tools),
+        ?assertMatch(
+            #{<<"web_search">> := #{module := erllama_server_tool_executor_stub}},
+            R#erllama_request.server_tools
+        )
+    after
+        persistent_term:erase({erllama_server_config, builtin_tool_executors})
+    end.
+
+responses_input_builtin_item_dropped(_Cfg) ->
+    %% A built-in tool call/result item replayed in `input` is dropped
+    %% (not 501'd); the surrounding user message still parses.
+    Body = #{
+        <<"model">> => <<"gpt-4o">>,
+        <<"input">> => [
+            #{<<"type">> => <<"web_search_call">>, <<"id">> => <<"ws_1">>},
+            #{
+                <<"type">> => <<"message">>,
+                <<"role">> => <<"user">>,
+                <<"content">> => <<"hi">>
+            }
+        ]
+    },
+    {ok, R} = erllama_server_translate:openai_responses_to_internal(Body),
+    ?assertEqual(
+        [#{role => <<"user">>, content => <<"hi">>}],
+        R#erllama_request.messages
     ).
 
 stream_options_include_usage_parsed(_Cfg) ->

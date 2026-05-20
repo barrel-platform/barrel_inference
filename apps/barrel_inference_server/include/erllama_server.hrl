@@ -115,7 +115,14 @@
     %% The GBNF grammar emits a single tool call per turn, so `false'
     %% is honoured exactly and `true' is best-effort single until a
     %% multi-call grammar lands.
-    parallel_tool_calls = true :: boolean()
+    parallel_tool_calls = true :: boolean(),
+    %% Built-in tools the server executes in-process, keyed by the
+    %% model-facing name (which also appears in `tools'). Each value
+    %% is the executor spec resolved from the built-in tool `type' via
+    %% `erllama_server_tool_executor:lookup_type/1'. Empty (the
+    %% default) means no server-side tools: the agentic continue-loop
+    %% never engages and handlers behave exactly as before.
+    server_tools = #{} :: #{binary() => erllama_server_tool_executor:spec()}
 }).
 
 %% Stats payload erllama emits in its erllama_done message. The exact

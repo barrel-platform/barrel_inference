@@ -116,10 +116,10 @@ openai_chat_to_internal(_) ->
 
 %% OpenAI /v1/responses request body. `input` is either a string or a
 %% list of input items. `instructions` is prepended to any system
-%% message. Built-in tools (`web_search`, `file_search`,
-%% `computer_use_preview`) raise `{error, {builtin_tool_not_supported, _}}`
-%% so the handler can answer 501. `max_output_tokens` is the Responses
-%% naming for the chat-completions `max_tokens` cap.
+%% message. Tools are classified by `parse_responses_tools/1` (function
+%% tools kept, MCP `namespace` flattened, built-ins kept only when an
+%% executor is registered else dropped). `max_output_tokens` is the
+%% Responses naming for the chat-completions `max_tokens` cap.
 -spec openai_responses_to_internal(map()) ->
     {ok, #erllama_request{}} | {error, term()}.
 openai_responses_to_internal(Body) when is_map(Body) ->
@@ -134,7 +134,7 @@ openai_responses_to_internal(Body) when is_map(Body) ->
         check_messages_cap(MessagesIn),
         Instructions = parse_responses_instructions(Body),
         System = merge_instructions_system(Instructions, SystemFromInput),
-        Tools = parse_responses_tools(Body),
+        {Tools, ServerTools} = parse_responses_tools(Body),
         check_tools_cap(Tools),
         ToolChoice = parse_openai_tool_choice(Body),
         RF = parse_response_format_openai(
@@ -152,7 +152,8 @@ openai_responses_to_internal(Body) when is_map(Body) ->
             system = System,
             tools = Tools,
             tool_choice = ToolChoice,
-            response_format = RF
+            response_format = RF,
+            server_tools = ServerTools
         }}
     catch
         throw:{error, _} = E -> E
@@ -171,7 +172,8 @@ parse_responses_input(B) when is_binary(B) ->
     {undefined, [#{role => <<"user">>, content => B}]};
 parse_responses_input(L) when is_list(L) ->
     Normalised = [normalise_responses_input_item(I) || I <- L],
-    {Sys, Rest} = split_responses_system(Normalised),
+    Kept = [M || M <- Normalised, M =/= skip],
+    {Sys, Rest} = split_responses_system(Kept),
     {Sys, Rest};
 parse_responses_input(_) ->
     throw({error, {invalid_field, <<"input">>}}).
@@ -179,11 +181,12 @@ parse_responses_input(_) ->
 normalise_responses_input_item(B) when is_binary(B) ->
     #{role => <<"user">>, content => B};
 normalise_responses_input_item(#{<<"type">> := Type} = Item) when is_binary(Type) ->
-    %% A handful of `type` values are valid wrappers: "message",
-    %% "input_text" (used for vision-shaped content blocks). The
-    %% built-in server tool items show up here as e.g. "web_search",
-    %% "file_search", "computer_use_preview" and must be rejected
-    %% with 501.
+    %% `message` / `input_text` are content wrappers; `function_call`
+    %% / `function_call_output` are replayed tool rounds we preserve
+    %% as markers. Anything else - built-in tool call/result items
+    %% (`web_search_call`, ...) replayed from a prior turn, or input
+    %% parts we don't pipe to the model - is dropped (logged), never
+    %% 501'd, so a continuation that replays them still admits.
     case Type of
         <<"message">> ->
             normalise_responses_message(Item);
@@ -208,15 +211,9 @@ normalise_responses_input_item(#{<<"type">> := Type} = Item) when is_binary(Type
                 role => <<"tool">>,
                 content => <<"[tool_result id=", CallId/binary, "]: ", Body/binary>>
             };
-        Builtin when
-            Builtin =:= <<"web_search">>;
-            Builtin =:= <<"file_search">>;
-            Builtin =:= <<"computer_use_preview">>;
-            Builtin =:= <<"code_interpreter">>
-        ->
-            throw({error, {builtin_tool_not_supported, Builtin}});
         Other ->
-            throw({error, {unsupported_input_part, Other}})
+            logger:info(#{event => responses_input_item_dropped, type => Other}),
+            skip
     end;
 normalise_responses_input_item(#{<<"role">> := _} = Msg) ->
     normalise_responses_message(Msg);
@@ -263,41 +260,84 @@ merge_instructions_system(Instructions, undefined) ->
 merge_instructions_system(Instructions, System) ->
     <<Instructions/binary, "\n\n", System/binary>>.
 
-%% Responses-shape tools. The Responses API accepts the same function
-%% shape as Chat Completions (under `{"type":"function", "function":
-%% {...}}`) plus built-in server tools. We accept the function form
-%% and reject anything else with a 501-mapped error so the handler can
-%% answer with the right HTTP status.
+%% Responses-shape tools. Returns `{Tools, ServerTools}`:
+%%   - `Tools :: [tool()] | undefined` is the model-facing list the
+%%     grammar offers - function tools, the inner functions of an MCP
+%%     `namespace` (flattened), and any built-in with a registered
+%%     executor (synthesised from its `declare/0`).
+%%   - `ServerTools :: #{Name => executor spec}` is the subset the
+%%     server runs in-process (built-ins with a registered executor).
+%% Real agents (Codex) bundle built-in/MCP tools alongside their
+%% functions, so an unsupported built-in is DROPPED (logged), never
+%% 501'd - rejecting the bundle would block the whole turn.
 parse_responses_tools(Body) ->
     case maps:get(<<"tools">>, Body, undefined) of
-        undefined ->
-            undefined;
         Tools when is_list(Tools) ->
-            [parse_responses_tool(T) || T <- Tools];
+            {RevTools, ServerTools} = lists:foldl(
+                fun classify_responses_tool/2, {[], #{}}, Tools
+            ),
+            {lists:reverse(RevTools), ServerTools};
         _ ->
-            undefined
+            {undefined, #{}}
     end.
 
-parse_responses_tool(#{<<"type">> := <<"function">>, <<"function">> := F}) when
+%% Accumulator is `{ToolsAccReversed, ServerToolsMap}`.
+classify_responses_tool(#{<<"type">> := <<"function">>, <<"function">> := F}, Acc) when
     is_map(F)
 ->
+    push_tool(function_tool(F), Acc);
+classify_responses_tool(#{<<"type">> := <<"function">>} = F, Acc) ->
+    %% Flattened function form (no nested `function` key).
+    push_tool(function_tool(F), Acc);
+classify_responses_tool(
+    #{<<"type">> := <<"namespace">>, <<"tools">> := Inner}, Acc
+) when is_list(Inner) ->
+    %% MCP namespace (e.g. Codex's `mcp__codex_apps__github`): the
+    %% inner entries are themselves function tools the client
+    %% executes. Flatten each into the tool list.
+    lists:foldl(fun classify_responses_tool/2, Acc, Inner);
+classify_responses_tool(#{<<"type">> := Type}, {ToolsRev, ServerTools} = Acc) when
+    is_binary(Type)
+->
+    %% Built-in tool. The decision is surface-agnostic, so it lives in
+    %% `classify_builtin/1' (shared with the chat / Anthropic parsers).
+    case classify_builtin(Type) of
+        {server_tool, Tool, Spec} ->
+            {[Tool | ToolsRev], ServerTools#{maps:get(name, Tool) => Spec}};
+        drop ->
+            Acc
+    end;
+classify_responses_tool(_, Acc) ->
+    Acc.
+
+%% Surface-agnostic built-in tool classification. Given an OpenAI /
+%% Anthropic built-in tool `type', offer + run it server-side when an
+%% executor is registered (returning the synthesised model-facing
+%% `tool()' and its spec), else drop it (logged, never rejected).
+%% Shared so the executor registry works uniformly across every
+%% surface's tool parser; callers map the result into their own
+%% accumulator. Anthropic surfaces pass a canonical type (their
+%% versioned `web_search_20250305' is normalised before this call).
+-spec classify_builtin(binary()) ->
+    {server_tool, tool(), erllama_server_tool_executor:spec()} | drop.
+classify_builtin(Type) when is_binary(Type) ->
+    case erllama_server_tool_executor:lookup_type(Type) of
+        {ok, Spec} ->
+            {server_tool, erllama_server_tool_executor:declare(Spec), Spec};
+        not_found ->
+            logger:info(#{event => builtin_tool_dropped, type => Type}),
+            drop
+    end.
+
+function_tool(F) ->
     #{
         name => maps:get(<<"name">>, F),
         description => maps:get(<<"description">>, F, <<>>),
         schema => maps:get(<<"parameters">>, F, #{})
-    };
-parse_responses_tool(#{<<"type">> := <<"function">>} = F) ->
-    %% Some Responses-shape callers flatten function fields onto the
-    %% tool object directly (no nested `function` key).
-    #{
-        name => maps:get(<<"name">>, F),
-        description => maps:get(<<"description">>, F, <<>>),
-        schema => maps:get(<<"parameters">>, F, #{})
-    };
-parse_responses_tool(#{<<"type">> := Type}) when is_binary(Type) ->
-    throw({error, {builtin_tool_not_supported, Type}});
-parse_responses_tool(_) ->
-    throw({error, {invalid_field, <<"tools">>}}).
+    }.
+
+push_tool(Tool, {ToolsRev, ServerTools}) ->
+    {[Tool | ToolsRev], ServerTools}.
 
 %% Responses uses `max_output_tokens` instead of `max_tokens`. When
 %% both are present, `max_output_tokens` wins.

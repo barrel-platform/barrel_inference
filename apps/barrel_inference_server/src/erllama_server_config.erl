@@ -24,6 +24,7 @@
     anthropic_api_keys/0,
     anthropic_retry_after_seconds/0,
     tool_call_formats/0,
+    builtin_tool_executors/0,
     tool_replay_dir/0,
     tool_replay_ttl_ms/0,
     tool_replay_gc_interval_ms/0,
@@ -186,6 +187,21 @@ default_tool_call_formats() ->
         },
         <<"bare-json">> => #{module => erllama_server_tool_format_bare_json}
     }.
+
+%% Registry of server-side built-in tool executors used by
+%% erllama_server_tool_executor. Keyed by the OpenAI built-in tool
+%% `type` binary (e.g. <<"web_search">>); each value is an executor
+%% spec `#{module := M, type := T, _ => _}`. Empty by default - no
+%% executors ship; operators register entries via the
+%% `builtin_tool_executors` app env (the init merge keeps both).
+-spec builtin_tool_executors() -> #{binary() => map()}.
+builtin_tool_executors() ->
+    persistent_term:get(
+        {?MODULE, builtin_tool_executors}, default_builtin_tool_executors()
+    ).
+
+default_builtin_tool_executors() ->
+    #{}.
 
 %% Directory hosting the exact-replay DETS file used by
 %% erllama_server_tool_replay. Defaults to a `replay` sibling of the
@@ -361,6 +377,12 @@ init([]) ->
     persistent_term:put(
         {?MODULE, tool_call_formats},
         maps:merge(default_tool_call_formats(), app_env(tool_call_formats, #{}))
+    ),
+    persistent_term:put(
+        {?MODULE, builtin_tool_executors},
+        maps:merge(
+            default_builtin_tool_executors(), app_env(builtin_tool_executors, #{})
+        )
     ),
     persistent_term:put(
         {?MODULE, tool_replay_ttl_ms},
