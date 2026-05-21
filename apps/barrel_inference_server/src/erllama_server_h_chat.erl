@@ -104,9 +104,31 @@
     captured_tool_use = undefined ::
         undefined | #{id := binary(), name := binary(), input := map()},
     %% Built-in tools the server executes in-process, keyed by the
-    %% model-facing name. Empty unless an executor is registered;
-    %% reserved for the cross-surface continue-loop port.
-    server_tools = #{} :: #{binary() => erllama_server_tool_executor:spec()}
+    %% model-facing name. Empty unless an executor is registered.
+    server_tools = #{} :: #{binary() => erllama_server_tool_executor:spec()},
+    %% Agentic continue-loop state (engages only on a server_tools hit):
+    %% run the executor server-side and re-invoke with the result
+    %% appended, until the model answers without a server tool or the
+    %% cap is hit. Mirrors erllama_server_h_responses.
+    tool_iter = 0 :: non_neg_integer(),
+    max_tool_iter = 5 :: pos_integer(),
+    loop_request = undefined :: undefined | #erllama_request{},
+    loop_messages = [] :: [map()],
+    pending_exec = undefined ::
+        undefined
+        | #{
+            spec := erllama_server_tool_executor:spec(),
+            name := binary(),
+            args := map(),
+            call_id := binary(),
+            full_bin := binary()
+        },
+    exec_mon = undefined :: undefined | reference(),
+    exec_tref = undefined :: undefined | reference(),
+    agg_stats = #{} :: map(),
+    %% keepalive request_begin is refcounted; each loop round re-emits
+    %% {pipeline, loaded}, so only the first round begins.
+    keepalive_begun = false :: boolean()
 }).
 
 %%====================================================================
@@ -191,7 +213,10 @@ init_state(R, Requested, Api, Worker, Mon) ->
         include_usage = R#erllama_request.include_usage,
         session_id = R#erllama_request.session_id,
         tool_format = resolve_tool_format(R#erllama_request.model_id),
-        server_tools = R#erllama_request.server_tools
+        server_tools = R#erllama_request.server_tools,
+        max_tool_iter = erllama_server_config:max_tool_iterations(),
+        loop_request = R,
+        loop_messages = R#erllama_request.messages
     }.
 
 resolve_tool_format(ModelId) ->
@@ -228,9 +253,12 @@ info({pipeline, loading, _ModelId}, Req, S) ->
     %% Non-streaming request: nothing to write yet; cowboy
     %% idle_timeout (configured at the listener) is the safety net.
     {ok, Req, S, hibernate};
+info({pipeline, loaded}, Req, S = #st{keepalive_begun = true}) ->
+    %% Later loop round re-loading; keepalive already counted.
+    {ok, Req, S#st{phase = waiting_template}, hibernate};
 info({pipeline, loaded}, Req, S) ->
     ok = erllama_server_keepalive:request_begin(S#st.model),
-    {ok, Req, S#st{phase = waiting_template}, hibernate};
+    {ok, Req, S#st{phase = waiting_template, keepalive_begun = true}, hibernate};
 info({pipeline, templated, _Tokens}, Req, S) ->
     {ok, Req, S#st{phase = waiting_queue}, hibernate};
 info({pipeline, queued}, Req, S) ->
@@ -314,7 +342,29 @@ info({erllama_reasoning_token, Ref, Tok}, Req0, S0) ->
 info({erllama_done, Ref, Stats}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     record_session_committed(S, Stats),
-    finish_ok(Req, demonitor_engine(S#st{received_done = true}), Stats);
+    S1 = accumulate_stats(S, Stats),
+    case S1#st.pending_exec of
+        undefined ->
+            %% A buffered tool call may name a server tool; if so, run
+            %% it and continue the turn instead of finishing.
+            maybe_server_tool_or_finish(Req, demonitor_engine(S1));
+        _ ->
+            {ok, Req, demonitor_engine(S1), hibernate}
+    end;
+info({tool_exec_result, CallId, Result}, Req, S = #st{pending_exec = #{call_id := CallId}}) ->
+    continue_after_tool(Result, Req, S);
+info({tool_exec_result, _, _}, Req, S) ->
+    {ok, Req, S, hibernate};
+info({exec_timeout, CallId}, Req, S = #st{pending_exec = #{call_id := CallId}}) ->
+    continue_after_tool({error, executor_timeout}, Req, S);
+info({exec_timeout, _}, Req, S) ->
+    {ok, Req, S, hibernate};
+info({'DOWN', Mon, process, _Pid, normal}, Req, S = #st{exec_mon = Mon}) ->
+    {ok, Req, S#st{exec_mon = undefined}, hibernate};
+info({'DOWN', Mon, process, _Pid, Reason}, Req, S = #st{exec_mon = Mon, pending_exec = P}) when
+    P =/= undefined
+->
+    continue_after_tool({error, {executor_crashed, Reason}}, Req, S);
 info({erllama_error, Ref, Reason}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     finish_err(Req, demonitor_engine(S#st{received_done = true}), Reason);
@@ -356,6 +406,11 @@ cleanup(S) ->
     cancel_timer(S#st.prefill_tref),
     cancel_timer(S#st.idle_tref),
     cancel_timer(S#st.total_tref),
+    cancel_timer(S#st.exec_tref),
+    case S#st.exec_mon of
+        Mon when is_reference(Mon) -> erlang:demonitor(Mon, [flush]);
+        _ -> ok
+    end,
     _ = demonitor_engine(S),
     case is_pid(S#st.worker) of
         true -> erllama_server_pipeline:abort(S#st.worker);
@@ -380,7 +435,7 @@ cleanup(S) ->
     maybe_end_session(S),
     %% Decrement the keepalive active count. If this was the last
     %% request, the model enters the keep-alive grace window.
-    keepalive_release(S#st.model, S#st.phase),
+    keepalive_release(S),
     erllama_server_metrics:dec_active_streams(S#st.model).
 
 maybe_end_session(#st{received_done = true}) ->
@@ -406,12 +461,12 @@ record_session_committed(#st{model = Model, session_id = SessionId}, Stats) ->
             ok
     end.
 
-%% request_end only fires if request_begin was called (i.e., load
-%% completed). If we never reached `waiting_template`, the active
-%% count was never bumped.
-keepalive_release(_Model, waiting_load) ->
+%% Balance request_begin iff it ran. Keying off `keepalive_begun`
+%% (not phase) is correct under the loop, where a re-load round resets
+%% phase to waiting_load while the begin is still outstanding.
+keepalive_release(#st{keepalive_begun = false}) ->
     ok;
-keepalive_release(Model, _Phase) ->
+keepalive_release(#st{model = Model}) ->
     erllama_server_keepalive:request_end(
         Model, erllama_server_config:keep_alive_default_ms()
     ).
@@ -898,9 +953,14 @@ handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) -
     ToolId = make_tool_id_toolu(),
     maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Input),
     Captured = #{id => ToolId, name => Name, input => Input},
+    %% Keep the verbatim bytes in buf_text too: the server-tool loop
+    %% feeds them back as the assistant turn (extract_tool_call still
+    %% prefers captured_tool_use, so the client-tool finish is
+    %% unaffected).
     {ok, Req,
         rearm_idle(S#st{
             mode = tool_buffer,
+            buf_text = [FullBin],
             captured_tool_use = Captured
         }), hibernate}.
 
@@ -937,6 +997,147 @@ maybe_persist_replay(_Spec, ToolId, Model, FullBin, Name, Input) ->
         FullBin,
         #{name => Name, arguments => Input}
     ).
+
+%%====================================================================
+%% Agentic continue-loop (server-executed built-in tools)
+%%====================================================================
+
+%% At done, a buffered tool call (wire or legacy) may name a server
+%% tool. If so, run the executor and continue the turn; otherwise
+%% finish normally (a client tool_calls chunk or plain text).
+maybe_server_tool_or_finish(Req, S = #st{mode = tool_buffer, server_tools = ST}) when
+    map_size(ST) > 0
+->
+    {Name, Input} = tool_name_input(S),
+    case maps:find(Name, ST) of
+        {ok, ExecSpec} ->
+            begin_server_tool(iolist_to_binary(S#st.buf_text), Name, Input, ExecSpec, Req, S);
+        error ->
+            finish_ok(Req, S#st{received_done = true}, S#st.agg_stats)
+    end;
+maybe_server_tool_or_finish(Req, S) ->
+    finish_ok(Req, S#st{received_done = true}, S#st.agg_stats).
+
+tool_name_input(#st{captured_tool_use = #{name := N, input := I}}) ->
+    {N, I};
+tool_name_input(#st{buf_text = B}) ->
+    parse_tool_call_to_map(iolist_to_binary(B)).
+
+%% Run the executor off the handler process; the result arrives as a
+%% {tool_exec_result, CallId, _} message.
+begin_server_tool(FullBin, Name, Input, ExecSpec, Req, S) ->
+    CallId = erllama_server_translate:make_id(<<"call_">>),
+    Self = self(),
+    Ctx = #{
+        model => S#st.model,
+        request_id => S#st.req_id,
+        session_id => S#st.session_id,
+        config => maps:without([module, type], ExecSpec)
+    },
+    {_Pid, Mon} = spawn_monitor(fun() ->
+        Self ! {tool_exec_result, CallId, run_executor(ExecSpec, Input, Ctx)}
+    end),
+    TRef = erlang:send_after(exec_timeout_ms(), self(), {exec_timeout, CallId}),
+    Pending = #{
+        spec => ExecSpec,
+        name => Name,
+        args => Input,
+        call_id => CallId,
+        full_bin => FullBin
+    },
+    cancel_timer(S#st.idle_tref),
+    {ok, Req, S#st{pending_exec = Pending, exec_mon = Mon, exec_tref = TRef, idle_tref = undefined},
+        hibernate}.
+
+run_executor(ExecSpec, Input, Ctx) ->
+    try
+        erllama_server_tool_executor:execute(ExecSpec, Input, Ctx)
+    catch
+        Class:Reason -> {error, {Class, Reason}}
+    end.
+
+%% Fold the result into the conversation and re-invoke on the warm
+%% session path (session_id kept), streaming into the same response.
+continue_after_tool(Result, Req, S0) ->
+    #{name := _Name, call_id := CallId, full_bin := FullBin} = S0#st.pending_exec,
+    S = clear_pending(S0),
+    Iter = S#st.tool_iter + 1,
+    ResultJson = result_json(Result),
+    case Iter >= S#st.max_tool_iter of
+        true ->
+            Stats = maps:put(finish_reason, length, S#st.agg_stats),
+            finish_ok(
+                Req,
+                S#st{received_done = true, tool_iter = Iter, mode = text, buf_text = []},
+                Stats
+            );
+        false ->
+            NewMessages =
+                S#st.loop_messages ++
+                    [
+                        #{role => <<"assistant">>, content => FullBin},
+                        #{
+                            role => <<"tool">>,
+                            content =>
+                                <<"[tool_result id=", CallId/binary, "]: ", ResultJson/binary>>
+                        }
+                    ],
+            ContReq = (S#st.loop_request)#erllama_request{messages = NewMessages},
+            release_slot(S),
+            {WorkerPid, Mon} = erllama_server_pipeline:start_link(self(), ContReq),
+            S2 = S#st{
+                tool_iter = Iter,
+                loop_messages = NewMessages,
+                worker = WorkerPid,
+                worker_mon = Mon,
+                phase = waiting_load,
+                ref = undefined,
+                slot = undefined,
+                mode = text,
+                buf_text = [],
+                %% Reset so the next round's first-byte detection fires;
+                %% otherwise a round-2 tool call streams as plain text.
+                out_tokens = 0,
+                captured_tool_use = undefined,
+                first_token_at = undefined
+            },
+            {ok, Req, S2, hibernate}
+    end.
+
+clear_pending(S) ->
+    case S#st.exec_mon of
+        Mon when is_reference(Mon) -> erlang:demonitor(Mon, [flush]);
+        _ -> ok
+    end,
+    cancel_timer(S#st.exec_tref),
+    S#st{pending_exec = undefined, exec_mon = undefined, exec_tref = undefined}.
+
+release_slot(#st{slot = undefined}) ->
+    ok;
+release_slot(#st{model = Model, slot = Slot}) ->
+    erllama_server_queue:release(Model, Slot).
+
+result_json({ok, Json}) when is_map(Json) ->
+    iolist_to_binary(json:encode(Json));
+result_json({ok, Bin}) when is_binary(Bin) ->
+    Bin;
+result_json({error, Reason}) ->
+    iolist_to_binary(json:encode(#{<<"error">> => to_bin(Reason)})).
+
+exec_timeout_ms() ->
+    erllama_server_config:generation_idle_ms().
+
+accumulate_stats(S, Stats) ->
+    S#st{agg_stats = merge_stats(S#st.agg_stats, Stats)}.
+
+merge_stats(A, B) ->
+    Sum = fun(K) -> maps:get(K, A, 0) + maps:get(K, B, 0) end,
+    (maps:merge(A, B))#{
+        prompt_tokens => Sum(prompt_tokens),
+        completion_tokens => Sum(completion_tokens),
+        prefill_ms => Sum(prefill_ms),
+        generation_ms => Sum(generation_ms)
+    }.
 
 %% The Anthropic-style `toolu_' id is used in the replay-map row so
 %% PR 6's render path uses one scheme across both endpoints.

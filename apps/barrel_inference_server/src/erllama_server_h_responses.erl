@@ -722,6 +722,9 @@ continue_after_tool(Result, Req, S0) ->
                 slot = undefined,
                 mode = text,
                 buf_text = [],
+                %% Reset so the next round's first-byte detection fires;
+                %% otherwise a round-2 tool call streams as plain text.
+                out_tokens = 0,
                 captured_tool_use = undefined,
                 first_token_at = undefined
             },
