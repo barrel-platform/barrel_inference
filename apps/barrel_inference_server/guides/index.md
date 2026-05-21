@@ -32,6 +32,7 @@ that already speak any of those three APIs.
 - Want every endpoint as a curl one-liner? [HTTP API reference](api.md).
 - Hooking up an SDK? [Client examples](clients.md) (Python OpenAI /
   Anthropic / ollama, JavaScript fetch, LangChain, LiteLLM, Claude Code).
+- Running tools server-side (web_search)? [Server-side tools](tools.md).
 - Picking a model that fits your laptop? [Sizing guide](sizing.md).
 - Pulling and managing models? [Registry guide](registry.md).
 - Downloading internals? [Fetching guide](fetching.md).
