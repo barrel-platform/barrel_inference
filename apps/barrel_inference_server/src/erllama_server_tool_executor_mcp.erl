@@ -9,11 +9,18 @@
 %%% `execute/2', which the agentic loop calls for any `server_tools'
 %%% entry whose `module' is this one.
 %%%
-%%% The catalog entry carries the namespaced tool name and the
-%%% separator in the spec, which arrive here as `Ctx.config'. Execution
-%%% routes through `barrel_mcp_agent:call_tool/3', which dispatches to
-%%% the owning MCP server, and the MCP result is normalised to the
-%%% compact shape the loop folds back into the conversation.
+%%% The catalog entry's spec arrives here as `Ctx.config' and selects
+%%% one of two routes via its `kind':
+%%%
+%%%   - `tool' (default): a namespaced tool call dispatched through
+%%%     `barrel_mcp_agent:call_tool/3' to the owning MCP server.
+%%%   - `list_resources' / `read_resource': a resource operation on a
+%%%     specific server (`server_id'), via that server's client pid.
+%%%     barrel_mcp's agent aggregates tools only, so resources go
+%%%     straight to `barrel_mcp_client'.
+%%%
+%%% Either way the MCP result is normalised to the compact shape the
+%%% loop folds back into the conversation.
 -module(erllama_server_tool_executor_mcp).
 
 -export([execute/2]).
@@ -23,6 +30,13 @@
 -spec execute(map(), map()) -> {ok, map()} | {error, term()}.
 execute(Args, Ctx) when is_map(Args) ->
     Config = maps:get(config, Ctx, #{}),
+    case maps:get(kind, Config, tool) of
+        tool -> execute_tool(Args, Config);
+        list_resources -> execute_list_resources(Config);
+        read_resource -> execute_read_resource(Args, Config)
+    end.
+
+execute_tool(Args, Config) ->
     case maps:get(mcp_name, Config, undefined) of
         Name when is_binary(Name) ->
             Sep = maps:get(separator, Config, ?DEFAULT_SEP),
@@ -33,6 +47,51 @@ execute(Args, Ctx) when is_map(Args) ->
         _ ->
             {error, missing_mcp_name}
     end.
+
+execute_list_resources(Config) ->
+    with_client(Config, fun(Pid) ->
+        case barrel_mcp_client:list_resources_all(Pid) of
+            {ok, Resources} ->
+                {ok, #{<<"resources">> => [resource_summary(R) || R <- Resources]}};
+            {error, _} = E ->
+                E
+        end
+    end).
+
+execute_read_resource(Args, Config) ->
+    case maps:get(<<"uri">>, Args, undefined) of
+        Uri when is_binary(Uri) ->
+            with_client(Config, fun(Pid) ->
+                case barrel_mcp_client:read_resource(Pid, Uri) of
+                    {ok, Result} -> {ok, #{<<"content">> => extract_resource_text(Result)}};
+                    {error, _} = E -> E
+                end
+            end);
+        _ ->
+            {error, missing_uri}
+    end.
+
+with_client(Config, Fun) ->
+    case maps:get(server_id, Config, undefined) of
+        Id when is_binary(Id) ->
+            case barrel_mcp_clients:whereis_client(Id) of
+                Pid when is_pid(Pid) -> Fun(Pid);
+                _ -> {error, unknown_server}
+            end;
+        _ ->
+            {error, missing_server_id}
+    end.
+
+resource_summary(R) when is_map(R) ->
+    maps:with([<<"uri">>, <<"name">>, <<"description">>, <<"mimeType">>], R).
+
+%% `resources/read' returns `#{contents => [#{uri, mimeType, text|blob}]}'.
+%% Join the text blocks (binary blobs are skipped).
+extract_resource_text(Result) ->
+    Blocks = maps:get(<<"contents">>, Result, []),
+    iolist_to_binary(
+        lists:join(<<"\n">>, [T || #{<<"text">> := T} <- Blocks, is_binary(T)])
+    ).
 
 %% MCP tool results are `#{content => [block], isError => bool,
 %% structuredContent => _}'. Fold to text + (optional) structured data

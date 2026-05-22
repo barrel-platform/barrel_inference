@@ -12,8 +12,12 @@ history and the guides; this file is the not-yet-done list.
   `erllama_server_tool_executor_mcp`). See `guides/tools.md`.
   The catalog refreshes on `tools/list_changed` (timer is a fallback);
   stdio transport is verified against the Python reference server
-  (gated CT). Remaining: bridge MCP resources; expose erllama's *own*
-  tools as an MCP server (the other direction).
+  (gated CT); a server's resources are bridged as `<id>__list_resources`
+  / `<id>__read_resource` meta-tools (capability-gated). Remaining:
+  expose erllama's *own* tools as an MCP server (the other direction).
+  MCP prompts are deliberately not bridged into the model loop (they
+  are user-facing macros); a client-facing prompts surface is a
+  possible later feature.
 - **`code_interpreter`.** Highest value for coding agents, but heavy
   and security-sensitive: needs a real sandbox (container / firejail /
   separate service), not an in-process call. Do deliberately.

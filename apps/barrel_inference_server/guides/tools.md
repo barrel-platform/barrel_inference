@@ -114,6 +114,14 @@ spawned as child processes - `command` must be on `PATH` or an absolute
 path, and one process is started per server. Optional `env` / `cwd`
 keys in the stdio map pass through to the spawned process.
 
+**Resources.** A server that advertises the `resources` capability
+also gets two model-callable tools: `<id>__list_resources` (list the
+server's resources) and `<id>__read_resource` (read one by `uri`). So
+the model can discover and pull a server's data the same way it calls a
+tool - list first, then read the uri it wants. Servers without the
+capability get no resource tools. MCP *prompts* are not bridged (they
+are user-facing macros, a poor fit for the model loop).
+
 ## Test it
 
 With an executor registered, a model that decides to search will have

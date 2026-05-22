@@ -13,10 +13,13 @@
 -include_lib("stdlib/include/assert.hrl").
 
 all() ->
-    [catalog_and_executor, list_changed_refresh, stdio_transport].
+    [catalog_and_executor, list_changed_refresh, stdio_transport, resources_bridge].
 
 %% Tool handler registered on the in-process MCP server.
 echo_tool(#{<<"text">> := T}) -> T.
+
+%% Resource handler registered on the in-process MCP server.
+greeting_resource(_) -> <<"hello, world">>.
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(barrel_mcp),
@@ -28,12 +31,19 @@ init_per_suite(Config) ->
             <<"properties">> => #{<<"text">> => #{<<"type">> => <<"string">>}}
         }
     }),
+    ok = barrel_mcp_registry:reg(resource, <<"greeting">>, ?MODULE, greeting_resource, #{
+        name => <<"Greeting">>,
+        uri => <<"mem://greeting">>,
+        description => <<"Sample greeting resource">>,
+        mime_type => <<"text/plain">>
+    }),
     Port = free_port(),
     {ok, _} = barrel_mcp_http_stream:start(#{port => Port, session_enabled => true}),
     Url = iolist_to_binary(io_lib:format("http://127.0.0.1:~B/mcp", [Port])),
     [{url, Url} | Config].
 
 end_per_suite(_Config) ->
+    catch barrel_mcp_registry:unreg(resource, <<"greeting">>),
     application:unset_env(erllama_server, mcp_servers),
     ok.
 
@@ -42,6 +52,7 @@ end_per_testcase(_, _Config) ->
     catch barrel_mcp:stop_client(<<"t">>),
     catch barrel_mcp:stop_client(<<"lc">>),
     catch barrel_mcp:stop_client(<<"py">>),
+    catch barrel_mcp:stop_client(<<"r">>),
     catch barrel_mcp_registry:unreg(tool, <<"echo2">>),
     application:unset_env(erllama_server, mcp_servers),
     ok.
@@ -149,9 +160,55 @@ run_stdio_transport(Python, Script) ->
     ),
     ?assertEqual(<<"hello stdio">>, maps:get(<<"content">>, Result)).
 
+%% A server that advertises the `resources' capability gets two
+%% synthesized meta-tools; both run through the mcp executor by
+%% server_id + kind (the agent aggregates tools only). The in-process
+%% server always advertises resources, so the no-capability gate isn't
+%% exercised here - it's covered by the `server_has_resources' guard.
+resources_bridge(Config) ->
+    Url = ?config(url, Config),
+    application:set_env(erllama_server, mcp_servers, [
+        #{id => <<"r">>, transport => {http, Url}}
+    ]),
+    {ok, _Pid} = erllama_server_mcp:start_link(),
+    ok = wait_client_ready(<<"r">>, 50),
+    ok = erllama_server_mcp:refresh(),
+    {Tools, ServerTools} = erllama_server_mcp:catalog(),
+    Names = [maps:get(name, T) || T <- Tools],
+    ?assert(lists:member(<<"r__list_resources">>, Names)),
+    ?assert(lists:member(<<"r__read_resource">>, Names)),
+    %% list_resources -> the registered greeting resource is present.
+    {ok, ListResult} = erllama_server_tool_executor_mcp:execute(
+        #{}, ctx(maps:get(<<"r__list_resources">>, ServerTools))
+    ),
+    Uris = [maps:get(<<"uri">>, R) || R <- maps:get(<<"resources">>, ListResult)],
+    ?assert(lists:member(<<"mem://greeting">>, Uris)),
+    %% read_resource -> its text comes back.
+    {ok, ReadResult} = erllama_server_tool_executor_mcp:execute(
+        #{<<"uri">> => <<"mem://greeting">>},
+        ctx(maps:get(<<"r__read_resource">>, ServerTools))
+    ),
+    ?assertEqual(<<"hello, world">>, maps:get(<<"content">>, ReadResult)),
+    %% read_resource without a uri is a tool error, not a crash.
+    ?assertEqual(
+        {error, missing_uri},
+        erllama_server_tool_executor_mcp:execute(
+            #{}, ctx(maps:get(<<"r__read_resource">>, ServerTools))
+        )
+    ).
+
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+%% The loop-shaped Ctx the handlers build for an executor call.
+ctx(Spec) ->
+    #{
+        model => <<"m">>,
+        request_id => <<"r">>,
+        session_id => undefined,
+        config => maps:without([module, type], Spec)
+    }.
 
 wait_catalog_tool(_Name, 0) ->
     {error, not_in_catalog};

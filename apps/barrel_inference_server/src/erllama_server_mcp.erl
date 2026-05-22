@@ -142,9 +142,9 @@ with_default_handler(Spec) ->
     end.
 
 rebuild_catalog() ->
-    Tools0 = safe_list_tools(),
-    {Tools, ServerTools} = lists:foldl(fun catalog_entry/2, {[], #{}}, Tools0),
-    persistent_term:put(?CATALOG, {lists:reverse(Tools), ServerTools}).
+    Acc0 = lists:foldl(fun catalog_entry/2, {[], #{}}, safe_list_tools()),
+    {ToolsRev, ServerTools} = lists:foldl(fun resource_entries/2, Acc0, connected_servers()),
+    persistent_term:put(?CATALOG, {lists:reverse(ToolsRev), ServerTools}).
 
 safe_list_tools() ->
     try
@@ -175,3 +175,72 @@ catalog_entry(McpTool, {ToolsRev, ServerTools}) when is_map(McpTool) ->
     end;
 catalog_entry(_, Acc) ->
     Acc.
+
+connected_servers() ->
+    try
+        barrel_mcp:list_clients()
+    catch
+        Class:Reason ->
+            logger:warning(#{event => mcp_list_clients_failed, error => {Class, Reason}}),
+            []
+    end.
+
+%% A server that advertises the `resources' capability gets two
+%% model-callable meta-tools - `<id>__list_resources' and
+%% `<id>__read_resource' - routed to the mcp executor by `server_id' +
+%% `kind' (not by a namespaced tool name; these are not `call_tool'
+%% targets). Servers without the capability get none.
+resource_entries({Id, Pid}, Acc) when is_binary(Id), is_pid(Pid) ->
+    case server_has_resources(Pid) of
+        true -> add_resource_meta_tools(Id, Acc);
+        false -> Acc
+    end;
+resource_entries(_, Acc) ->
+    Acc.
+
+add_resource_meta_tools(Id, {ToolsRev, ServerTools}) ->
+    ListName = <<Id/binary, ?SEP/binary, "list_resources">>,
+    ReadName = <<Id/binary, ?SEP/binary, "read_resource">>,
+    Tools = [
+        resource_tool(read_resource, Id, ReadName),
+        resource_tool(list_resources, Id, ListName)
+        | ToolsRev
+    ],
+    Specs = ServerTools#{
+        ListName => resource_spec(list_resources, Id),
+        ReadName => resource_spec(read_resource, Id)
+    },
+    {Tools, Specs}.
+
+resource_tool(list_resources, Id, Name) ->
+    #{
+        name => Name,
+        description => <<"List resources available from the ", Id/binary, " MCP server.">>,
+        schema => #{<<"type">> => <<"object">>, <<"properties">> => #{}}
+    };
+resource_tool(read_resource, Id, Name) ->
+    #{
+        name => Name,
+        description => <<"Read a resource from the ", Id/binary, " MCP server by its uri.">>,
+        schema => #{
+            <<"type">> => <<"object">>,
+            <<"required">> => [<<"uri">>],
+            <<"properties">> => #{
+                <<"uri">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"description">> => <<"The resource uri to read.">>
+                }
+            }
+        }
+    }.
+
+resource_spec(Kind, Id) ->
+    #{module => erllama_server_tool_executor_mcp, type => <<"mcp">>, kind => Kind, server_id => Id}.
+
+server_has_resources(Pid) ->
+    try barrel_mcp_client:server_capabilities(Pid) of
+        {ok, Caps} when is_map(Caps) -> maps:is_key(<<"resources">>, Caps);
+        _ -> false
+    catch
+        _:_ -> false
+    end.
