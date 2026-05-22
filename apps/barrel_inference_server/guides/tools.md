@@ -9,8 +9,8 @@ conversation, and continues generating, until the model answers
 without calling a server tool (or a per-request cap is reached). This
 works on `/v1/responses`, `/v1/chat/completions`, and `/v1/messages`.
 
-Nothing runs server-side unless you register an executor. The shipped
-example is `web_search`.
+Nothing runs server-side unless you register an executor. Two ship:
+`web_search` (multi-provider) and `web_fetch` (fetch one URL).
 
 ## Enable web_search
 
@@ -48,6 +48,30 @@ Optional keys for any provider: `max_results` (default 5),
 `timeout_ms` (default 10000), `endpoint` (override the default URL).
 
 Restart the server after editing `sys.config`.
+
+## Enable web_fetch
+
+`web_fetch` retrieves a single model-supplied URL and returns its
+readable text - the natural companion to `web_search` (search, then
+fetch a result's full page). No provider/key:
+
+```erlang
+{builtin_tool_executors, #{
+  <<"web_fetch">> => #{module => erllama_server_tool_executor_web_fetch,
+                       type => <<"web_fetch">>}
+}}
+```
+
+Optional config keys: `max_chars` (truncate the extracted text,
+default 4000), `timeout_ms` (default 10000), `max_body` (cap the
+downloaded bytes, default 5 MiB), `allow_private` (default `false`).
+
+Because the URL is model-controlled, `web_fetch` is hardened against
+SSRF: only `http`/`https`, TLS certificates are verified, the body and
+extracted text are size-capped, and hosts that resolve to
+loopback/private/link-local addresses (e.g. `127.0.0.1`,
+`169.254.169.254`, `10.x`, `192.168.x`) are rejected with
+`blocked_host` unless you set `allow_private => true`.
 
 ## Test it
 
@@ -111,6 +135,22 @@ dropped from the request (no error, no search). A misconfigured
 provider (missing `api_key`, unreachable `endpoint`) folds an error
 result into the conversation so the model can recover rather than
 failing the turn; the server logs the failure.
+
+## Security notes
+
+- **Indirect prompt injection.** Search and fetch results are
+  attacker-influenced web content folded into the model's context. A
+  page can contain text crafted to steer the model. Results enter as
+  tool/user content (never as system instructions), but you can't
+  fully prevent a model from being influenced - treat any
+  tool-grounded output as untrusted, and be cautious chaining it into
+  privileged actions.
+- **SSRF.** `web_fetch` fetches model-supplied URLs server-side; its
+  guard (above) blocks private/loopback hosts and verifies TLS. A
+  self-hosted `searxng` `endpoint` you configure is trusted as-is.
+- **Auth.** If the daemon listens on anything other than localhost,
+  enable the `openai_api_keys` / `anthropic_api_keys` allowlist so the
+  tool-running surface isn't open to the network.
 
 ## Write your own executor
 

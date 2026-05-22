@@ -32,6 +32,7 @@
 -define(MARGINALIA_URL, <<"https://api2.marginalia-search.com/search">>).
 -define(DEFAULT_MAX_RESULTS, 5).
 -define(DEFAULT_TIMEOUT_MS, 10000).
+-define(DEFAULT_MAX_BODY, 5 * 1024 * 1024).
 
 declare() ->
     #{
@@ -167,7 +168,13 @@ query_string(Pairs) ->
 
 http_call(Method, Url, Headers, Body, Config) ->
     Timeout = maps:get(timeout_ms, Config, ?DEFAULT_TIMEOUT_MS),
-    Opts = [with_body, {recv_timeout, Timeout}, {connect_timeout, Timeout}],
+    Opts = [
+        with_body,
+        {recv_timeout, Timeout},
+        {connect_timeout, Timeout},
+        {max_body, maps:get(max_body, Config, ?DEFAULT_MAX_BODY)},
+        {ssl_options, tls_opts()}
+    ],
     case hackney:request(Method, Url, Headers, Body, Opts) of
         {ok, 200, _RespHeaders, RespBody} ->
             {ok, RespBody};
@@ -176,6 +183,17 @@ http_call(Method, Url, Headers, Body, Config) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% Verify provider TLS certs against the OS trust store (avoids MITM).
+tls_opts() ->
+    [
+        {verify, verify_peer},
+        {depth, 10},
+        {cacerts, public_key:cacerts_get()},
+        {customize_hostname_check, [
+            {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+        ]}
+    ].
 
 %%====================================================================
 %% Response parsing (pure)
