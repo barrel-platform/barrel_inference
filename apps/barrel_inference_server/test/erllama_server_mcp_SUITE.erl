@@ -13,7 +13,7 @@
 -include_lib("stdlib/include/assert.hrl").
 
 all() ->
-    [catalog_lists_mcp_server_tools].
+    [catalog_and_executor].
 
 %% Tool handler registered on the in-process MCP server.
 echo_tool(#{<<"text">> := T}) -> T.
@@ -43,7 +43,10 @@ end_per_testcase(_, _Config) ->
     application:unset_env(erllama_server, mcp_servers),
     ok.
 
-catalog_lists_mcp_server_tools(Config) ->
+%% End to end against the in-process server (no model): the manager
+%% connects, publishes the catalog, and the mcp executor runs a tool
+%% via the catalog's server_tools spec (the same Ctx the loop builds).
+catalog_and_executor(Config) ->
     Url = ?config(url, Config),
     application:set_env(erllama_server, mcp_servers, [
         #{id => <<"t">>, transport => {http, Url}}
@@ -55,16 +58,23 @@ catalog_lists_mcp_server_tools(Config) ->
     Names = [maps:get(name, T) || T <- Tools],
     %% Tool name is namespaced `<<ServerId, "__", Name>>`.
     ?assert(lists:member(<<"t__echo">>, Names)),
+    Spec = maps:get(<<"t__echo">>, ServerTools),
     ?assertMatch(
-        #{
-            <<"t__echo">> := #{
-                module := erllama_server_tool_executor_mcp, mcp_name := <<"t__echo">>
-            }
-        },
-        ServerTools
+        #{module := erllama_server_tool_executor_mcp, mcp_name := <<"t__echo">>}, Spec
     ),
     [Tool] = [T || T <- Tools, maps:get(name, T) =:= <<"t__echo">>],
-    ?assert(is_map(maps:get(schema, Tool))).
+    ?assert(is_map(maps:get(schema, Tool))),
+    %% Run it via the executor with the loop-shaped Ctx.
+    Ctx = #{
+        model => <<"m">>,
+        request_id => <<"r">>,
+        session_id => undefined,
+        config => maps:without([module, type], Spec)
+    },
+    {ok, Result} = erllama_server_tool_executor_mcp:execute(
+        #{<<"text">> => <<"hello mcp">>}, Ctx
+    ),
+    ?assertEqual(<<"hello mcp">>, maps:get(<<"content">>, Result)).
 
 %%====================================================================
 %% Helpers

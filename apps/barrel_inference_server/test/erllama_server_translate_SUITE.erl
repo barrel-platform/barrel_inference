@@ -104,7 +104,10 @@
     chat_builtin_tool_with_executor_synthesised/1,
     anthropic_custom_tool_kept/1,
     anthropic_builtin_tool_dropped/1,
-    anthropic_builtin_tool_with_executor_synthesised/1
+    anthropic_builtin_tool_with_executor_synthesised/1,
+    %% mcp catalog injection
+    mcp_tools_injected_all_surfaces/1,
+    mcp_not_injected_when_tool_choice_none/1
 ]).
 
 %%====================================================================
@@ -205,7 +208,9 @@ all() ->
         chat_builtin_tool_with_executor_synthesised,
         anthropic_custom_tool_kept,
         anthropic_builtin_tool_dropped,
-        anthropic_builtin_tool_with_executor_synthesised
+        anthropic_builtin_tool_with_executor_synthesised,
+        mcp_tools_injected_all_surfaces,
+        mcp_not_injected_when_tool_choice_none
     ].
 
 %%====================================================================
@@ -1606,6 +1611,69 @@ with_stub_executor(Fun) ->
         Fun()
     after
         persistent_term:erase({erllama_server_config, builtin_tool_executors})
+    end.
+
+%% --- mcp catalog injection ---
+
+mcp_tools_injected_all_surfaces(_Cfg) ->
+    with_mcp_catalog(fun() ->
+        ChatBody = base_chat(),
+        {ok, RC} = erllama_server_translate:openai_chat_to_internal(ChatBody),
+        assert_has_mcp_tool(RC),
+        RespBody = #{<<"model">> => <<"gpt-4o">>, <<"input">> => <<"hi">>},
+        {ok, RR} = erllama_server_translate:openai_responses_to_internal(RespBody),
+        assert_has_mcp_tool(RR),
+        AnthBody = #{
+            <<"model">> => <<"claude">>,
+            <<"max_tokens">> => 8,
+            <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
+        },
+        {ok, RA} = erllama_server_translate:anthropic_messages_to_internal(AnthBody),
+        assert_has_mcp_tool(RA)
+    end).
+
+mcp_not_injected_when_tool_choice_none(_Cfg) ->
+    with_mcp_catalog(fun() ->
+        Body = (base_chat())#{<<"tool_choice">> => <<"none">>},
+        {ok, R} = erllama_server_translate:openai_chat_to_internal(Body),
+        ?assertEqual(#{}, R#erllama_request.server_tools),
+        Names =
+            case R#erllama_request.tools of
+                undefined -> [];
+                L -> [maps:get(name, T) || T <- L]
+            end,
+        ?assertEqual(false, lists:member(<<"srv__ping">>, Names))
+    end).
+
+assert_has_mcp_tool(R) ->
+    Names = [maps:get(name, T) || T <- R#erllama_request.tools],
+    ?assert(lists:member(<<"srv__ping">>, Names)),
+    ?assertMatch(
+        #{<<"srv__ping">> := #{module := erllama_server_tool_executor_mcp}},
+        R#erllama_request.server_tools
+    ).
+
+with_mcp_catalog(Fun) ->
+    Tools = [
+        #{
+            name => <<"srv__ping">>,
+            description => <<"ping">>,
+            schema => #{<<"type">> => <<"object">>}
+        }
+    ],
+    ServerTools = #{
+        <<"srv__ping">> => #{
+            module => erllama_server_tool_executor_mcp,
+            type => <<"mcp">>,
+            mcp_name => <<"srv__ping">>,
+            separator => <<"__">>
+        }
+    },
+    persistent_term:put({erllama_server_mcp, catalog}, {Tools, ServerTools}),
+    try
+        Fun()
+    after
+        persistent_term:erase({erllama_server_mcp, catalog})
     end.
 
 stream_options_include_usage_parsed(_Cfg) ->

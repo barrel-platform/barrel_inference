@@ -73,6 +73,37 @@ loopback/private/link-local addresses (e.g. `127.0.0.1`,
 `169.254.169.254`, `10.x`, `192.168.x`) are rejected with
 `blocked_host` unless you set `allow_private => true`.
 
+## Connect MCP servers
+
+erllama_server can act as an **MCP client**: connect to one or more
+[Model Context Protocol](https://modelcontextprotocol.io) servers and
+offer *their* tools to the model through the same continue-loop. This
+turns the whole MCP ecosystem (github, filesystem, databases, ...)
+into server-side tools with no per-tool code.
+
+List the servers in `mcp_servers` (each is a `barrel_mcp` connect spec
+plus an `id`):
+
+```erlang
+{mcp_servers, [
+  #{id => <<"github">>,
+    transport => {http, <<"https://mcp.example.com/mcp">>},
+    auth => {bearer, <<"...">>}},
+  #{id => <<"fs">>,
+    transport => {stdio, #{command => "mcp-server-filesystem",
+                           args => ["/srv/data"]}}}
+]}
+```
+
+On boot the server connects to each (a failed server is logged and
+skipped), discovers their tools, and offers them on **every** request,
+namespaced as `<id>__<tool>` (e.g. `github__create_issue`). When the
+model calls one, the server routes it to the owning MCP server, folds
+the result back into the conversation, and continues - the same loop
+and `max_tool_iterations` cap as any server-side tool. `tool_choice =
+none` still disables tools for a request. Empty `mcp_servers` (the
+default) leaves the bridge off.
+
 ## Test it
 
 With an executor registered, a model that decides to search will have

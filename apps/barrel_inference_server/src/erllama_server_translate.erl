@@ -94,9 +94,9 @@ openai_chat_to_internal(Body) when is_map(Body) ->
         MessagesIn = required_list(Body, <<"messages">>),
         check_messages_cap(MessagesIn),
         {System, Messages} = split_system(MessagesIn),
-        {Tools, ServerTools} = parse_openai_tools(Body),
-        check_tools_cap(Tools),
         ToolChoice = parse_openai_tool_choice(Body),
+        {Tools, ServerTools} = maybe_inject_mcp(ToolChoice, parse_openai_tools(Body)),
+        check_tools_cap(Tools),
         RF = parse_response_format_openai(maps:get(<<"response_format">>, Body, undefined)),
         Base = base_request(Body, openai),
         {ok, Base#erllama_request{
@@ -135,9 +135,9 @@ openai_responses_to_internal(Body) when is_map(Body) ->
         check_messages_cap(MessagesIn),
         Instructions = parse_responses_instructions(Body),
         System = merge_instructions_system(Instructions, SystemFromInput),
-        {Tools, ServerTools} = parse_responses_tools(Body),
-        check_tools_cap(Tools),
         ToolChoice = parse_openai_tool_choice(Body),
+        {Tools, ServerTools} = maybe_inject_mcp(ToolChoice, parse_responses_tools(Body)),
+        check_tools_cap(Tools),
         RF = parse_response_format_openai(
             maps:get(<<"response_format">>, Body, undefined)
         ),
@@ -330,6 +330,23 @@ classify_builtin(Type) when is_binary(Type) ->
             drop
     end.
 
+%% Append operator-configured MCP server tools (the `erllama_server_mcp'
+%% catalog) to the request's tool set so the model can call them via
+%% the continue-loop. Skipped when the client disabled tools
+%% (`tool_choice = none'); a no-op when no MCP servers are configured.
+maybe_inject_mcp(none, ToolsAndServer) ->
+    ToolsAndServer;
+maybe_inject_mcp(_ToolChoice, {Tools, ServerTools}) ->
+    case erllama_server_mcp:catalog() of
+        {[], _} ->
+            {Tools, ServerTools};
+        {McpTools, McpServerTools} ->
+            {merge_tools(Tools, McpTools), maps:merge(ServerTools, McpServerTools)}
+    end.
+
+merge_tools(undefined, McpTools) -> McpTools;
+merge_tools(Tools, McpTools) when is_list(Tools) -> Tools ++ McpTools.
+
 function_tool(F) ->
     #{
         name => maps:get(<<"name">>, F),
@@ -410,9 +427,9 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
         SystemRaw = maps:get(<<"system">>, Body, undefined),
         System = parse_anthropic_system(SystemRaw),
         Messages = [normalise_message(M) || M <- MessagesIn],
-        {Tools, ServerTools} = parse_anthropic_tools(Body),
-        check_tools_cap(Tools),
         ToolChoice = parse_anthropic_tool_choice(Body),
+        {Tools, ServerTools} = maybe_inject_mcp(ToolChoice, parse_anthropic_tools(Body)),
+        check_tools_cap(Tools),
         Thinking = parse_anthropic_thinking(Body),
         CacheHints = collect_cache_hints(SystemRaw, MessagesIn, Body),
         RF = parse_anthropic_output_config(Body),
