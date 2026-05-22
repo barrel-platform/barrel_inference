@@ -13,7 +13,9 @@
 %%%     `tool()' (model-facing name + JSON schema) plus one
 %%%     `server_tools' entry per MCP tool - and publish it to
 %%%     persistent_term for a lock-free read on the request path,
-%%%   - rebuild on a timer (and on demand via `refresh/0').
+%%%   - rebuild when a server pushes `notifications/<kind>/list_changed'
+%%%     (via `erllama_server_mcp_handler' -> `refresh_async/0'), on
+%%%     demand via `refresh/0', and on a slow fallback timer.
 %%%
 %%% Each catalog `server_tools' entry routes back through the mcp
 %%% executor: `#{module => erllama_server_tool_executor_mcp, type =>
@@ -26,7 +28,7 @@
 -module(erllama_server_mcp).
 -behaviour(gen_server).
 
--export([start_link/0, catalog/0, refresh/0]).
+-export([start_link/0, catalog/0, refresh/0, refresh_async/0]).
 
 -export([
     init/1,
@@ -39,7 +41,9 @@
 -define(CATALOG, {?MODULE, catalog}).
 -define(SEP, <<"__">>).
 -define(INITIAL_REFRESH_MS, 1500).
--define(REFRESH_INTERVAL_MS, 60000).
+%% list_changed notifications drive refresh; the timer is a slow
+%% fallback for servers that don't emit them.
+-define(REFRESH_INTERVAL_MS, 300000).
 
 %%====================================================================
 %% Public API
@@ -60,6 +64,13 @@ catalog() ->
 refresh() ->
     gen_server:call(?MODULE, refresh, 30000).
 
+%% Like `refresh/0' but non-blocking. The MCP client handler calls this
+%% from inside a client process on `list_changed'; a synchronous call
+%% would deadlock (the rebuild lists tools back through that client).
+-spec refresh_async() -> ok.
+refresh_async() ->
+    gen_server:cast(?MODULE, refresh).
+
 %%====================================================================
 %% gen_server
 %%====================================================================
@@ -74,16 +85,19 @@ init([]) ->
     {ok, []}.
 
 handle_call(refresh, _From, S) ->
-    do_refresh(),
+    rebuild_catalog(),
     {reply, ok, S};
 handle_call(_, _, S) ->
     {reply, ok, S}.
 
+handle_cast(refresh, S) ->
+    rebuild_catalog(),
+    {noreply, S};
 handle_cast(_, S) ->
     {noreply, S}.
 
 handle_info(refresh_tick, S) ->
-    do_refresh(),
+    rebuild_catalog(),
     erlang:send_after(?REFRESH_INTERVAL_MS, self(), refresh_tick),
     {noreply, S};
 handle_info(_, S) ->
@@ -103,7 +117,7 @@ start_clients(_) ->
     ok.
 
 start_client(#{id := Id} = Entry) ->
-    Spec = maps:remove(id, Entry),
+    Spec = with_default_handler(maps:remove(id, Entry)),
     try barrel_mcp:start_client(Id, Spec) of
         {ok, _Pid} ->
             ok;
@@ -118,7 +132,16 @@ start_client(#{id := Id} = Entry) ->
 start_client(Bad) ->
     logger:warning(#{event => mcp_server_config_invalid, entry => Bad}).
 
-do_refresh() ->
+%% Install our notification handler unless the operator set one. The
+%% handler forwards `list_changed' to `refresh_async/0' so the catalog
+%% tracks runtime tool/resource changes.
+with_default_handler(Spec) ->
+    case maps:is_key(handler, Spec) of
+        true -> Spec;
+        false -> Spec#{handler => {erllama_server_mcp_handler, []}}
+    end.
+
+rebuild_catalog() ->
     Tools0 = safe_list_tools(),
     {Tools, ServerTools} = lists:foldl(fun catalog_entry/2, {[], #{}}, Tools0),
     persistent_term:put(?CATALOG, {lists:reverse(Tools), ServerTools}).

@@ -104,6 +104,16 @@ and `max_tool_iterations` cap as any server-side tool. `tool_choice =
 none` still disables tools for a request. Empty `mcp_servers` (the
 default) leaves the bridge off.
 
+A server that changes its tool set at runtime emits
+`notifications/tools/list_changed`; the bridge subscribes and rebuilds
+the catalog when it fires, so the offered tools track the server within
+a round-trip (a slow timer is kept only as a fallback).
+
+**stdio servers** (`transport => {stdio, #{command, args}}`) are
+spawned as child processes - `command` must be on `PATH` or an absolute
+path, and one process is started per server. Optional `env` / `cwd`
+keys in the stdio map pass through to the spawned process.
+
 ## Test it
 
 With an executor registered, a model that decides to search will have

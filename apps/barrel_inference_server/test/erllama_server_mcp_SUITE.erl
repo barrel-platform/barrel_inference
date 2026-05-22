@@ -13,7 +13,7 @@
 -include_lib("stdlib/include/assert.hrl").
 
 all() ->
-    [catalog_and_executor].
+    [catalog_and_executor, list_changed_refresh, stdio_transport].
 
 %% Tool handler registered on the in-process MCP server.
 echo_tool(#{<<"text">> := T}) -> T.
@@ -40,6 +40,9 @@ end_per_suite(_Config) ->
 end_per_testcase(_, _Config) ->
     catch gen_server:stop(erllama_server_mcp, normal, 5000),
     catch barrel_mcp:stop_client(<<"t">>),
+    catch barrel_mcp:stop_client(<<"lc">>),
+    catch barrel_mcp:stop_client(<<"py">>),
+    catch barrel_mcp_registry:unreg(tool, <<"echo2">>),
     application:unset_env(erllama_server, mcp_servers),
     ok.
 
@@ -76,9 +79,114 @@ catalog_and_executor(Config) ->
     ),
     ?assertEqual(<<"hello mcp">>, maps:get(<<"content">>, Result)).
 
+%% A server that adds a tool at runtime broadcasts
+%% notifications/tools/list_changed; the manager's client handler kicks
+%% an async refresh, so the new tool lands in the catalog without
+%% waiting for the fallback timer.
+list_changed_refresh(Config) ->
+    Url = ?config(url, Config),
+    application:set_env(erllama_server, mcp_servers, [
+        #{id => <<"lc">>, transport => {http, Url}}
+    ]),
+    {ok, _Pid} = erllama_server_mcp:start_link(),
+    ok = wait_client_ready(<<"lc">>, 50),
+    ok = erllama_server_mcp:refresh(),
+    {Tools0, _} = erllama_server_mcp:catalog(),
+    ?assert(lists:member(<<"lc__echo">>, [maps:get(name, T) || T <- Tools0])),
+    ?assertNot(lists:member(<<"lc__echo2">>, [maps:get(name, T) || T <- Tools0])),
+    %% Register a second tool on the in-process server: this broadcasts
+    %% list_changed to the connected client. No explicit refresh here -
+    %% the notification must drive it.
+    ok = barrel_mcp_registry:reg(tool, <<"echo2">>, ?MODULE, echo_tool, #{
+        description => <<"Second echo">>,
+        input_schema => #{
+            <<"type">> => <<"object">>,
+            <<"required">> => [<<"text">>],
+            <<"properties">> => #{<<"text">> => #{<<"type">> => <<"string">>}}
+        }
+    }),
+    ok = wait_catalog_tool(<<"lc__echo2">>, 50).
+
+%% stdio transport against barrel_mcp's Python reference server. Gated
+%% on INTEROP_PYTHON (a venv interpreter with the `mcp' package); skips
+%% cleanly on the default `rebar3 ct' loop. Proves the manager forwards
+%% a `{stdio, _}' connect spec and bridges the spawned server's tools.
+stdio_transport(_Config) ->
+    case python_or_skip() of
+        {skip, _} = Skip ->
+            Skip;
+        Python ->
+            case interop_server_script() of
+                {error, Reason} ->
+                    {skip, Reason};
+                Script ->
+                    run_stdio_transport(Python, Script)
+            end
+    end.
+
+run_stdio_transport(Python, Script) ->
+    application:set_env(erllama_server, mcp_servers, [
+        #{
+            id => <<"py">>,
+            transport => {stdio, #{command => Python, args => [Script]}}
+        }
+    ]),
+    {ok, _Pid} = erllama_server_mcp:start_link(),
+    ok = wait_client_ready(<<"py">>, 50),
+    ok = erllama_server_mcp:refresh(),
+    {Tools, ServerTools} = erllama_server_mcp:catalog(),
+    Names = [maps:get(name, T) || T <- Tools],
+    ?assert(lists:member(<<"py__echo">>, Names)),
+    Spec = maps:get(<<"py__echo">>, ServerTools),
+    Ctx = #{
+        model => <<"m">>,
+        request_id => <<"r">>,
+        session_id => undefined,
+        config => maps:without([module, type], Spec)
+    },
+    {ok, Result} = erllama_server_tool_executor_mcp:execute(
+        #{<<"text">> => <<"hello stdio">>}, Ctx
+    ),
+    ?assertEqual(<<"hello stdio">>, maps:get(<<"content">>, Result)).
+
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+wait_catalog_tool(_Name, 0) ->
+    {error, not_in_catalog};
+wait_catalog_tool(Name, N) ->
+    {Tools, _} = erllama_server_mcp:catalog(),
+    case lists:member(Name, [maps:get(name, T) || T <- Tools]) of
+        true ->
+            ok;
+        false ->
+            timer:sleep(100),
+            wait_catalog_tool(Name, N - 1)
+    end.
+
+python_or_skip() ->
+    case os:getenv("INTEROP_PYTHON") of
+        false ->
+            {skip, "INTEROP_PYTHON not set; stdio transport unverified"};
+        Python ->
+            case filelib:is_regular(Python) of
+                true -> Python;
+                false -> {skip, "INTEROP_PYTHON does not point at a file"}
+            end
+    end.
+
+interop_server_script() ->
+    case code:lib_dir(barrel_mcp) of
+        {error, _} ->
+            {error, "barrel_mcp lib dir not found"};
+        Dir ->
+            Script = filename:join([Dir, "test", "interop", "server.py"]),
+            case filelib:is_regular(Script) of
+                true -> Script;
+                false -> {error, "barrel_mcp interop server.py not found"}
+            end
+    end.
 
 wait_client_ready(_Id, 0) ->
     {error, not_ready};

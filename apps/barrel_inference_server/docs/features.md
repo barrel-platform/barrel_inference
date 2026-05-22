@@ -10,9 +10,10 @@ history and the guides; this file is the not-yet-done list.
   tools on every request through the continue-loop
   (`erllama_server_mcp` manager + catalog -> translate injection ->
   `erllama_server_tool_executor_mcp`). See `guides/tools.md`.
-  Remaining: `tools/list_changed` subscription-driven refresh (today a
-  timer); verify stdio-transport servers; expose erllama's *own* tools
-  as an MCP server (the other direction).
+  The catalog refreshes on `tools/list_changed` (timer is a fallback);
+  stdio transport is verified against the Python reference server
+  (gated CT). Remaining: bridge MCP resources; expose erllama's *own*
+  tools as an MCP server (the other direction).
 - **`code_interpreter`.** Highest value for coding agents, but heavy
   and security-sensitive: needs a real sandbox (container / firejail /
   separate service), not an in-process call. Do deliberately.
