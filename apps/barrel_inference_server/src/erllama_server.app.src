@@ -13,7 +13,8 @@
         cowboy,
         instrument,
         hackney,
-        erllama
+        erllama,
+        barrel_mcp
     ]},
     {env, []},
     {modules, []},
