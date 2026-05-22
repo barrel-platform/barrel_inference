@@ -9,12 +9,12 @@
 %%%     <<"web_search">> => #{
 %%%       module => erllama_server_tool_executor_web_search,
 %%%       type => <<"web_search">>,
-%%%       provider => tavily,            %% tavily | ollama | brave | searxng
-%%%       api_key => <<"tvly-...">>}     %% endpoint => ... for searxng
+%%%       provider => tavily,            %% tavily|ollama|brave|mojeek
+%%%       api_key => <<"tvly-...">>}     %% |marginalia|searxng (endpoint=)
 %%%   }}
 %%%
 %%% The backend is pluggable via the `provider' config key (carried in
-%%% `Ctx.config'). Four providers ship; adding one is a `build_request/3'
+%%% `Ctx.config'). Six providers ship; adding one is a `build_request/3'
 %%% clause plus a `parse/2' clause. Every provider normalises to a
 %%% compact, model-friendly `#{answer => _, results => [#{title, url,
 %%% content}]}`.
@@ -28,6 +28,8 @@
 -define(TAVILY_URL, <<"https://api.tavily.com/search">>).
 -define(OLLAMA_URL, <<"https://ollama.com/api/web_search">>).
 -define(BRAVE_URL, <<"https://api.search.brave.com/res/v1/web/search">>).
+-define(MOJEEK_URL, <<"https://api.mojeek.com/search">>).
+-define(MARGINALIA_URL, <<"https://api2.marginalia-search.com/search">>).
 -define(DEFAULT_MAX_RESULTS, 5).
 -define(DEFAULT_TIMEOUT_MS, 10000).
 
@@ -79,33 +81,59 @@ build_request(ollama, Query, Config) ->
         {ok, {post, endpoint(Config, ?OLLAMA_URL), bearer_headers(Key), search_body(Query, Config)}}
     end);
 build_request(brave, Query, Config) ->
-    with_key(Config, fun(Key) -> brave_request(Query, Config, Key) end);
+    %% Brave: query param `q`, key in the x-subscription-token header.
+    with_key(Config, fun(Key) ->
+        keyed_get(?BRAVE_URL, <<"q">>, Query, <<"x-subscription-token">>, Key, Config)
+    end);
+build_request(marginalia, Query, Config) ->
+    %% Marginalia (Sweden, independent open index): query param `query`,
+    %% key in the API-Key header; the free public key is "public".
+    with_key(Config, fun(Key) ->
+        keyed_get(?MARGINALIA_URL, <<"query">>, Query, <<"api-key">>, Key, Config)
+    end);
+build_request(mojeek, Query, Config) ->
+    %% Mojeek (UK/European, own index): api_key is a query param.
+    with_key(Config, fun(Key) ->
+        get_with_query(endpoint(Config, ?MOJEEK_URL), [
+            {<<"q">>, Query}, {<<"fmt">>, <<"json">>}, {<<"api_key">>, Key}
+        ])
+    end);
 build_request(searxng, Query, Config) ->
     searxng_request(Query, Config);
 build_request(Provider, _Query, _Config) ->
     {error, {unsupported_provider, Provider}}.
 
-brave_request(Query, Config, Key) ->
-    Qs = query_string([
-        {<<"q">>, Query},
-        {<<"count">>, integer_to_binary(max_results(Config))}
-    ]),
-    Url = <<(endpoint(Config, ?BRAVE_URL))/binary, "?", Qs/binary>>,
-    Headers = [
-        {<<"accept">>, <<"application/json">>},
-        {<<"x-subscription-token">>, Key}
-    ],
-    {ok, {get, Url, Headers, <<>>}}.
+%% GET with a `count` param and the key carried in AuthHeader (Brave,
+%% Marginalia). DefaultUrl may be overridden by the `endpoint' config.
+keyed_get(DefaultUrl, QueryKey, Query, AuthHeader, Key, Config) ->
+    get_with_query(
+        endpoint(Config, DefaultUrl),
+        [{QueryKey, Query}, {<<"count">>, count_param(Config)}],
+        [{AuthHeader, Key}]
+    ).
 
 searxng_request(Query, Config) ->
     case endpoint(Config, undefined) of
         undefined ->
             {error, missing_endpoint};
         Base ->
-            Qs = query_string([{<<"q">>, Query}, {<<"format">>, <<"json">>}]),
-            Url = <<Base/binary, "/search?", Qs/binary>>,
-            {ok, {get, Url, [{<<"accept">>, <<"application/json">>}], <<>>}}
+            get_with_query(<<Base/binary, "/search">>, [
+                {<<"q">>, Query}, {<<"format">>, <<"json">>}
+            ])
     end.
+
+get_with_query(BaseUrl, Pairs) ->
+    get_with_query(BaseUrl, Pairs, []).
+
+%% A GET request with an `accept: application/json' header (plus any
+%% ExtraHeaders) and a url-encoded query string appended to BaseUrl.
+get_with_query(BaseUrl, Pairs, ExtraHeaders) ->
+    Url = <<BaseUrl/binary, "?", (query_string(Pairs))/binary>>,
+    Headers = [{<<"accept">>, <<"application/json">>} | ExtraHeaders],
+    {ok, {get, Url, Headers, <<>>}}.
+
+count_param(Config) ->
+    integer_to_binary(max_results(Config)).
 
 with_key(Config, Fun) ->
     case maps:get(api_key, Config, undefined) of
@@ -170,6 +198,15 @@ parse(Provider, RespBody) ->
 normalise(brave, Decoded) ->
     Web = maps:get(<<"web">>, Decoded, #{}),
     Results = result_list(Web),
+    #{<<"results">> => [result(R, <<"description">>) || R <- Results, is_map(R)]};
+normalise(mojeek, Decoded) ->
+    %% Mojeek wraps in `response` and uses `desc`.
+    Resp = maps:get(<<"response">>, Decoded, #{}),
+    Results = result_list(Resp),
+    #{<<"results">> => [result(R, <<"desc">>) || R <- Results, is_map(R)]};
+normalise(marginalia, Decoded) ->
+    %% Marginalia: top-level `results`, uses `description`.
+    Results = result_list(Decoded),
     #{<<"results">> => [result(R, <<"description">>) || R <- Results, is_map(R)]};
 normalise(tavily, Decoded) ->
     Results = result_list(Decoded),

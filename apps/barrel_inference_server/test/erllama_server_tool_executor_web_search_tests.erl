@@ -52,6 +52,25 @@ build_brave_test() ->
     %% the query is url-encoded into the q param
     ?assert(binary:match(Url, <<"q=hello">>) =/= nomatch).
 
+build_mojeek_test() ->
+    {ok, {Method, Url, _Headers, Body}} =
+        ?M:build_request(mojeek, <<"hello">>, #{api_key => <<"mjk">>}),
+    ?assertEqual(get, Method),
+    ?assertEqual(<<>>, Body),
+    ?assert(binary:match(Url, <<"api.mojeek.com/search?">>) =/= nomatch),
+    %% Mojeek carries the key + json format as query params.
+    ?assert(binary:match(Url, <<"fmt=json">>) =/= nomatch),
+    ?assert(binary:match(Url, <<"api_key=mjk">>) =/= nomatch).
+
+build_marginalia_test() ->
+    {ok, {get, Url, Headers, <<>>}} =
+        ?M:build_request(marginalia, <<"hello">>, #{api_key => <<"public">>}),
+    ?assert(binary:match(Url, <<"api2.marginalia-search.com/search?">>) =/= nomatch),
+    ?assert(binary:match(Url, <<"query=hello">>) =/= nomatch),
+    %% the key travels in the API-Key header, not the URL
+    ?assertEqual(<<"public">>, header(<<"api-key">>, Headers)),
+    ?assertEqual(nomatch, binary:match(Url, <<"public">>)).
+
 build_searxng_test() ->
     {ok, {get, Url, _Headers, <<>>}} =
         ?M:build_request(searxng, <<"q">>, #{endpoint => <<"http://127.0.0.1:8888">>}),
@@ -142,6 +161,41 @@ parse_searxng_test() ->
     Parsed = ?M:parse(searxng, Body),
     [R] = maps:get(<<"results">>, Parsed),
     ?assertEqual(<<"S">>, maps:get(<<"title">>, R)).
+
+parse_mojeek_test() ->
+    %% Mojeek nests results under `response` and uses `desc`.
+    Body = enc(#{
+        <<"response">> => #{
+            <<"results">> => [
+                #{
+                    <<"title">> => <<"Paris - Wikipedia">>,
+                    <<"url">> => <<"https://en.wikipedia.org/wiki/Paris">>,
+                    <<"desc">> => <<"Paris is the capital of France.">>
+                }
+            ]
+        }
+    }),
+    Parsed = ?M:parse(mojeek, Body),
+    [R] = maps:get(<<"results">>, Parsed),
+    ?assertEqual(<<"Paris - Wikipedia">>, maps:get(<<"title">>, R)),
+    %% desc is mapped onto the unified `content` field
+    ?assertEqual(<<"Paris is the capital of France.">>, maps:get(<<"content">>, R)).
+
+parse_marginalia_test() ->
+    %% Marginalia: top-level results, uses `description`.
+    Body = enc(#{
+        <<"results">> => [
+            #{
+                <<"title">> => <<"A blog about Paris">>,
+                <<"url">> => <<"https://example.org/paris">>,
+                <<"description">> => <<"Notes on the capital of France.">>
+            }
+        ]
+    }),
+    Parsed = ?M:parse(marginalia, Body),
+    [R] = maps:get(<<"results">>, Parsed),
+    ?assertEqual(<<"A blog about Paris">>, maps:get(<<"title">>, R)),
+    ?assertEqual(<<"Notes on the capital of France.">>, maps:get(<<"content">>, R)).
 
 parse_malformed_test() ->
     ?assertEqual(#{<<"results">> => []}, ?M:parse(tavily, <<"{not json">>)),

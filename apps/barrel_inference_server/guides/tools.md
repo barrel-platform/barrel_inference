@@ -40,6 +40,8 @@ Provider config:
 | `tavily`  | `api_key`                             | `api.tavily.com` (LLM-tuned)     |
 | `ollama`  | `api_key`                             | `ollama.com/api/web_search`      |
 | `brave`   | `api_key`                             | Brave Search API                 |
+| `mojeek`  | `api_key`                             | Mojeek (UK/European, own index)  |
+| `marginalia` | `api_key` (free public key: `public`) | Marginalia (Sweden, indie index) |
 | `searxng` | `endpoint` (e.g. `http://host:8888`)  | your self-hosted SearXNG         |
 
 Optional keys for any provider: `max_results` (default 5),
