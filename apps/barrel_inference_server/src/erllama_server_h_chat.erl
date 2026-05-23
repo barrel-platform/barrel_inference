@@ -128,7 +128,12 @@
     agg_stats = #{} :: map(),
     %% keepalive request_begin is refcounted; each loop round re-emits
     %% {pipeline, loaded}, so only the first round begins.
-    keepalive_begun = false :: boolean()
+    keepalive_begun = false :: boolean(),
+    %% Rendered prompt token ids for the current round, captured from
+    %% {pipeline, templated, _}. With Stats.generated on erllama_done
+    %% they form the session's committed token-id list for the
+    %% byte-exact continuation path.
+    prompt_token_ids = [] :: [non_neg_integer()]
 }).
 
 %%====================================================================
@@ -259,8 +264,8 @@ info({pipeline, loaded}, Req, S = #st{keepalive_begun = true}) ->
 info({pipeline, loaded}, Req, S) ->
     ok = erllama_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template, keepalive_begun = true}, hibernate};
-info({pipeline, templated, _Tokens}, Req, S) ->
-    {ok, Req, S#st{phase = waiting_queue}, hibernate};
+info({pipeline, templated, Tokens}, Req, S) ->
+    {ok, Req, S#st{phase = waiting_queue, prompt_token_ids = Tokens}, hibernate};
 info({pipeline, queued}, Req, S) ->
     {ok, Req, S#st{phase = waiting_admit}, hibernate};
 info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
@@ -453,13 +458,10 @@ maybe_end_session(#st{model = Model, session_id = SessionId}) ->
 
 record_session_committed(#st{session_id = undefined}, _) ->
     ok;
-record_session_committed(#st{model = Model, session_id = SessionId}, Stats) ->
-    case maps:get(committed_tokens, Stats, undefined) of
-        N when is_integer(N), N > 0 ->
-            erllama_server_session_state:put(Model, SessionId, N);
-        _ ->
-            ok
-    end.
+record_session_committed(
+    #st{model = Model, session_id = SessionId, prompt_token_ids = Prompt}, Stats
+) ->
+    erllama_server_session_state:record(Model, SessionId, Prompt, Stats).
 
 %% Balance request_begin iff it ran. Keying off `keepalive_begun`
 %% (not phase) is correct under the loop, where a re-load round resets

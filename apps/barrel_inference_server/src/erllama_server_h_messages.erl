@@ -137,7 +137,12 @@
     agg_stats = #{} :: map(),
     %% keepalive request_begin is refcounted; each loop round re-emits
     %% {pipeline, loaded}, so only the first round begins.
-    keepalive_begun = false :: boolean()
+    keepalive_begun = false :: boolean(),
+    %% Rendered prompt token ids for the current round (the `prompt_tokens'
+    %% field above is just their count, for usage reporting). With
+    %% Stats.generated on erllama_done they form the session's committed
+    %% token-id list for the byte-exact continuation path.
+    prompt_token_ids = [] :: [non_neg_integer()]
 }).
 
 %%====================================================================
@@ -375,7 +380,13 @@ info({pipeline, templated, Tokens}, Req, S) ->
     %% Capture the prompt token count for the message_start frame's
     %% `usage.input_tokens`. Without this, streaming clients see 0
     %% in message_start while non-streaming reports the real value.
-    {ok, Req, S#st{phase = waiting_queue, prompt_tokens = length(Tokens)}, hibernate};
+    {ok, Req,
+        S#st{
+            phase = waiting_queue,
+            prompt_tokens = length(Tokens),
+            prompt_token_ids = Tokens
+        },
+        hibernate};
 info({pipeline, queued}, Req, S) ->
     {ok, Req, S#st{phase = waiting_admit}, hibernate};
 info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
@@ -590,20 +601,16 @@ maybe_end_session(#st{model = Model, session_id = SessionId}) ->
     erllama_server_session_state:delete(Model, SessionId),
     ok.
 
-%% Stash the engine-reported `committed_tokens' so the next turn's
-%% pipeline can slice the rendered prompt at the right boundary
-%% for `erllama:continue/3'. Skip when no session id is on file
-%% (legacy path) or the engine didn't surface the count (very old
-%% engine).
+%% Store the session's committed token-id list (rendered prompt ++
+%% generated) so the next turn can verify a byte-exact continuation
+%% before routing through `erllama:continue/3'. Skip when no session
+%% id is on file (legacy path); the guard lives in session_state.
 record_session_committed(#st{session_id = undefined}, _) ->
     ok;
-record_session_committed(#st{model = Model, session_id = SessionId}, Stats) ->
-    case maps:get(committed_tokens, Stats, undefined) of
-        N when is_integer(N), N > 0 ->
-            erllama_server_session_state:put(Model, SessionId, N);
-        _ ->
-            ok
-    end.
+record_session_committed(
+    #st{model = Model, session_id = SessionId, prompt_token_ids = Prompt}, Stats
+) ->
+    erllama_server_session_state:record(Model, SessionId, Prompt, Stats).
 
 %% Balance request_begin iff it ran. Keying off `keepalive_begun`
 %% (not phase) is correct under the loop, where a re-load round resets

@@ -211,23 +211,32 @@ the new suffix, the engine prefills it on top of the session's
 stored state without verification).
 
 `erllama_server_session_state` (supervised gen_server + public
-ETS, keyed on `{Model, SessionId} -> committed_tokens`) caches
-the `committed_tokens` count from each turn's `erllama_done`
-Stats. The pipeline's `accept_tokens/2` checks this state: if a
-prior count is on file, `lists:nthtail(N, NewTokens)` becomes
-the suffix passed to `erllama:continue/3` instead of running
-`infer/4` with the full token list.
+ETS, keyed on `{Model, SessionId} -> [token_id()]`) caches the
+session's exact committed token-id list. erllama 0.8 reports the
+generated token ids (`generated`) in each turn's `erllama_done`
+Stats; the handler's `record_session_committed/2` calls
+`erllama_server_session_state:record/4`, which stores
+`PromptTokens ++ generated` only when its length agrees with the
+engine's `committed_tokens` count (otherwise the list cannot be
+trusted and nothing is stored). The pipeline's
+`maybe_arm_continuation/2` then routes through `continue/3` only
+when the stored list is a strict `lists:prefix/2` of the freshly
+rendered prompt; the new suffix is `lists:nthtail(length(Committed),
+NewTokens)` and `Committed` is forwarded as `expect_committed` so
+the engine re-validates the splice.
 
-Failure modes:
+Failure modes (all fall back to a correct full `infer/4`, never
+garbage):
 - `{error, no_session}` (TTL eviction, server restart, prior
   cancel-mid-flight): pipeline clears the stale local state and
-  retries with the full token list via `infer/4`.
-- Mis-sliced suffix (chat-template re-renders prior turns
-  differently across turns): engine accepts the suffix, model
-  emits garbage tokens. `cache_hit_kind = continuation` in
-  Stats makes this diagnosable. Operators should run
-  `multi_turn_cache_delta_profile/1` against their production
-  model before relying on the continuation path.
+  retries with the full token list.
+- `{error, {transcript_mismatch, _}}`: the engine's stored
+  context disagrees with our `expect_committed`. Clear + full
+  `infer/4`.
+- Stored list is not a prefix of the new render (chat template
+  re-renders prior turns differently): continuation is not armed;
+  the turn admits cold. `multi_turn_cache_delta_profile/1` against
+  a production model shows how often the warm path is kept.
 
 ### Test Organization
 

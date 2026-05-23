@@ -47,12 +47,18 @@
     %% State filled in as we progress.
     tokens :: [non_neg_integer()] | undefined,
     %% When set, this turn extends a prior pinned session whose
-    %% committed-token count is known. `suffix' is the new tail
-    %% (tokens after the slice); `infer/4' is replaced with
-    %% `erllama:continue/3' on this turn. Unset on the first turn
-    %% of a session, after `no_session' fallback, or when the
-    %% server-side session_state has no entry for this session.
+    %% committed token-id list is on file and is a true prefix of the
+    %% freshly rendered prompt. `continuation' is the new tail (tokens
+    %% after that prefix); `infer/4' is replaced with
+    %% `erllama:continue/3' on this turn, passing `expect_committed'
+    %% so the engine re-validates the splice. Unset on the first turn
+    %% of a session, after a `no_session' / `transcript_mismatch'
+    %% fallback, when there is no session_state entry, or when the
+    %% stored committed tokens are not a prefix of the new render.
     continuation :: [non_neg_integer()] | undefined,
+    %% The stored committed token-id list this continuation extends;
+    %% forwarded to `erllama:continue/3' as `expect_committed'.
+    expect_committed :: [non_neg_integer()] | undefined,
     slot :: erllama_server_queue:slot() | undefined,
     infer_ref :: reference() | undefined
 }).
@@ -421,14 +427,16 @@ accept_tokens(W, Tokens) ->
     W#work.handler ! {pipeline, templated, Tokens},
     {ok, W2}.
 
-%% When the request's session has a prior `committed_tokens' count
-%% on file and the freshly-rendered prompt is longer than that
-%% count, this turn is a continuation: slice the tokens after the
-%% prior count and route through `erllama:continue/3' instead of
-%% `infer/4'. Returns the work record annotated with the suffix on
-%% success; leaves it untouched (first turn / no session state /
-%% shorter prompt than prior) so step_infer falls through to the
-%% normal `infer/4' path.
+%% When the request's session has a prior committed token-id list on
+%% file AND that list is a strict prefix of the freshly rendered
+%% prompt, this turn is a byte-exact continuation: slice the tokens
+%% after the prefix and route through `erllama:continue/3' (passing
+%% `expect_committed') instead of `infer/4'. Returns the work record
+%% annotated with the suffix + expected prefix on success; leaves it
+%% untouched (first turn / no session state / the new render does not
+%% extend the stored prefix - e.g. the chat template re-rendered prior
+%% turns differently) so step_infer falls through to a correct, full
+%% `infer/4' instead of producing garbage.
 maybe_arm_continuation(W, Tokens) ->
     R = W#work.request,
     case R#erllama_request.session_id of
@@ -436,9 +444,18 @@ maybe_arm_continuation(W, Tokens) ->
             W;
         SessionId ->
             case erllama_server_session_state:get(R#erllama_request.model_id, SessionId) of
-                {ok, N} when is_integer(N), N > 0, N < length(Tokens) ->
-                    Suffix = lists:nthtail(N, Tokens),
-                    W#work{continuation = Suffix};
+                {ok, Committed} when
+                    is_list(Committed),
+                    Committed =/= [],
+                    length(Committed) < length(Tokens)
+                ->
+                    case lists:prefix(Committed, Tokens) of
+                        true ->
+                            Suffix = lists:nthtail(length(Committed), Tokens),
+                            W#work{continuation = Suffix, expect_committed = Committed};
+                        false ->
+                            W
+                    end;
                 _ ->
                     W
             end
@@ -557,10 +574,19 @@ do_infer(W, Params) ->
     R = W#work.request,
     ContOpts = maps:merge(Params, #{
         session_id => R#erllama_request.session_id,
-        caller_pid => W#work.handler
+        caller_pid => W#work.handler,
+        expect_committed => W#work.expect_committed
     }),
     case erllama:continue(model_id(W), W#work.continuation, ContOpts) of
+        %% Engine has no session entry (TTL evict, restart, prior
+        %% cancel-mid-flight) or our committed list disagrees with the
+        %% engine's stored context (transcript_mismatch). Either way the
+        %% slice is unsafe: drop the stale state and re-admit cold with
+        %% the full token list.
         {error, no_session} ->
+            clear_session_state(W),
+            erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler);
+        {error, {transcript_mismatch, _}} ->
             clear_session_state(W),
             erllama:infer(model_id(W), W#work.tokens, Params, W#work.handler);
         Other ->
