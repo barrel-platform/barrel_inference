@@ -60,6 +60,59 @@ manifest_to_config_passes_n_ctx_to_context_opts_test() ->
     %% when neither is present).
     ?assert(is_integer(maps:get(n_batch, CtxOpts))).
 
+%% erllama 0.8.0 decode_budget_ms threads into context_opts.
+%% `loader.decode_budget_ms' is forwarded as-is.
+manifest_to_config_decode_budget_from_loader_test() ->
+    application:set_env(erllama_server, max_context_size, 4096),
+    application:unset_env(erllama_server, decode_budget_ms),
+    Manifest = with_loader_keys(
+        manifest(<<"sha256:0010">>, <<"q4_k_m">>, 4096, 4),
+        #{<<"decode_budget_ms">> => 60000}
+    ),
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertEqual(60000, maps:get(decode_budget_ms, CtxOpts)).
+
+%% `parameters.num_decode_budget_ms' (an /api/edit override) wins over
+%% the loader value.
+manifest_to_config_decode_budget_param_overrides_test() ->
+    application:set_env(erllama_server, max_context_size, 4096),
+    application:unset_env(erllama_server, decode_budget_ms),
+    Manifest0 = with_loader_keys(
+        manifest(<<"sha256:0011">>, <<"q4_k_m">>, 4096, 4),
+        #{<<"decode_budget_ms">> => 60000}
+    ),
+    Manifest = Manifest0#{<<"parameters">> => #{<<"num_decode_budget_ms">> => 5000}},
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertEqual(5000, maps:get(decode_budget_ms, CtxOpts)).
+
+%% No manifest keys: fall back to the global `decode_budget_ms' app env.
+manifest_to_config_decode_budget_app_env_fallback_test() ->
+    application:set_env(erllama_server, max_context_size, 4096),
+    application:set_env(erllama_server, decode_budget_ms, 12000),
+    Manifest = manifest(<<"sha256:0012">>, <<"q4_k_m">>, 4096, 4),
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    application:unset_env(erllama_server, decode_budget_ms),
+    ?assertEqual(12000, maps:get(decode_budget_ms, CtxOpts)).
+
+%% Nothing set anywhere: the key is omitted so the engine keeps its
+%% own default. Zero is a valid value (disables the budget) and is kept.
+manifest_to_config_decode_budget_absent_and_zero_test() ->
+    application:set_env(erllama_server, max_context_size, 4096),
+    application:unset_env(erllama_server, decode_budget_ms),
+    Manifest = manifest(<<"sha256:0013">>, <<"q4_k_m">>, 4096, 4),
+    Config = erllama_server_loader:manifest_to_config(Manifest),
+    ?assertNot(maps:is_key(decode_budget_ms, maps:get(context_opts, Config))),
+    ManifestZero = with_loader_keys(Manifest, #{<<"decode_budget_ms">> => 0}),
+    ConfigZero = erllama_server_loader:manifest_to_config(ManifestZero),
+    ?assertEqual(0, maps:get(decode_budget_ms, maps:get(context_opts, ConfigZero))).
+
+with_loader_keys(Manifest, Extra) ->
+    Loader = maps:get(<<"loader">>, Manifest, #{}),
+    Manifest#{<<"loader">> => maps:merge(Loader, Extra)}.
+
 %% Without an explicit `loader.n_batch', the loader picks a default
 %% from the manifest's `parameter_size'. Larger models get a smaller
 %% n_batch to keep the compute buffer in check.

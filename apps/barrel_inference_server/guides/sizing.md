@@ -115,6 +115,7 @@ What each knob does for the too-big-to-fit case:
 | `n_ctx: 8192` (low) | KV cache scales with context size and is fully RAM-resident. Bigger context = less RAM for weight paging. Pick the smallest context your client actually uses. |
 | `n_batch: 256` (low) | Smaller prefill batches mean smaller scratch buffers competing for RAM. Trades prefill throughput for paging headroom. |
 | `n_seq_max: 1` | Multiple concurrent sequences each have a KV cache and their own expert-access pattern. Pin to 1 for big models on small RAM. |
+| `decode_budget_ms` (engine) | erllama 0.8 aborts any decode step that exceeds this wall-clock budget and recovers the context in place instead of wedging. Default 30000 (30 s). A very large model on CPU can legitimately exceed 30 s on a heavy prefill step — raise it (or set `0` to disable) if you see spurious `decode_timeout`. Set globally via `decode_budget_ms` in `sys.config`, or per model via `loader.decode_budget_ms`. |
 
 And in `sys.config`:
 

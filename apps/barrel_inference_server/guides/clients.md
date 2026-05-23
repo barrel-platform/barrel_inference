@@ -557,6 +557,7 @@ firing.
 | --- | --- |
 | 529 with `retry-after` | Two concurrent admits on the same session — Claude Code occasionally fires parallel asks; SDKs retry. A spike means `n_seq_max` is too low. |
 | 504 `queue_timeout` after a few turns | A sticky session pinned a seq and no spare seq_ids are left; bump `loader.context_opts.n_seq_max` to 4+. |
+| Requests block then 504 when many sessions are active | The engine's seq pool is full. Set `admission_on_full => error` in `sys.config` so a full pool fails fast with a retryable 503/529 (SDKs back off) instead of blocking until a timeout. The durable fix is a higher `n_seq_max`. |
 | Garbage tokens on turn 2+ | Model's chat template re-renders prior turns differently across turns; the continuation suffix doesn't line up against the engine's stored prefix. Pick a model whose template is stable (run `multi_turn_cache_delta_profile` against it first). |
 | Claude Code says "model not found" | The alias key in `sys.config` doesn't match the exact id Claude Code is sending. Check `curl http://127.0.0.1:8080/v1/models` and compare. |
 | First load is slow | Cold-pull + GGUF mmap + Metal/CUDA init can be 20-30 s for a 7B Q4 on Apple Silicon. Warm reloads are sub-second. |

@@ -360,6 +360,24 @@ manifest_to_config(Manifest) ->
             maps:get(<<"n_seq_max">>, Loader, undefined)
         )
     ),
+    %% erllama 0.8.0 bounds each decode step at a per-step wall-clock
+    %% budget (`context_opts.decode_budget_ms', engine default 30000,
+    %% 0 disables) so a wedged decode aborts and the engine recovers in
+    %% place instead of blocking forever. Resolution mirrors n_seq_max:
+    %% `parameters.num_decode_budget_ms' > `loader.decode_budget_ms' >
+    %% global `decode_budget_ms' app env. Undefined leaves the key off
+    %% so the engine keeps its own default.
+    DecodeBudget = non_neg_int(
+        maps:get(
+            <<"num_decode_budget_ms">>,
+            Params,
+            maps:get(
+                <<"decode_budget_ms">>,
+                Loader,
+                application:get_env(?APP, decode_budget_ms, undefined)
+            )
+        )
+    ),
     %% erllama_model_llama reads `context_opts` (forwarded to
     %% erllama_nif:new_context/2) and `model_opts` (forwarded to
     %% erllama_nif:load_model/2). Without these the NIF falls back to
@@ -382,9 +400,12 @@ manifest_to_config(Manifest) ->
         quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
         quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
         context_size => Ctx,
-        context_opts => maybe_put_n_seq_max(
-            #{n_ctx => Ctx, n_batch => NBatch},
-            NSeqMax
+        context_opts => maybe_put_decode_budget_ms(
+            maybe_put_n_seq_max(
+                #{n_ctx => Ctx, n_batch => NBatch},
+                NSeqMax
+            ),
+            DecodeBudget
         ),
         model_opts => model_opts_from(Loader, Params)
     },
@@ -440,8 +461,15 @@ add_payload_markers(Base, _) ->
 pos_int(N) when is_integer(N), N > 0 -> N;
 pos_int(_) -> undefined.
 
+%% Like pos_int/1 but 0 is valid (0 disables the decode budget).
+non_neg_int(N) when is_integer(N), N >= 0 -> N;
+non_neg_int(_) -> undefined.
+
 maybe_put_n_seq_max(Opts, undefined) -> Opts;
 maybe_put_n_seq_max(Opts, N) -> Opts#{n_seq_max => N}.
+
+maybe_put_decode_budget_ms(Opts, undefined) -> Opts;
+maybe_put_decode_budget_ms(Opts, N) -> Opts#{decode_budget_ms => N}.
 
 %% Build the model_opts map. Only set keys the manifest actually
 %% supplies; let llama.cpp pick its own platform-appropriate default

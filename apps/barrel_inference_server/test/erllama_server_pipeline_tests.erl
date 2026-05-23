@@ -11,10 +11,25 @@
 -module(erllama_server_pipeline_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("erllama_server.hrl").
 
 %% =============================================================================
 %% Cases
 %% =============================================================================
+
+%% erllama 0.8.0 on_full: opt-in via the admission_on_full app env.
+%% `error' threads `on_full => error' into the infer params; anything
+%% else (the default) leaves the key off so the engine stays on block.
+build_params_on_full_opt_in_test() ->
+    application:set_env(erllama_server, admission_on_full, error),
+    Params = erllama_server_pipeline:build_params(#erllama_request{}),
+    application:unset_env(erllama_server, admission_on_full),
+    ?assertEqual(error, maps:get(on_full, Params)).
+
+build_params_on_full_default_omitted_test() ->
+    application:unset_env(erllama_server, admission_on_full),
+    Params = erllama_server_pipeline:build_params(#erllama_request{}),
+    ?assertNot(maps:is_key(on_full, Params)).
 
 forwards_progress_ticks_to_handler_test() ->
     ModelId = <<"unit-test-model">>,

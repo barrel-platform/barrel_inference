@@ -38,6 +38,8 @@
 -include("erllama_server.hrl").
 
 -export([start_link/2, abort/1]).
+%% Exported for unit tests (pure).
+-export([build_params/1]).
 
 -record(work, {
     handler :: pid(),
@@ -532,6 +534,12 @@ step_infer(W) ->
         %% backoff delay.
         {ok, {error, sticky_busy}} ->
             {error, 503, sticky_busy};
+        %% erllama 0.8.0 `on_full => error': the seq pool is full (no
+        %% free seq). Retryable, same surface mapping as sticky_busy
+        %% (Anthropic remaps 503 -> 529 + retry-after).
+        {ok, {error, seq_capacity}} ->
+            erllama_server_metrics:inc_pool_exhausted(model_id(W)),
+            {error, 503, seq_capacity};
         {ok, {error, Reason}} ->
             {error, 500, Reason};
         {error, _, _} = E ->
@@ -629,7 +637,20 @@ build_params(R) ->
     %% from disk. Cancel is async (next decode tick observes it) so a
     %% retry with the same session_id during that window gets
     %% `{error, sticky_busy}` -> 503; SDKs honour Retry-After.
-    maybe_put(Maybe3, session_id, R#erllama_request.session_id).
+    Maybe4 = maybe_put(Maybe3, session_id, R#erllama_request.session_id),
+    %% erllama 0.8.0: `on_full => error' fails an admission fast with
+    %% `{error, seq_capacity}' when no seq is free instead of blocking
+    %% (the engine default). Under sticky pinning the seq pool can be
+    %% full while our queue still has a slot, so fail-fast + retry beats
+    %% blocking until a request timeout fires. Opt-in via the
+    %% `admission_on_full' app env; absent leaves the engine on `block'.
+    maybe_put(Maybe4, on_full, admission_on_full()).
+
+admission_on_full() ->
+    case application:get_env(erllama_server, admission_on_full, undefined) of
+        error -> error;
+        _ -> undefined
+    end.
 
 maybe_put(Map, _Key, undefined) -> Map;
 maybe_put(Map, Key, Value) -> Map#{Key => Value}.
