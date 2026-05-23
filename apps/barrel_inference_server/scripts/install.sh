@@ -1,34 +1,34 @@
 #!/bin/sh
-# erllama_server installer. Detects OS + arch, picks the right
-# release asset, untars it, symlinks `erllama_server` and `erllama`
+# barrel_inference_server installer. Detects OS + arch, picks the right
+# release asset, untars it, symlinks `barrel_inference_server` and `barrel_inference`
 # into the chosen bin dir.
 #
 # Usage:
-#   curl -fsSL https://github.com/erllama/erllama_server/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/barrel-platform/barrel_inference/releases/latest/download/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --variant cuda12
 #   curl -fsSL .../install.sh | sh -s -- --prefix /opt --bindir /usr/local/bin
 #   curl -fsSL .../install.sh | sh -s -- --version 0.1.0
 #
 # Environment variables (override the auto-detection):
-#   ERLLAMA_PREFIX     install prefix    (default /usr/local)
-#   ERLLAMA_BINDIR     symlink dir       (default $PREFIX/bin)
-#   ERLLAMA_VARIANT    cpu | cuda12 | rocm   (default cpu)
-#   ERLLAMA_VERSION    e.g. 0.1.0        (default: latest release)
+#   BARREL_INFERENCE_PREFIX     install prefix    (default /usr/local)
+#   BARREL_INFERENCE_BINDIR     symlink dir       (default $PREFIX/bin)
+#   BARREL_INFERENCE_VARIANT    cpu | cuda12 | rocm   (default cpu)
+#   BARREL_INFERENCE_VERSION    e.g. 0.1.0        (default: latest release)
 #
-# License: MIT. https://github.com/erllama/erllama_server
+# License: MIT. https://github.com/barrel-platform/barrel_inference
 
 set -eu
 
-REPO="erllama/erllama_server"
-PREFIX="${ERLLAMA_PREFIX:-/usr/local}"
-BINDIR="${ERLLAMA_BINDIR:-$PREFIX/bin}"
-VARIANT="${ERLLAMA_VARIANT:-cpu}"
-VERSION="${ERLLAMA_VERSION:-}"
+REPO="barrel-platform/barrel_inference"
+PREFIX="${BARREL_INFERENCE_PREFIX:-/usr/local}"
+BINDIR="${BARREL_INFERENCE_BINDIR:-$PREFIX/bin}"
+VARIANT="${BARREL_INFERENCE_VARIANT:-cpu}"
+VERSION="${BARREL_INFERENCE_VERSION:-}"
 
 # ---- Parse flags ----------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
-    --prefix)   PREFIX="$2";  BINDIR="${ERLLAMA_BINDIR:-$PREFIX/bin}"; shift 2 ;;
+    --prefix)   PREFIX="$2";  BINDIR="${BARREL_INFERENCE_BINDIR:-$PREFIX/bin}"; shift 2 ;;
     --bindir)   BINDIR="$2";  shift 2 ;;
     --variant)  VARIANT="$2"; shift 2 ;;
     --version)  VERSION="$2"; shift 2 ;;
@@ -93,7 +93,7 @@ if [ -z "$VERSION" ]; then
   printf 'v%s\n' "$VERSION"
 fi
 
-ASSET="erllama_server-${VERSION}-${PLATFORM}.${EXT}"
+ASSET="barrel_inference_server-${VERSION}-${PLATFORM}.${EXT}"
 URL="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET}"
 
 # ---- Permissions check ----------------------------------------------------
@@ -115,7 +115,7 @@ trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 printf '==> downloading %s\n' "$ASSET"
 curl -fSL --progress-bar "$URL" -o "$TMPDIR/$ASSET"
 
-printf '==> extracting to %s/erllama_server\n' "$PREFIX"
+printf '==> extracting to %s/barrel_inference_server\n' "$PREFIX"
 $SUDO mkdir -p "$PREFIX"
 case "$EXT" in
   tgz)      $SUDO tar -C "$PREFIX" -xzf "$TMPDIR/$ASSET" ;;
@@ -132,18 +132,18 @@ esac
 # ---- Symlink + finish ----------------------------------------------------
 printf '==> linking binaries into %s\n' "$BINDIR"
 $SUDO mkdir -p "$BINDIR"
-$SUDO ln -sf "$PREFIX/erllama_server/bin/erllama_server" "$BINDIR/erllama_server"
-$SUDO ln -sf "$PREFIX/erllama_server/bin/erllama"        "$BINDIR/erllama"
+$SUDO ln -sf "$PREFIX/barrel_inference_server/bin/barrel_inference_server" "$BINDIR/barrel_inference_server"
+$SUDO ln -sf "$PREFIX/barrel_inference_server/bin/barrel_inference"        "$BINDIR/barrel_inference"
 
 cat <<EOF
 
-  erllama_server v$VERSION installed.
+  barrel_inference_server v$VERSION installed.
 
-    Start the daemon:   erllama_server daemon
+    Start the daemon:   barrel_inference_server daemon
     Verify:             curl http://127.0.0.1:8080/health
-    CLI:                erllama help
+    CLI:                barrel_inference help
 
-  Docs: https://erllama.github.io/erllama_server/
+  Docs: https://barrel-platform.github.io/barrel_inference/
   Repo: https://github.com/$REPO
 
 EOF

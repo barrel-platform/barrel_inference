@@ -1,6 +1,6 @@
 # Model registry
 
-`erllama_server` carries an Ollama-compatible model registry on top
+`barrel_inference_server` carries an Ollama-compatible model registry on top
 of the content-addressed blob cache from
 [`fetching.md`](fetching.md). One manifest per `name:tag`,
 GGUF-derived metadata sniffed at pull time, blob deduplication via
@@ -8,8 +8,8 @@ sha256.
 
 ## Layout
 
-Under the cache root (default `~/Library/Caches/erllama_server/models`
-on macOS, `~/.cache/erllama_server/models` on Linux, override with
+Under the cache root (default `~/Library/Caches/barrel_inference_server/models`
+on macOS, `~/.cache/barrel_inference_server/models` on Linux, override with
 `{model_cache_dir, "/path"}` in `sys.config`):
 
 ```
@@ -65,7 +65,7 @@ Modelfile-installed entries also get:
 
 ## Pull semantics
 
-`erllama pull <spec>` (or `POST /api/pull`) accepts:
+`barrel-inference pull <spec>` (or `POST /api/pull`) accepts:
 
 - Short Ollama name: `llama3` -> `ollama://library/llama3:latest`
 - Full Ollama spec: `ollama://library/llama3:8b`
@@ -79,7 +79,7 @@ Modelfile-installed entries also get:
 `HF_TOKEN` is honoured for gated repos.
 
 A concurrent `pull` for the same spec is deduped: the second caller
-attaches to the first call's worker via `erllama_server_fetch_srv`.
+attaches to the first call's worker via `barrel_inference_server_fetch_srv`.
 
 Streaming pulls emit NDJSON status events:
 
@@ -119,14 +119,14 @@ JSON
 
 ```sh
 # One blob, two names
-erllama copy "Qwen/Qwen2.5-7B-Instruct-GGUF:main" "qwen:7b"
+barrel-inference copy "Qwen/Qwen2.5-7B-Instruct-GGUF:main" "qwen:7b"
 
 # Delete a manifest. Blob is preserved (might back another alias).
-erllama rm "qwen:7b"
+barrel-inference rm "qwen:7b"
 ```
 
 No GC of orphan blobs in v0.1; if a blob's last alias is deleted
-the blob file remains on disk. A future `POST /api/gc` (or `erllama
+the blob file remains on disk. A future `POST /api/gc` (or `barrel_inference
 gc`) is on the backlog.
 
 ## Keep-alive eviction
@@ -137,7 +137,7 @@ therefore never gets unloaded mid-stream.
 
 ```sh
 # Default TTL after the last request (server-wide):
-{erllama_server, [{keep_alive_default_ms, 300000}]}      % 5 min
+{barrel_inference_server, [{keep_alive_default_ms, 300000}]}      % 5 min
 
 # Per-request overrides on /api/* endpoints:
 curl ... -d '{"model":"qwen7b","prompt":"","keep_alive":0}'      % unload now
@@ -148,7 +148,7 @@ curl ... -d '{"model":"qwen7b","prompt":"","keep_alive":-1}'     % never auto-un
 `/v1/*` endpoints silently accept `keep_alive` in the body
 (no-op) for SDK compatibility.
 
-## `erllama ps`
+## `barrel-inference ps`
 
 Reports which models are currently in memory:
 

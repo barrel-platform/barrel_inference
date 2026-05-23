@@ -1,19 +1,19 @@
-# erllama_server
+# Barrel Inference Server
 
-[![Docs](https://img.shields.io/badge/docs-erllama.github.io%2Ferllama__server-blue)](https://erllama.github.io/erllama_server/)
+[![Docs](https://img.shields.io/badge/docs-barrel-platform.github.io%2Fbarrel_inference__server-blue)](https://barrel-platform.github.io/barrel_inference/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of
-[erllama](https://github.com/erllama/erllama). One Erlang/OTP node;
+[Barrel Inference](https://github.com/barrel-platform/barrel_inference). One Erlang/OTP node;
 real GGUF inference via llama.cpp under the hood. Drop-in for SDKs
 that already speak any of those three APIs, including the OpenAI
 Python SDK, the Anthropic SDK, Claude Code as a local backend,
 LangChain / LiteLLM connectors, and the `ollama` CLI shims.
 
-**Documentation: <https://erllama.github.io/erllama_server/>**
+**Documentation: <https://barrel-platform.github.io/barrel_inference/>**
 
 ```
-┌───────────── erllama_server (Erlang/OTP, this repo) ─────────────┐
+┌───────────── barrel_inference_server (Erlang/OTP, this repo) ─────────────┐
 │                                                                  │
 │  OpenAI       /v1/chat/completions  /v1/completions               │
 │               /v1/embeddings        /v1/models[/:id]              │
@@ -28,7 +28,7 @@ LangChain / LiteLLM connectors, and the `ollama` CLI shims.
 │  Observability  /health  /health/ready  /metrics (Prometheus)    │
 └───────────────────────────────┬──────────────────────────────────┘
                                 ▼
-                  erllama (NIF over llama.cpp)
+                  barrel_inference (NIF over llama.cpp)
 ```
 
 ## Features
@@ -52,17 +52,17 @@ LangChain / LiteLLM connectors, and the `ollama` CLI shims.
   `SYSTEM`, `TEMPLATE` directives.
 - **Per-model FIFO queue** with `pool_exhausted` returning 429.
 - **CORS preflight** + `X-Request-ID` echo.
-- **Cancel-on-disconnect**: TCP close fires `erllama:cancel/1`, the
+- **Cancel-on-disconnect**: TCP close fires `barrel_inference:cancel/1`, the
   queue slot is released, the inference stops.
 
 ## Quick start
 
 ```sh
-# Build (one-off; pulls erllama + builds the native NIF)
+# Build (one-off; pulls barrel_inference + builds the native NIF)
 rebar3 release
 
 # Start the daemon (binds 0.0.0.0:8080 by default)
-_build/default/rel/erllama_server/bin/erllama_server daemon
+_build/default/rel/barrel_inference_server/bin/barrel_inference_server daemon
 
 # Verify
 curl http://127.0.0.1:8080/health
@@ -72,15 +72,15 @@ Then either point an SDK at `http://127.0.0.1:8080`, or use the
 bundled CLI:
 
 ```sh
-rebar3 escriptize                                     # builds _build/default/bin/erllama
+rebar3 escriptize                                     # builds _build/default/bin/barrel_inference
 export PATH=$PWD/_build/default/bin:$PATH
 
-erllama pull hf://Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q3_k_m.gguf
-erllama list
-erllama run "Qwen/Qwen2.5-7B-Instruct-GGUF:main" "say hello"
-erllama ps
-erllama unload "Qwen/Qwen2.5-7B-Instruct-GGUF:main"
-erllama version
+barrel-inference pull hf://Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q3_k_m.gguf
+barrel-inference list
+barrel-inference run "Qwen/Qwen2.5-7B-Instruct-GGUF:main" "say hello"
+barrel-inference ps
+barrel-inference unload "Qwen/Qwen2.5-7B-Instruct-GGUF:main"
+barrel-inference version
 ```
 
 Full guides under [`guides/`](guides/). Full OpenAPI 3.1 spec at
@@ -191,7 +191,7 @@ only emit tokens consistent with the schema.
 `config/sys.config` (defaults shown):
 
 ```erlang
-{erllama_server, [
+{barrel_inference_server, [
   {port,                       8080},
   {ip,                         {0,0,0,0}},
   {num_acceptors,              100},
@@ -206,7 +206,7 @@ only emit tokens consistent with the schema.
   %% Pull a model on demand if it's not in the registry yet.
   {auto_pull,                  false},
   %% Where blobs + manifests live.
-  %% {model_cache_dir, "/srv/erllama_server/cache"},
+  %% {model_cache_dir, "/srv/barrel_inference_server/cache"},
   {model_aliases, #{
     <<"gpt-4o">>        => <<"Qwen/Qwen2.5-7B-Instruct-GGUF:main">>,
     <<"claude-sonnet">> => <<"Qwen/Qwen2.5-7B-Instruct-GGUF:main">>
@@ -245,7 +245,7 @@ client request -> model_aliases lookup -> registry manifest
 
 `resolve_model/1` does an alias-or-identity `maps:get/3`, so any
 id missing from `model_aliases` falls through unchanged. The
-result has to exist in the registry (`erllama list`); otherwise
+result has to exist in the registry (`barrel-inference list`); otherwise
 the request fails with `404 model_not_found` unless
 `auto_pull = true`, in which case the loader pulls it from the
 default Ollama-style registry first.
@@ -265,12 +265,12 @@ curl -sN http://127.0.0.1:8080/v1/chat/completions \
 }}
 
 # 3) Hot-update aliases from a running shell, no restart needed.
-1> erllama_server_config:set_aliases(
+1> barrel_inference_server_config:set_aliases(
 1>   #{<<"claude-sonnet-4-5">> => <<"Qwen/...:main">>}).
 ```
 
 Tag-less ids resolve to `:latest`. The CLI prints the canonical
-form: `erllama list` for what's installed, `erllama show <id>`
+form: `barrel-inference list` for what's installed, `barrel-inference show <id>`
 for the resolved manifest.
 
 See [`guides/clients.md`](guides/clients.md#model-resolution-flow)
@@ -282,7 +282,7 @@ HuggingFace gated repos: set `HF_TOKEN` before starting the server.
 
 ```sh
 export HF_TOKEN=hf_xxx
-_build/default/rel/erllama_server/bin/erllama_server daemon
+_build/default/rel/barrel_inference_server/bin/barrel_inference_server daemon
 ```
 
 Plain HTTPS sources do not currently support per-call basic auth or
@@ -292,32 +292,32 @@ custom headers; `curl` once and pass the resulting path through
 ## Architecture
 
 ```
-erllama_server_sup (rest_for_one)
-├── erllama_server_registry         via callback for {queue, ModelId}
-├── erllama_server_config           aliases + policy + persistent_term
-├── erllama_server_disk_cache       KV cache tier (erllama_cache_disk_srv)
-├── erllama_server_loaders_sup      per-model loader processes
-├── erllama_server_queues_sup       per-model semaphore queues
-├── erllama_server_fetch_sup        download workers
-├── erllama_server_fetch_srv        dedupe + progress fan-out
-├── erllama_server_keepalive        per-model TTL eviction
-└── erllama_server_listener_mon     Cowboy listener + restart watch
+barrel_inference_server_sup (rest_for_one)
+├── barrel_inference_server_registry         via callback for {queue, ModelId}
+├── barrel_inference_server_config           aliases + policy + persistent_term
+├── barrel_inference_server_disk_cache       KV cache tier (barrel_inference_cache_disk_srv)
+├── barrel_inference_server_loaders_sup      per-model loader processes
+├── barrel_inference_server_queues_sup       per-model semaphore queues
+├── barrel_inference_server_fetch_sup        download workers
+├── barrel_inference_server_fetch_srv        dedupe + progress fan-out
+├── barrel_inference_server_keepalive        per-model TTL eviction
+└── barrel_inference_server_listener_mon     Cowboy listener + restart watch
 ```
 
 Each request:
 
 1. **Fast phase** (in `init/2`): read body, decode JSON, translate to
-   `#erllama_request{}`, resolve alias. Failures land as JSON 4xx via
+   `#barrel_inference_request{}`, resolve alias. Failures land as JSON 4xx via
    `cowboy_req:reply/4` before the handler enters `cowboy_loop`.
 2. Spawn a linked **pipeline worker** that runs the slow phase:
    `ensure_loaded_async` -> `apply_chat_template` (or `tokenize` for
    legacy completions) -> grammar build -> queue acquire ->
-   `erllama:infer/4`. Progress messages flow back to the handler.
+   `barrel_inference:infer/4`. Progress messages flow back to the handler.
 3. **Streaming**: handler stays in `cowboy_loop`, receives
-   `{erllama_token, ...}` messages, emits SSE / NDJSON.
+   `{barrel_inference_token, ...}` messages, emits SSE / NDJSON.
 4. **Non-streaming**: same handler, accumulates tokens, replies once.
 5. **Cancel-on-disconnect**: TCP close triggers `terminate/3`, which
-   calls `erllama:cancel/1`, releases the queue slot, kills the
+   calls `barrel_inference:cancel/1`, releases the queue slot, kills the
    pipeline worker.
 
 ## Test
@@ -332,16 +332,16 @@ rebar3 escriptize     # required by CLI suites
 rebar3 ct             # 106 cases (6 skipped without a real GGUF)
 ```
 
-The real-model CT suite (`erllama_server_real_model_SUITE`) is
+The real-model CT suite (`barrel_inference_server_real_model_SUITE`) is
 gated on `LLAMA_TEST_MODEL` pointing at a GGUF file.
 
 ## Links
 
-- Documentation: <https://erllama.github.io/erllama_server/>
-- Source: <https://github.com/erllama/erllama_server>
+- Documentation: <https://barrel-platform.github.io/barrel_inference/>
+- Source: <https://github.com/barrel-platform/barrel_inference>
 - OpenAPI spec: [`openapi.yaml`](openapi.yaml)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
-- Issue tracker: <https://github.com/erllama/erllama_server/issues>
+- Issue tracker: <https://github.com/barrel-platform/barrel_inference/issues>
 
 ## License
 

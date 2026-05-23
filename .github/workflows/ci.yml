@@ -1,0 +1,323 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cache keys:
+#   build-* keyed on the umbrella rebar.lock + the vendored llama.cpp
+#           CMakeLists (so a llama bump busts the compiled NIF cache).
+#   plt-*   keyed on the umbrella rebar.lock only (single PLT for all apps).
+env:
+  OTP_VERSION: '28'
+  REBAR3_VERSION: '3.25.0'
+
+jobs:
+  # ---- Static checks: fail fast ------------------------------------------
+  format:
+    name: erlfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - run: rebar3 fmt --check
+
+  lint:
+    name: Elvis lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - run: rebar3 lint
+
+  xref:
+    name: XRef
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - name: System deps (NIF C/C++ backend)
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - uses: actions/cache@v5
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: build-ubuntu-24.04-otp-${{ env.OTP_VERSION }}-${{ hashFiles('rebar.lock', 'apps/barrel_inference/c_src/llama.cpp/CMakeLists.txt') }}
+          restore-keys: build-ubuntu-24.04-otp-${{ env.OTP_VERSION }}-
+      - run: rebar3 xref
+
+  # Single PLT across the whole umbrella, keyed to the umbrella lock.
+  dialyzer:
+    name: Dialyzer (umbrella PLT)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - name: System deps (NIF C/C++ backend)
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: PLT + deps cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            _build/*_plt
+            _build/*/rebar3_*_plt
+            ~/.cache/rebar3
+          key: plt-otp-${{ env.OTP_VERSION }}-${{ hashFiles('rebar.lock') }}
+          restore-keys: plt-otp-${{ env.OTP_VERSION }}-
+      - run: rebar3 dialyzer
+
+  # ---- Build matrix: gated on the fast static checks ---------------------
+  build:
+    name: Build OTP ${{ matrix.otp }} on ${{ matrix.os }}
+    needs: [format, lint]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15]
+        otp: ['28']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - name: System deps (Linux only; macOS ships cmake)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - uses: actions/cache@v5
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: build-${{ matrix.os }}-otp-${{ matrix.otp }}-${{ hashFiles('rebar.lock', 'apps/barrel_inference/c_src/llama.cpp/CMakeLists.txt') }}
+          restore-keys: build-${{ matrix.os }}-otp-${{ matrix.otp }}-
+      - name: Compile umbrella (builds the NIF)
+        run: rebar3 compile
+
+  # ---- Per-app test matrix: reuse the cached umbrella build --------------
+  test:
+    name: Test ${{ matrix.app }}
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [barrel_inference, barrel_inference_server, barrel_inference_cli]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - name: System deps (NIF C/C++ backend)
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - uses: actions/cache@v5
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: build-ubuntu-24.04-otp-${{ env.OTP_VERSION }}-${{ hashFiles('rebar.lock', 'apps/barrel_inference/c_src/llama.cpp/CMakeLists.txt') }}
+          restore-keys: build-ubuntu-24.04-otp-${{ env.OTP_VERSION }}-
+      - name: Test ${{ matrix.app }}
+        run: |
+          case "${{ matrix.app }}" in
+            barrel_inference)
+              rebar3 eunit --application=barrel_inference
+              rebar3 proper -d apps/barrel_inference/test
+              rebar3 ct --dir apps/barrel_inference/test
+              ;;
+            barrel_inference_server)
+              # CLI integration suites locate _build/default/bin/barrel-inference
+              rebar3 escriptize
+              rebar3 eunit --application=barrel_inference_server
+              rebar3 ct --dir apps/barrel_inference_server/test
+              ;;
+            barrel_inference_cli)
+              # No dedicated suites yet; smoke that the binary builds and runs.
+              rebar3 escriptize
+              _build/default/bin/barrel-inference help
+              ;;
+          esac
+
+  # ---- Cross-app integration: top-level test/ ----------------------------
+  integration:
+    name: Integration (cross-app)
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - name: System deps (NIF C/C++ backend)
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - uses: actions/cache@v5
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: build-ubuntu-24.04-otp-${{ env.OTP_VERSION }}-${{ hashFiles('rebar.lock', 'apps/barrel_inference/c_src/llama.cpp/CMakeLists.txt') }}
+          restore-keys: build-ubuntu-24.04-otp-${{ env.OTP_VERSION }}-
+      - run: rebar3 ct --dir test
+
+  # ---- NIF C-safety (runtime app) ----------------------------------------
+  sanitizers:
+    name: ASan + UBSan
+    needs: [format, lint]
+    runs-on: ubuntu-24.04
+    env:
+      BARREL_INFERENCE_OPTS: "-DENABLE_ASAN=ON -DENABLE_UBSAN=ON"
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+      MODEL_URL: "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf"
+      MODEL_PATH: "${{ github.workspace }}/.cache/barrel_inference/models/stories260K.gguf"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Cache tiny GGUF
+        id: model-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: gguf-stories260K
+      - name: Download tiny GGUF
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          curl -L --fail --retry 3 -o "$MODEL_PATH" "$MODEL_URL"
+      - name: Build with ASan + UBSan
+        run: |
+          rm -rf _build
+          rebar3 compile
+      - name: Runtime EUnit + CT under sanitizers
+        env:
+          LLAMA_TEST_MODEL: ${{ env.MODEL_PATH }}
+        run: |
+          export LD_PRELOAD=$(gcc -print-file-name=libasan.so)
+          rebar3 eunit --application=barrel_inference
+          rebar3 ct --dir apps/barrel_inference/test
+
+  clang-tidy:
+    name: clang-tidy (NIF sources)
+    needs: [format, lint]
+    runs-on: ubuntu-24.04
+    env:
+      BARREL_INFERENCE_OPTS: "-DENABLE_CLANG_TIDY=ON"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - run: sudo apt-get update && sudo apt-get install -y clang-tidy cmake
+      - name: Build with clang-tidy
+        run: |
+          rm -rf _build
+          rebar3 compile
+
+  scan-build:
+    name: scan-build (clang analyzer)
+    needs: [format, lint]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - run: sudo apt-get update && sudo apt-get install -y clang-tools cmake
+      - name: Configure
+        run: cmake -S apps/barrel_inference/c_src -B _build/scan -DCMAKE_BUILD_TYPE=Debug
+      - name: Pre-build vendored llama.cpp (not analyzed)
+        run: cmake --build _build/scan --target llama -- -j "$(nproc)"
+      - name: Analyze the NIF translation units
+        run: |
+          touch apps/barrel_inference/c_src/barrel_inference_nif.c \
+                apps/barrel_inference/c_src/barrel_inference_safe.cpp \
+                apps/barrel_inference/c_src/crc32c.c
+          scan-build --status-bugs -o /tmp/scan-reports \
+              cmake --build _build/scan --target barrel_inference_nif -- -j "$(nproc)"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-build-reports
+          path: /tmp/scan-reports
+          if-no-files-found: ignore
+
+  freebsd:
+    name: FreeBSD ${{ matrix.release }}
+    needs: [format, lint]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.2', '14.4']
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build + test in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          prepare: |
+            pkg install -y pcre2
+            pkg install -y erlang-runtime28 cmake bash gmake git
+          run: |
+            set -e
+            export PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
+            git config --global --add safe.directory '*'
+            fetch https://github.com/erlang/rebar3/releases/download/3.25.0/rebar3 -o rebar3
+            chmod +x rebar3
+            ./rebar3 compile
+            ./rebar3 xref
+            ./rebar3 eunit --application=barrel_inference
+
+  # ---- Release artifact: prove the daemon release + CLI build ------------
+  release-artifact:
+    name: Release artifact (smoke)
+    needs: [test, integration]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          rebar3-version: ${{ env.REBAR3_VERSION }}
+      - run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Build prod release + escript
+        run: |
+          rebar3 as prod release
+          rebar3 as prod escriptize
+      - name: Bundle the barrel-inference CLI into the release
+        run: cp _build/prod/bin/barrel-inference _build/prod/rel/barrel_inference_server/bin/barrel-inference
+      - name: Upload release tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: barrel_inference_server-${{ github.sha }}
+          path: _build/prod/rel/barrel_inference_server
+          if-no-files-found: error
+          retention-days: 7

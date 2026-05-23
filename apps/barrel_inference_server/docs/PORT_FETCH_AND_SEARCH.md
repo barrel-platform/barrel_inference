@@ -1,20 +1,20 @@
-# Port fetch + search from `erllama` to `erllama_server`
+# Port fetch + search from `barrel_inference` to `barrel_inference_server`
 
-This is a follow-up task. The `erllama` library (sibling repo at
-`../erllama`) currently hosts a model-fetching subsystem
-(`erllama:fetch/1,2`, async variants, `erllama:search/1,2`). That
-work belongs in `erllama_server`, not in the inference core: it
+This is a follow-up task. The `barrel_inference` library (sibling repo at
+`../barrel_inference`) currently hosts a model-fetching subsystem
+(`barrel_inference:fetch/1,2`, async variants, `barrel_inference:search/1,2`). That
+work belongs in `barrel_inference_server`, not in the inference core: it
 introduces an HTTP-client dependency (hackney) on the inference
 library and is conceptually orthogonal to KV-cache-aware inference.
 
 This document briefs the next agent on how to move it. **Do not
-delete from `../erllama` in this task.** A separate follow-up will
+delete from `../barrel_inference` in this task.** A separate follow-up will
 prune the fetch + search code from the inference repo once the
 ported version is wired in here.
 
-## Current implementation in `../erllama/`
+## Current implementation in `../barrel_inference/`
 
-Public façade (in `../erllama/src/erllama.erl`):
+Public façade (in `../barrel_inference/src/barrel_inference.erl`):
 
 ```erlang
 -export([
@@ -31,14 +31,14 @@ Modules (each with a moduledoc explaining intent):
 
 | File | Role |
 |---|---|
-| `../erllama/src/erllama_fetch.erl` | Public façade. Spec parsing, cache-root resolution, sync/async dispatch. |
-| `../erllama/src/erllama_fetch_resolvers.erl` | Pure: parse spec strings into tagged tuples; build per-source URLs/headers; HF siblings list + best-GGUF picker; spec hashing. |
-| `../erllama/src/erllama_fetch_srv.erl` | Dedupe registry + progress fan-out + async lifecycle. gen_server. State is keyed by spec hash. Holds a `done` map for 5-min TTL after completion so late `status/1`/`await/2` queries succeed. |
-| `../erllama/src/erllama_fetch_sup.erl` | `simple_one_for_one` supervisor for the workers. |
-| `../erllama/src/erllama_fetch_worker.erl` | Transient one-shot streaming worker. Async hackney, sha256 streaming digest, resume from `.part`, redirect-following, atomic rename to `blobs/sha256-<hex>.gguf` plus a small `refs/<spec_hash>.ref` text file. |
-| `../erllama/src/erllama_search.erl` | Façade for `search/1,2`. Sequential per-source dispatch with an injected sync HTTP fetch fun. |
-| `../erllama/src/erllama_search_hf.erl` | HuggingFace `/api/models` query, sorted by downloads, with siblings inline (`full=true`). |
-| `../erllama/src/erllama_search_ollama.erl` | Ollama registry catalog (`/v2/_catalog`) substring match. |
+| `../barrel_inference/src/barrel_inference_fetch.erl` | Public façade. Spec parsing, cache-root resolution, sync/async dispatch. |
+| `../barrel_inference/src/barrel_inference_fetch_resolvers.erl` | Pure: parse spec strings into tagged tuples; build per-source URLs/headers; HF siblings list + best-GGUF picker; spec hashing. |
+| `../barrel_inference/src/barrel_inference_fetch_srv.erl` | Dedupe registry + progress fan-out + async lifecycle. gen_server. State is keyed by spec hash. Holds a `done` map for 5-min TTL after completion so late `status/1`/`await/2` queries succeed. |
+| `../barrel_inference/src/barrel_inference_fetch_sup.erl` | `simple_one_for_one` supervisor for the workers. |
+| `../barrel_inference/src/barrel_inference_fetch_worker.erl` | Transient one-shot streaming worker. Async hackney, sha256 streaming digest, resume from `.part`, redirect-following, atomic rename to `blobs/sha256-<hex>.gguf` plus a small `refs/<spec_hash>.ref` text file. |
+| `../barrel_inference/src/barrel_inference_search.erl` | Façade for `search/1,2`. Sequential per-source dispatch with an injected sync HTTP fetch fun. |
+| `../barrel_inference/src/barrel_inference_search_hf.erl` | HuggingFace `/api/models` query, sorted by downloads, with siblings inline (`full=true`). |
+| `../barrel_inference/src/barrel_inference_search_ollama.erl` | Ollama registry catalog (`/v2/_catalog`) substring match. |
 
 Tests (each is offline + uses an injected fetch fun; the integration
 suite spins up an `inets` httpd on a random port and exercises the
@@ -46,11 +46,11 @@ real hackney path):
 
 | File | Coverage |
 |---|---|
-| `../erllama/test/erllama_fetch_resolvers_tests.erl` | 28 cases. parse, resolve, HF siblings, GGUF pick, spec hash. |
-| `../erllama/test/erllama_fetch_tests.erl` | 12 cases. Local httpd: round-trip, sha256 verify, sha256 mismatch, progress, 404, async + status + await + subscribe. |
-| `../erllama/test/erllama_search_tests.erl` | 8 cases. HF + Ollama backends with fake fetch funs. |
+| `../barrel_inference/test/barrel_inference_fetch_resolvers_tests.erl` | 28 cases. parse, resolve, HF siblings, GGUF pick, spec hash. |
+| `../barrel_inference/test/barrel_inference_fetch_tests.erl` | 12 cases. Local httpd: round-trip, sha256 verify, sha256 mismatch, progress, 404, async + status + await + subscribe. |
+| `../barrel_inference/test/barrel_inference_search_tests.erl` | 8 cases. HF + Ollama backends with fake fetch funs. |
 
-Guide: `../erllama/guides/fetching.md` — URL syntax, async usage,
+Guide: `../barrel_inference/guides/fetching.md` — URL syntax, async usage,
 HF auto-pick, search, cache layout, integrity / resume semantics.
 
 ## Hackney 4.0.0 quirks the worker handles
@@ -64,13 +64,13 @@ worker from scratch:
    HTTP/2 returns `{ok, ConnPid}` and then never sends any
    `{hackney_response, _, _}` messages. Workaround:
    `{protocols, [http1]}` in the request options. See
-   `hackney_options/1` in `../erllama/src/erllama_fetch_worker.erl`.
+   `hackney_options/1` in `../barrel_inference/src/barrel_inference_fetch_worker.erl`.
 2. **`stream_next/1` takes a `pid()` per its spec but the value
    returned by `request/5` in async mode is documented as
    `reference()`.** It's actually `self()` of the connection
-   gen_statem (see `../erllama/_build/default/lib/hackney/src/hackney_conn.erl:2173`),
+   gen_statem (see `../barrel_inference/_build/default/lib/hackney/src/hackney_conn.erl:2173`),
    so a pid. The dialyzer suppression list at the top of
-   `erllama_fetch_worker.erl` deals with the spec mismatch.
+   `barrel_inference_fetch_worker.erl` deals with the spec mismatch.
 3. **Redirects are not followed in async mode.** Even with
    `{follow_redirect, true}`, a 301/302/307/308 response sends a
    `{hackney_response, Pid, {redirect, Loc, _}}` message. The
@@ -87,10 +87,10 @@ worker from scratch:
 The shape is:
 
 ```
-erllama_server_sup
-└── erllama_fetch_subtree
-    ├── erllama_fetch_sup        % simple_one_for_one workers
-    └── erllama_fetch_srv        % gen_server: dedupe + lifecycle
+barrel_inference_server_sup
+└── barrel_inference_fetch_subtree
+    ├── barrel_inference_fetch_sup        % simple_one_for_one workers
+    └── barrel_inference_fetch_srv        % gen_server: dedupe + lifecycle
 ```
 
 The srv state:
@@ -104,8 +104,8 @@ The srv state:
 -record(job, {
     parsed, worker, monitor,
     subscribers = [],     %% blocking gen_server:from() callers
-    progress_pids = [],   %% receive {erllama_fetch_progress, Hash, Bytes, Total}
-    done_pids = [],       %% receive {erllama_fetch_done, Hash, Result}
+    progress_pids = [],   %% receive {barrel_inference_fetch_progress, Hash, Bytes, Total}
+    done_pids = [],       %% receive {barrel_inference_fetch_done, Hash, Result}
     progress = #progress{phase = starting, bytes = 0, total = undefined}
 }).
 ```
@@ -118,12 +118,12 @@ headers arrive.
 Async lifecycle from `download_async/2`:
 
 1. Caller is auto-subscribed via `done_pids`.
-2. Worker is spawned under `erllama_fetch_sup`.
+2. Worker is spawned under `barrel_inference_fetch_sup`.
 3. Worker resolves (HF/Ollama metadata) and casts `{phase, _, _}`.
 4. Worker streams the body, casts `{progress, _, B, T}` ~10/s.
 5. On completion the srv:
    - replies to `subscribers` (sync `download/2` and `await/2`),
-   - sends `{erllama_fetch_done, Hash, Result}` to `done_pids`,
+   - sends `{barrel_inference_fetch_done, Hash, Result}` to `done_pids`,
    - moves the entry to `done` with a 5-min TTL timer.
 
 ## Cache layout (keep it identical)
@@ -135,38 +135,38 @@ Async lifecycle from `download_async/2`:
   tmp/<spec_hash>.part          % in-progress download
 ```
 
-`<root>` resolution order (in `erllama_fetch:cache_root/0`):
+`<root>` resolution order (in `barrel_inference_fetch:cache_root/0`):
 
-1. `application:get_env(erllama, model_cache_dir)` (rename to
-   `erllama_server` when you port).
-2. `XDG_CACHE_HOME/erllama/models` (rename the suffix).
-3. `filename:basedir(user_cache, "erllama")/models` (ditto).
+1. `application:get_env(barrel_inference, model_cache_dir)` (rename to
+   `barrel_inference_server` when you port).
+2. `XDG_CACHE_HOME/barrel_inference/models` (rename the suffix).
+3. `filename:basedir(user_cache, "barrel_inference")/models` (ditto).
 
 ## Renames during the port
 
-- App env key `erllama.model_cache_dir` → `erllama_server.model_cache_dir`.
+- App env key `barrel_inference.model_cache_dir` → `barrel_inference_server.model_cache_dir`.
 - Application list in `.app.src`: add `hackney`, `ssl`, `inets`.
-- Module names: keep `erllama_fetch_*` and `erllama_search_*` if you
-  prefer (they don't claim the `erllama_server_` namespace), or
-  rename to `erllama_server_fetch_*` for consistency with the rest
+- Module names: keep `barrel_inference_fetch_*` and `barrel_inference_search_*` if you
+  prefer (they don't claim the `barrel_inference_server_` namespace), or
+  rename to `barrel_inference_server_fetch_*` for consistency with the rest
   of this app. Personal preference; the moduledocs will need light
   edits either way.
 - The public façade: re-export `fetch/1,2`, `fetch_async/1,2`,
   `fetch_status/1`, `fetch_await/1,2`, `fetch_subscribe/2`, and
-  `search/1,2` from `erllama_server` (or expose a thin `erllama_server_fetch`
-  module — the existing `erllama_server` module is the OTP `application`
+  `search/1,2` from `barrel_inference_server` (or expose a thin `barrel_inference_server_fetch`
+  module — the existing `barrel_inference_server` module is the OTP `application`
   callback so don't bloat it).
 
-## Integration with existing erllama_server processes
+## Integration with existing Barrel Inference Server processes
 
 Once the port lands, the natural next step is to wire fetching into
-the loader path so that `erllama_server` can resolve a model id
+the loader path so that `barrel_inference_server` can resolve a model id
 that is not yet on disk:
 
-- `../erllama_server/src/erllama_server_loader.erl` currently calls
-  `erllama:load_model(ModelId, default_opts(ModelId))` directly. Add
+- `../barrel_inference_server/src/barrel_inference_server_loader.erl` currently calls
+  `barrel_inference:load_model(ModelId, default_opts(ModelId))` directly. Add
   a pre-step: if `default_opts(ModelId).model_path` is missing or
-  the file does not exist, call `erllama_server:fetch(ModelId)`
+  the file does not exist, call `barrel_inference_server:fetch(ModelId)`
   first and feed the resulting path through.
 
 That's a follow-up after this port — note it but don't implement here.
@@ -174,7 +174,7 @@ That's a follow-up after this port — note it but don't implement here.
 ## Verification after porting
 
 ```bash
-cd ../erllama_server
+cd ../barrel_inference_server
 rebar3 fmt --check
 rebar3 compile         # adds hackney + transitive deps
 rebar3 eunit           # ported tests stay green
@@ -187,23 +187,23 @@ rebar3 ct
 Live smoke test:
 
 ```erlang
-1> {ok, _} = application:ensure_all_started(erllama_server).
-2> {ok, R} = erllama_server:fetch_async(<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF">>).
-3> erllama_server:fetch_status(R).
+1> {ok, _} = application:ensure_all_started(barrel_inference_server).
+2> {ok, R} = barrel_inference_server:fetch_async(<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF">>).
+3> barrel_inference_server:fetch_status(R).
 %% expect {pending, #{phase => streaming, ...}} after a second or two
-4> receive {erllama_fetch_done, R, X} -> X end.
-{ok, "/Users/me/Library/Caches/erllama_server/models/blobs/sha256-...gguf"}
+4> receive {barrel_inference_fetch_done, R, X} -> X end.
+{ok, "/Users/me/Library/Caches/barrel_inference_server/models/blobs/sha256-...gguf"}
 ```
 
 ## Cleanup follow-up (separate task, after this one)
 
-Once `erllama_server` is the source of truth for fetch + search:
+Once `barrel_inference_server` is the source of truth for fetch + search:
 
-1. Remove the modules listed at the top of this doc from `../erllama/src/`.
-2. Drop `fetch_*` / `search` exports from `../erllama/src/erllama.erl`.
-3. Drop hackney from `../erllama/rebar.config` and `applications`
-   list in `../erllama/src/erllama.app.src`.
+1. Remove the modules listed at the top of this doc from `../barrel_inference/src/`.
+2. Drop `fetch_*` / `search` exports from `../barrel_inference/src/barrel_inference.erl`.
+3. Drop hackney from `../barrel_inference/rebar.config` and `applications`
+   list in `../barrel_inference/src/barrel_inference.app.src`.
 4. Remove the test files.
-5. Move `../erllama/guides/fetching.md` to `../erllama_server/guides/`.
-6. Update `../erllama/README.md` and `CHANGELOG.md` to point at
-   `erllama_server` for the fetch + search story.
+5. Move `../barrel_inference/guides/fetching.md` to `../barrel_inference_server/guides/`.
+6. Update `../barrel_inference/README.md` and `CHANGELOG.md` to point at
+   `barrel_inference_server` for the fetch + search story.

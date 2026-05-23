@@ -1,24 +1,24 @@
 # Changelog
 
-All notable changes to erllama_server are documented here. The
+All notable changes to Barrel Inference Server are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-### erllama 0.5.0 + tool-call exact-replay
+### Barrel Inference 0.5.0 + tool-call exact-replay
 
-- Bumped to erllama 0.5.0 (`{erllama, "0.5.0"}` in `rebar.config`).
+- Bumped to Barrel Inference 0.5.0 (`{barrel_inference, "0.5.0"}` in `rebar.config`).
   v0.5 exposes per-model `tool_call_markers`, the
-  `{tool_call_delta, _}` / `erllama_tool_call_end` streaming wire,
+  `{tool_call_delta, _}` / `barrel_inference_tool_call_end` streaming wire,
   greedy-on-syntax sampling, sticky-seq KV reuse (`session_id` on
   `infer/4`, `end_session/2`), and the `prefill_only/3` cache-
   warming primitive.
 - `loader.tool_call_markers` plumbed from the manifest into the
-  Config map passed to `erllama:load_model/2`, mirroring the
+  Config map passed to `barrel_inference:load_model/2`, mirroring the
   existing `thinking_markers` path. Required keys `start` / `end`;
   optional `payload_start` / `payload_end`.
-- New `erllama_server_tool_format` behaviour and registry. Each
+- New `barrel_inference_server_tool_format` behaviour and registry. Each
   model family ships a module implementing `parse/1` (FullBin ->
   `#{name, arguments}`) and `canonicalise/1` (the reverse). The
   registry resolves a canonical model id via the manifest's
@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
     is a documented follow-up.
   - `bare-json` (fallback for models that emit raw JSON without
     delimiters).
-- New `erllama_server_tool_replay` DETS-backed exact-replay store
+- New `barrel_inference_server_tool_replay` DETS-backed exact-replay store
   (supervised gen_server). Public ETS table for the O(1) hot-path
   read; sibling DETS file under `<cache_root>/replay/replay.dets`
   persists writes across restarts; periodic gc evicts rows past
@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   sensible defaults.
 - Both `/v1/messages` and `/v1/chat/completions` consume the v0.5
   tool-call wire when the model has `tool_call_markers` configured:
-  every `erllama_tool_call_end` triggers `tool_format:parse/2`, a
+  every `barrel_inference_tool_call_end` triggers `tool_format:parse/2`, a
   fresh `toolu_...` id is minted, the parsed JSON + raw `FullBin` +
   model id are persisted in the replay map, and the corresponding
   Anthropic SSE frames (`content_block_start` / `input_json_delta`
@@ -57,10 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `tool_calls` are emitted. The legacy `mode = tool_buffer` first-
   byte heuristic stays as the fallback for models without
   `tool_call_markers` set.
-- Render path in `erllama_server_pipeline` walks the message
+- Render path in `barrel_inference_server_pipeline` walks the message
   history before `apply_chat_template/2` and consults the replay
   map for every prior `tool_use` block. Outcome lands on the new
-  `erllama_tool_replay_lookups_total` counter, labelled by `model`
+  `barrel_inference_tool_replay_lookups_total` counter, labelled by `model`
   and `result` (`hit` / `miss` / `no_format`). Byte-exact splice
   awaits an engine-side ask (return-rendered-string variant of
   `apply_chat_template/2` or a verbatim content-block escape);
@@ -68,22 +68,22 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Sticky-seq session id derivation + engine pin
 
-- New `erllama_server_session:derive/2` that yields a stable
+- New `barrel_inference_server_session:derive/2` that yields a stable
   `session_id` for every request via a layered chain:
   `x-conversation-id` header > `metadata.user_id` >
   `base64(sha256(model || first user message bytes))`. Stamped
-  onto `#erllama_request{}` in both handlers' fast phase. Per-
+  onto `#barrel_inference_request{}` in both handlers' fast phase. Per-
   request stable id without requiring the SDK to send an explicit
   conversation header.
 - Engine pin live: `build_params/1` now forwards the derived id
-  on `Params.session_id` to `erllama:infer/4`. The engine pins
+  on `Params.session_id` to `barrel_inference:infer/4`. The engine pins
   the seq_id across turns so a continuing conversation truncates-
   and-prefills in place on warm KV cells instead of restoring
   from disk.
 - `{error, sticky_busy}` (two concurrent admits on the same
   session) maps to 503 with retry-after; the Anthropic handler
   remaps 503 to 529 so SDKs honour the documented backoff.
-- Handler `cleanup/1` calls `erllama:end_session/2` only when the
+- Handler `cleanup/1` calls `barrel_inference:end_session/2` only when the
   request was cancelled mid-flight (`received_done = false`).
   Cleanly-completed turns leave the pinned session alive for
   cross-turn KV reuse.
@@ -97,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Cache-reuse profile (TinyLlama-1.1B, 3-turn conversation)
 
-`test/erllama_server_real_model_SUITE.erl:multi_turn_cache_delta_profile/1`
+`test/barrel_inference_server_real_model_SUITE.erl:multi_turn_cache_delta_profile/1`
 drives a stable-session three-turn conversation and logs the
 per-turn `cache_read_input_tokens` / `cache_creation_input_tokens`:
 
@@ -125,32 +125,32 @@ keeps leading-turn bytes stable across single- and multi-turn
 calls, OR an engine-side primitive that splices the prior turn's
 stored tokens verbatim into the new prompt (effectively the
 verbatim-content escape already proposed for tool-call replay).
-Captured in `/Users/benoitc/Projects/erllama_anthropic_support_prompt.md`.
+Captured in `/Users/benoitc/Projects/barrel_inference_anthropic_support_prompt.md`.
 
-### erllama 0.6.0: caller-asserted continuation (`continue/3`)
+### Barrel Inference 0.6.0: caller-asserted continuation (`continue/3`)
 
 The leverage-point ask above landed upstream as
-`erllama:continue/3`: the caller passes `(Model, SuffixTokens,
+`barrel_inference:continue/3`: the caller passes `(Model, SuffixTokens,
 Opts)`, the engine prefills only the suffix on top of the
 session's stored tokens without verifying the prefix. Two-PR
 integration:
 
-- Bump `rebar.config` to erllama 0.6.0. The new surface also
+- Bump `rebar.config` to Barrel Inference 0.6.0. The new surface also
   carries `cache_hit_kind = continuation` to make the call-path
   distinguishable from engine-verified `sticky` reuse in Stats.
-- New `erllama_server_session_state` (supervised gen_server +
+- New `barrel_inference_server_session_state` (supervised gen_server +
   public ETS) caches `{Model, SessionId} -> committed_tokens`.
   No disk persistence; restart drops the count and the next
   turn falls back to a full `infer/4`.
 - Pipeline `accept_tokens/2` arms a continuation slice when a
   prior count is on file:
   `lists:nthtail(N, NewTokens)` becomes the suffix passed to
-  `erllama:continue/3`. First-turn / no-state requests still
+  `barrel_inference:continue/3`. First-turn / no-state requests still
   take the `infer/4` path.
 - `{error, no_session}` from `continue/3` (TTL eviction, server
   restart, end_session-from-cancel) clears the stale local
   state and retries with the full token list via `infer/4`.
-- Both handlers stash `committed_tokens` from `erllama_done`
+- Both handlers stash `committed_tokens` from `barrel_inference_done`
   Stats; `maybe_end_session/1` on cancel-mid-flight clears the
   local entry alongside the engine's.
 
@@ -182,7 +182,7 @@ relying on continuation.
 ## [0.1.0] - 2026-05-11
 
 Initial public release. OpenAI-, Anthropic-, and Ollama-compatible
-HTTP server on top of `erllama`.
+HTTP server on top of `barrel_inference`.
 
 ### OpenAI surface
 
@@ -192,7 +192,7 @@ HTTP server on top of `erllama`.
 - `GET  /v1/models[/:id]` with alias passthrough
 - Tool / function calling via grammar-constrained sampling. Tool
   arrays converted to JSON Schema then to GBNF and passed as the
-  `grammar` field on `erllama:infer/4`. Tool-call output buffered
+  `grammar` field on `barrel_inference:infer/4`. Tool-call output buffered
   and emitted as one final `tool_calls` frame.
 - `response_format` (`text`, `json_object`, `{type: "json_schema",
   json_schema: {schema: ...}}`). All three compile to GBNF.
@@ -233,33 +233,33 @@ HTTP server on top of `erllama`.
 
 - Models stored under `<cache_root>/manifests/<name>/<tag>.json`,
   blobs deduplicated under `<cache_root>/blobs/sha256-<hex>.gguf`.
-- GGUF metadata reader (`erllama_server_gguf`, pure Erlang, no
+- GGUF metadata reader (`barrel_inference_server_gguf`, pure Erlang, no
   NIF). Extracts architecture, family, parameter size,
   quantisation, context length, embedding length, chat template
   at pull time. Stored verbatim in the manifest.
 - Manifest Modelfile overrides: `system`, `template`,
   `parameters` (which `loader` merges into the
-  `erllama:load_model/2` opts).
+  `barrel_inference:load_model/2` opts).
 
 ### Inference plumbing
 
-- Per-model loader: `erllama_server_loader` spawns a monitored
-  worker for `erllama:load_model/2` so the gen_server stays
+- Per-model loader: `barrel_inference_server_loader` spawns a monitored
+  worker for `barrel_inference:load_model/2` so the gen_server stays
   responsive while a load is in flight. Subscribers receive
-  `{erllama_load_progress, ModelId}` every 2 s and
-  `{erllama_load_done, ModelId, ok | {error, _}}` exactly once.
+  `{barrel_inference_load_progress, ModelId}` every 2 s and
+  `{barrel_inference_load_done, ModelId, ok | {error, _}}` exactly once.
 - Pipeline forwards load progress as `{pipeline, loading, _}`;
   chat handlers emit `: loading\n\n` SSE comments and Anthropic
   `event: ping` events so clients see activity during multi-second
   loads.
-- Per-model keepalive (`erllama_server_keepalive`) with active
+- Per-model keepalive (`barrel_inference_server_keepalive`) with active
   request counter. Eviction timer only arms when active count
   reaches zero, so long generations never trigger a mid-stream
   unload.
 - Per-model FIFO semaphore queue with `pool_exhausted` returning
   429. `concurrency`, `depth`, `timeout_ms` configurable per model.
 - Cancel-on-disconnect: TCP close fires `terminate/3`, which calls
-  `erllama:cancel/1`, releases the queue slot, kills the pipeline
+  `barrel_inference:cancel/1`, releases the queue slot, kills the pipeline
   worker.
 - Cowboy listener `idle_timeout` bumped to 30 min (configurable
   via `{idle_timeout_ms, _}`) so long fetches / loads do not get
@@ -267,7 +267,7 @@ HTTP server on top of `erllama`.
 - Loader `manifest_to_config/1` caps `context_size` at
   `max_context_size` (default 4096) so models advertising 128 K
   contexts in their GGUF do not OOM at load time.
-- Pipeline wraps every call into `erllama` in try/catch; a
+- Pipeline wraps every call into `barrel_inference` in try/catch; a
   crashing model gen_statem returns a 500 JSON envelope or an
   SSE / Anthropic error frame instead of killing the cowboy
   request process.
@@ -291,10 +291,10 @@ HTTP server on top of `erllama`.
 
 ### CLI
 
-- `erllama` escript (`rebar3 escriptize` -> `_build/default/bin/erllama`).
+- `barrel_inference` escript (`rebar3 escriptize` -> `_build/default/bin/barrel_inference`).
   Subcommands: `pull`, `list` (ls), `ps`, `show`, `rm` (delete),
   `copy` (cp), `search`, `run`, `embed`, `unload`, `version`, `help`.
-- Talks to the daemon over HTTP. Base URL via `ERLLAMA_HOST`
+- Talks to the daemon over HTTP. Base URL via `BARREL_INFERENCE_HOST`
   (default `http://127.0.0.1:8080`).
 
 ### Body-shape caps

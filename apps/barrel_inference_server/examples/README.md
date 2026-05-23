@@ -1,7 +1,7 @@
 # Examples
 
-Standalone snippets that talk to a local `erllama_server` daemon.
-All examples honour `ERLLAMA_HOST` (default `http://127.0.0.1:8080`)
+Standalone snippets that talk to a local `barrel_inference_server` daemon.
+All examples honour `BARREL_INFERENCE_HOST` (default `http://127.0.0.1:8080`)
 and `MODEL` (default `Qwen/Qwen2.5-7B-Instruct-GGUF:main`).
 
 ```
@@ -26,10 +26,10 @@ javascript/               needs: Node 18+
 
 ```sh
 # Start the daemon first
-_build/default/rel/erllama_server/bin/erllama_server daemon
+_build/default/rel/barrel_inference_server/bin/barrel_inference_server daemon
 
 # Pull a model
-_build/default/bin/erllama pull \
+_build/default/bin/barrel-inference pull \
   hf://Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q3_k_m.gguf
 
 # curl

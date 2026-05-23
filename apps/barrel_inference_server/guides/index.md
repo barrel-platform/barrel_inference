@@ -1,14 +1,14 @@
-# erllama_server
+# Barrel Inference Server
 
 OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of
-[erllama](https://github.com/erllama/erllama). One Erlang/OTP node;
+[Barrel Inference](https://github.com/barrel-platform/barrel_inference). One Erlang/OTP node;
 real GGUF inference via llama.cpp under the hood. Drop-in for SDKs
 that already speak any of those three APIs.
 
 ## Three API families, one process tree
 
 ```
-┌───────────── erllama_server (Erlang/OTP) ─────────────┐
+┌───────────── barrel_inference_server (Erlang/OTP) ─────────────┐
 │                                                       │
 │  OpenAI     /v1/chat/completions  /v1/completions     │
 │             /v1/embeddings        /v1/models[/:id]    │
@@ -23,7 +23,7 @@ that already speak any of those three APIs.
 │  health     /health  /health/ready  /metrics          │
 └───────────────────────────┬───────────────────────────┘
                             ▼
-              erllama (NIF over llama.cpp)
+              barrel_inference (NIF over llama.cpp)
 ```
 
 ## Pick your reading path
@@ -57,7 +57,7 @@ that already speak any of those three APIs.
 
 ## Project links
 
-- Source on GitHub: <https://github.com/erllama/erllama_server>
-- These docs: <https://erllama.github.io/erllama_server/>
-- Issues: <https://github.com/erllama/erllama_server/issues>
-- Releases: <https://github.com/erllama/erllama_server/releases>
+- Source on GitHub: <https://github.com/barrel-platform/barrel_inference>
+- These docs: <https://barrel-platform.github.io/barrel_inference/>
+- Issues: <https://github.com/barrel-platform/barrel_inference/issues>
+- Releases: <https://github.com/barrel-platform/barrel_inference/releases>

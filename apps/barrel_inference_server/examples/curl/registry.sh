@@ -2,7 +2,7 @@
 # Walk a model through its full lifecycle: pull -> list -> show ->
 # copy -> ps -> unload -> delete. Reports each response shape.
 set -euo pipefail
-HOST="${ERLLAMA_HOST:-http://127.0.0.1:8080}"
+HOST="${BARREL_INFERENCE_HOST:-http://127.0.0.1:8080}"
 SPEC="${SPEC:-hf://Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q3_k_m.gguf}"
 NAME="${NAME:-Qwen/Qwen2.5-7B-Instruct-GGUF:main}"
 ALIAS="${ALIAS:-qwen7b:latest}"

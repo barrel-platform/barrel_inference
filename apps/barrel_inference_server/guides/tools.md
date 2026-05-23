@@ -2,7 +2,7 @@
 
 Most tool calls are *client-executed*: the model emits a tool call,
 the server returns it, and your client runs the tool and sends the
-result back on the next request. erllama_server can also run a
+result back on the next request. Barrel Inference Server can also run a
 **built-in tool server-side**: when the model calls it, the server
 executes the tool in-process, feeds the result back into the
 conversation, and continues generating, until the model answers
@@ -18,11 +18,11 @@ Register an executor in `config/sys.config` under
 `builtin_tool_executors`, keyed by the tool `type`. Pick one provider:
 
 ```erlang
-{erllama_server, [
+{barrel_inference_server, [
   %% ... other settings ...
   {builtin_tool_executors, #{
     <<"web_search">> => #{
-      module   => erllama_server_tool_executor_web_search,
+      module   => barrel_inference_server_tool_executor_web_search,
       type     => <<"web_search">>,
       provider => tavily,            %% tavily | ollama | brave | searxng
       api_key  => <<"tvly-...">>
@@ -57,7 +57,7 @@ fetch a result's full page). No provider/key:
 
 ```erlang
 {builtin_tool_executors, #{
-  <<"web_fetch">> => #{module => erllama_server_tool_executor_web_fetch,
+  <<"web_fetch">> => #{module => barrel_inference_server_tool_executor_web_fetch,
                        type => <<"web_fetch">>}
 }}
 ```
@@ -75,7 +75,7 @@ loopback/private/link-local addresses (e.g. `127.0.0.1`,
 
 ## Connect MCP servers
 
-erllama_server can act as an **MCP client**: connect to one or more
+Barrel Inference Server can act as an **MCP client**: connect to one or more
 [Model Context Protocol](https://modelcontextprotocol.io) servers and
 offer *their* tools to the model through the same continue-loop. This
 turns the whole MCP ecosystem (github, filesystem, databases, ...)
@@ -204,7 +204,7 @@ failing the turn; the server logs the failure.
 ## Write your own executor
 
 A server-side tool is **one module plus one registry line**. The
-module implements the `erllama_server_tool_executor` behaviour: two
+module implements the `barrel_inference_server_tool_executor` behaviour: two
 callbacks, both surface-agnostic. You never touch the handlers, the
 grammar, or the loop.
 
@@ -309,6 +309,6 @@ types (`web_search_20250305`); the server normalises the trailing
 `_YYYYMMDD` to the canonical key before lookup, so register under the
 canonical `type` (`web_search`).
 
-`web_search` (`erllama_server_tool_executor_web_search`) is the
+`web_search` (`barrel_inference_server_tool_executor_web_search`) is the
 reference implementation if you want a worked example with a real
 backend.

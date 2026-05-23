@@ -1,10 +1,10 @@
-"""Ollama Python package against erllama_server.
+"""Ollama Python package against barrel_inference_server.
 Exercises generate, chat, preload, ps, embed."""
 # pip install ollama
 import os
 import ollama
 
-c = ollama.Client(host=os.environ.get("ERLLAMA_HOST", "http://127.0.0.1:8080"))
+c = ollama.Client(host=os.environ.get("BARREL_INFERENCE_HOST", "http://127.0.0.1:8080"))
 MODEL = os.environ.get("MODEL", "Qwen/Qwen2.5-7B-Instruct-GGUF:main")
 
 # Generate

@@ -2,7 +2,7 @@
 
 Runnable snippets pointing at a local daemon at
 `http://127.0.0.1:8080`. Replace the model id with whatever you
-have pulled (`erllama list` to check).
+have pulled (`barrel-inference list` to check).
 
 ## Python: OpenAI SDK
 
@@ -240,29 +240,29 @@ for (;;) {
 }
 ```
 
-## Bundled `erllama` CLI
+## Bundled `barrel_inference` CLI
 
 The escript ships with the release:
 
 ```sh
-erllama pull <name>                 pull a model into the registry
-erllama list                        list registered models
-erllama ps                          list currently-loaded models
-erllama show <name>                 print one manifest
-erllama rm <name>                   remove a manifest
-erllama copy <src> <dst>            alias under a new name:tag
-erllama search <query>              search HF / Ollama
-erllama run <name> [prompt..]       stream a chat completion
-erllama embed <name> <text..>       compute an embedding vector
-erllama unload <name>               evict a model from memory now
-erllama version                     print the server version
-erllama help
+barrel-inference pull <name>                 pull a model into the registry
+barrel-inference list                        list registered models
+barrel-inference ps                          list currently-loaded models
+barrel-inference show <name>                 print one manifest
+barrel-inference rm <name>                   remove a manifest
+barrel-inference copy <src> <dst>            alias under a new name:tag
+barrel-inference search <query>              search HF / Ollama
+barrel-inference run <name> [prompt..]       stream a chat completion
+barrel-inference embed <name> <text..>       compute an embedding vector
+barrel-inference unload <name>               evict a model from memory now
+barrel-inference version                     print the server version
+barrel-inference help
 ```
 
-Target a non-default host via `ERLLAMA_HOST`:
+Target a non-default host via `BARREL_INFERENCE_HOST`:
 
 ```sh
-ERLLAMA_HOST=http://gpu.lan:8080 erllama list
+BARREL_INFERENCE_HOST=http://gpu.lan:8080 barrel-inference list
 ```
 
 ## LangChain / LiteLLM
@@ -399,15 +399,15 @@ ANTHROPIC_AUTH_TOKEN=not-used \
 ```
 
 Claude Code sends the model id in every `/v1/messages` request.
-`erllama_server` then runs that id through alias resolution and
+`barrel_inference_server` then runs that id through alias resolution and
 looks up the result in the manifest registry. Two ways to wire it:
 
 **1. Pass a local id directly.** `claude --model <registry-id>` or
 the `ANTHROPIC_MODEL` env var. The id has to match something in
-`erllama list`:
+`barrel-inference list`:
 
 ```sh
-erllama list
+barrel-inference list
 # NAME                                       SIZE   MODIFIED
 # Qwen/Qwen2.5-7B-Instruct-GGUF:main         4.4G   2026-05-11
 
@@ -439,12 +439,12 @@ GPU. Skips steps already done in the [quickstart](quickstart.md).
 #### 1. Build and put both binaries on PATH
 
 ```sh
-cd erllama_server
+cd barrel_inference_server
 rebar3 release
-export PATH=$PWD/_build/default/rel/erllama_server/bin:$PATH
+export PATH=$PWD/_build/default/rel/barrel_inference_server/bin:$PATH
 ```
 
-`erllama_server` (daemon) and `erllama` (CLI) are now both
+`barrel_inference_server` (daemon) and `barrel_inference` (CLI) are now both
 callable.
 
 #### 2. Configure aliases + the `n_seq_max` gotcha
@@ -453,7 +453,7 @@ Edit `config/sys.config`:
 
 ```erlang
 [
- {erllama_server, [
+ {barrel_inference_server, [
    {port, 8080},
    {model_aliases, #{
      %% Claude Code's current default trio.
@@ -481,8 +481,8 @@ Claude Code talks to real coding workloads, so you want at least
 a 7B coder-tuned model. Qwen2.5-Coder-7B is a good first target:
 
 ```sh
-erllama pull hf://Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/qwen2.5-coder-7b-instruct-q4_k_m.gguf
-erllama copy "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:main" "local-coder:main"
+barrel-inference pull hf://Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/qwen2.5-coder-7b-instruct-q4_k_m.gguf
+barrel-inference copy "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:main" "local-coder:main"
 ```
 
 If you want tool-call exact-replay (recommended for repeat-loop
@@ -492,7 +492,7 @@ Qwen-family models the default registry already has `qwen-xml`;
 you just need the markers. Edit the manifest:
 
 ```sh
-MANIFEST="$(find ~/Library/Caches/erllama_server/manifests \
+MANIFEST="$(find ~/Library/Caches/barrel_inference_server/manifests \
   -name '*.json' -path '*local-coder*' | head -1)"
 # add to the JSON's "loader" object:
 #   "tool_call_markers": {"start":"<tool_call>","end":"</tool_call>"},
@@ -501,12 +501,12 @@ MANIFEST="$(find ~/Library/Caches/erllama_server/manifests \
 ```
 
 (The cache root and exact path depend on your platform; check
-`erllama show local-coder:main` to confirm where it landed.)
+`barrel-inference show local-coder:main` to confirm where it landed.)
 
 #### 4. Boot the daemon
 
 ```sh
-erllama_server daemon
+barrel_inference_server daemon
 curl -fsS http://127.0.0.1:8080/health     # -> {"status":"ok"}
 curl -fsS http://127.0.0.1:8080/v1/models  # confirms `local-coder` + aliases
 ```
@@ -537,17 +537,17 @@ prior KV state via the v0.6 `continue/3` path.
 
 ```sh
 # Daemon log (structured per-request lines + access log)
-tail -f _build/default/rel/erllama_server/log/erlang.log.*
+tail -f _build/default/rel/barrel_inference_server/log/erlang.log.*
 
 # Prometheus counters
 curl -sS http://127.0.0.1:8080/metrics | \
   grep -E 'cache_hits_total|active_streams|tool_replay_lookups'
 
 # Loaded models
-erllama ps
+barrel-inference ps
 ```
 
-The `erllama_cache_hits_total{kind="continuation"}` counter
+The `barrel_inference_cache_hits_total{kind="continuation"}` counter
 climbs on every multi-turn continuation — that's the v0.6 path
 firing.
 
@@ -565,7 +565,7 @@ firing.
 #### 8. Stop
 
 ```sh
-erllama_server stop
+barrel_inference_server stop
 ```
 
 ### Multiple Claude models on one server
@@ -594,7 +594,7 @@ Claude Code's UI then switches between these without code changes
 on either side. Same goes for the API: a client passing
 `"model": "claude-opus-4-7"` lands on the 70B; passing
 `"claude-haiku-4-5"` lands on the 3B. The handler reads the model
-from the body, runs `erllama_server_config:resolve_model/1`
+from the body, runs `barrel_inference_server_config:resolve_model/1`
 (persistent_term-backed, single map lookup), and the rest of the
 pipeline is identical regardless of which alias you matched.
 
@@ -608,7 +608,7 @@ A few practical patterns:
   code-specialised local model (Qwen Coder, DeepSeek Coder) and
   `claude-opus-*` / `claude-haiku-*` to a general-purpose one.
 - **Test multiple models without restart**: call
-  `erllama_server_config:set_aliases/1` from a connected shell
+  `barrel_inference_server_config:set_aliases/1` from a connected shell
   with the new map. Hot-reloads instantly; in-flight requests
   resolve against the snapshot they read at request time.
 - **Mixed local-id / Claude-id traffic**: aliases are
@@ -616,7 +616,7 @@ A few practical patterns:
   it bypasses the map and goes straight to the registry.
 
 The behaviour replaces what tools like `ds4` do (route Claude
-Code's Anthropic API requests to local models): `erllama_server`
+Code's Anthropic API requests to local models): `barrel_inference_server`
 is that route, with the local registry + multi-tier KV cache
 underneath.
 
@@ -667,7 +667,7 @@ under the `tool_call_formats` app env in `sys.config`:
 }}
 ```
 
-The module implements the `erllama_server_tool_format` behaviour:
+The module implements the `barrel_inference_server_tool_format` behaviour:
 `parse/1` turns `FullBin` into `#{name => Bin, arguments => Map}`,
 `canonicalise/1` does the reverse. The registry merges
 operator-supplied entries on top of the defaults, so qwen-xml
@@ -682,12 +682,12 @@ The replay map persists across restarts under
 shorter retention window or a different cache root:
 
 ```erlang
-{tool_replay_dir, "/var/lib/erllama_server/replay"},
+{tool_replay_dir, "/var/lib/barrel_inference_server/replay"},
 {tool_replay_ttl_ms, 604800000},        %% 7 days
 {tool_replay_gc_interval_ms, 600000}    %% 10 minutes
 ```
 
-The `erllama_tool_replay_lookups_total{result="hit"|"miss"|"no_format"}`
+The `barrel_inference_tool_replay_lookups_total{result="hit"|"miss"|"no_format"}`
 counter (Prometheus `/metrics`) reports how often the replay map
 hits on the render side - useful for verifying that turn-to-turn
 byte stability is holding up across an SDK's serialisation choices.
@@ -705,7 +705,7 @@ place instead of restoring from disk. The server derives a stable
    this natively as a per-user stable string).
 3. `base64(sha256(model || first_user_message_bytes))` fallback.
 
-The derived id is forwarded to `erllama:infer/4` on
+The derived id is forwarded to `barrel_inference:infer/4` on
 `Params.session_id`. The next request on the same session reuses
 the live KV cells; concurrent admits on the same session return
 `sticky_busy` mapped to 503 with `retry-after` (529 on
@@ -734,14 +734,14 @@ queue `concurrency`, or higher if you expect concurrent sessions
 from the same model. Cleanly-completed turns leave the session
 pinned for the next turn; only mid-flight cancels free the seq.
 
-**Continuation path (`erllama:continue/3`)**
+**Continuation path (`barrel_inference:continue/3`)**
 
 Many chat templates render the leading turns *differently* in a
 multi-turn context (different role markers, system-prefix
 formatting). The engine's prefix-equality check on the `sticky`
 path is byte-exact; when bytes diverge, it falls back to cold
 admit and you pay full prefill per turn. To work around this,
-the server uses erllama 0.6's `continue/3` primitive: after each
+the server uses Barrel Inference 0.6's `continue/3` primitive: after each
 turn the engine-reported `committed_tokens` count is cached
 server-side, and the next turn's pipeline slices the rendered
 prompt at that boundary and asks the engine to prefill only the
@@ -773,7 +773,7 @@ chat template's render is stable across turns.
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/model.gguf rebar3 ct \
-  --suite=erllama_server_real_model_SUITE \
+  --suite=barrel_inference_server_real_model_SUITE \
   --case=multi_turn_cache_delta_profile
 ```
 
@@ -786,8 +786,8 @@ deployments behind a public address, set an allowlist:
 
 ```erlang
 {anthropic_api_keys, [
-  <<"sk-erllama-alice-…">>,
-  <<"sk-erllama-bob-…">>
+  <<"sk-barrel_inference-alice-…">>,
+  <<"sk-barrel_inference-bob-…">>
 ]}
 ```
 
@@ -937,7 +937,7 @@ what Claude Code sends**:
 
 Server-side caching helps with speed and cost, not upload size:
 
-- erllama's **KV cache** (RAM/ramfile/disk tiered) hits when the
+- Barrel Inference's **KV cache** (RAM/ramfile/disk tiered) hits when the
   prompt prefix repeats across turns, so the second turn skips
   prefill server-side. Already enabled.
 - **Anthropic prompt caching** markers (`cache_control: {type:
@@ -957,11 +957,11 @@ Every API family is identical here. The handler:
 
 1. Reads the `model` field from the request body (OpenAI / Ollama)
    or path/body (Anthropic `/v1/messages`).
-2. Calls `erllama_server_config:resolve_model/1`. This is a
+2. Calls `barrel_inference_server_config:resolve_model/1`. This is a
    one-line `maps:get/3` over `model_aliases` with the requested
    id as the default, so aliases are an alias-or-identity
    passthrough.
-3. Calls `erllama_server_models:get/1` with the resolved id. If
+3. Calls `barrel_inference_server_models:get/1` with the resolved id. If
    the registry has no manifest under that name, the request
    fails with `404 model_not_found`, unless `auto_pull = true` in
    which case the loader pulls it from the default registry first.
@@ -975,5 +975,5 @@ Practical consequences:
   on the wire matches the manifest at
   `manifests/Qwen:Qwen2.5-7B-Instruct-GGUF/latest.json`.
 - Aliases are hot-reloadable via
-  `erllama_server_config:set_aliases/1` from a shell, no restart
+  `barrel_inference_server_config:set_aliases/1` from a shell, no restart
   needed.

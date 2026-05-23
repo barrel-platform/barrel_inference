@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 c = OpenAI(
     api_key="not-used",
-    base_url=os.environ.get("ERLLAMA_HOST", "http://127.0.0.1:8080") + "/v1",
+    base_url=os.environ.get("BARREL_INFERENCE_HOST", "http://127.0.0.1:8080") + "/v1",
 )
 MODEL = os.environ.get("MODEL", "Qwen/Qwen2.5-7B-Instruct-GGUF:main")
 

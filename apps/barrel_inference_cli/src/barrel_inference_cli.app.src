@@ -1,0 +1,17 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
+{application, barrel_inference_cli, [
+    {description, "Command-line client and launcher for Barrel Inference"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib,
+        hackney,
+        barrel_inference_server
+    ]},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{<<"GitHub">>, <<"https://github.com/barrel-platform/barrel_inference">>}]}
+]}.

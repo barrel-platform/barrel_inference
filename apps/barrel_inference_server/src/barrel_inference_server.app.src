@@ -1,0 +1,41 @@
+{application, barrel_inference_server, [
+    {description,
+        "OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of Barrel Inference"},
+    {vsn, "0.1.0"},
+    {registered, [barrel_inference_server_sup, barrel_inference_server_config]},
+    {mod, {barrel_inference_server_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        sasl,
+        crypto,
+        ssl,
+        inets,
+        cowboy,
+        instrument,
+        hackney,
+        barrel_inference,
+        barrel_mcp
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [
+        {"GitHub", "https://github.com/barrel-platform/barrel_inference"},
+        {"Docs", "https://barrel-platform.github.io/barrel_inference/"},
+        {"Changelog", "https://github.com/barrel-platform/barrel_inference/blob/main/CHANGELOG.md"}
+    ]},
+    {build_tools, ["rebar3"]},
+    {files, [
+        "src",
+        "include",
+        "config",
+        "guides",
+        "rebar.config",
+        "rebar.lock",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE",
+        "openapi.yaml"
+    ]}
+]}.

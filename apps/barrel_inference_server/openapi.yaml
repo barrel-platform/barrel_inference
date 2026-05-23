@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
-  title: erllama_server
+  title: barrel_inference_server
   description: |
     OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of
-    `erllama`. Drop-in for clients that already speak the OpenAI Python
+    `barrel_inference`. Drop-in for clients that already speak the OpenAI Python
     SDK, the Anthropic SDK, the Ollama HTTP API, or LangChain /
     LiteLLM connectors that point at any of the above. Runs locally
     against any GGUF model `llama.cpp` can load.
@@ -18,8 +18,8 @@ info:
     name: MIT
     url: https://opensource.org/licenses/MIT
   contact:
-    name: erllama_server
-    url: https://github.com/erllama/erllama_server
+    name: barrel_inference_server
+    url: https://github.com/barrel-platform/barrel_inference
 
 servers:
   - url: http://127.0.0.1:8080

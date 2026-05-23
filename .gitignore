@@ -1,0 +1,14 @@
+# Umbrella build output
+/_build/
+/.rebar3/
+/_checkouts/
+
+# Erlang / rebar3 crash artifacts
+erl_crash.dump
+rebar3.crashdump
+*.beam
+
+# Generated docs
+/doc/
+
+.DS_Store

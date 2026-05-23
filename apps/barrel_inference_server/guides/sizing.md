@@ -8,7 +8,7 @@ from **mmap behaviour** when a model is bigger than RAM.
 
 ## How the loader uses memory
 
-When `erllama_server` loads a GGUF, four things draw from the
+When `barrel_inference_server` loads a GGUF, four things draw from the
 unified memory pool:
 
 | Allocation | Approximate size | Knob |
@@ -115,7 +115,7 @@ What each knob does for the too-big-to-fit case:
 | `n_ctx: 8192` (low) | KV cache scales with context size and is fully RAM-resident. Bigger context = less RAM for weight paging. Pick the smallest context your client actually uses. |
 | `n_batch: 256` (low) | Smaller prefill batches mean smaller scratch buffers competing for RAM. Trades prefill throughput for paging headroom. |
 | `n_seq_max: 1` | Multiple concurrent sequences each have a KV cache and their own expert-access pattern. Pin to 1 for big models on small RAM. |
-| `decode_budget_ms` (engine) | erllama 0.8 aborts any decode step that exceeds this wall-clock budget and recovers the context in place instead of wedging. Default 30000 (30 s). A very large model on CPU can legitimately exceed 30 s on a heavy prefill step — raise it (or set `0` to disable) if you see spurious `decode_timeout`. Set globally via `decode_budget_ms` in `sys.config`, or per model via `loader.decode_budget_ms`. |
+| `decode_budget_ms` (engine) | Barrel Inference 0.8 aborts any decode step that exceeds this wall-clock budget and recovers the context in place instead of wedging. Default 30000 (30 s). A very large model on CPU can legitimately exceed 30 s on a heavy prefill step — raise it (or set `0` to disable) if you see spurious `decode_timeout`. Set globally via `decode_budget_ms` in `sys.config`, or per model via `loader.decode_budget_ms`. |
 
 And in `sys.config`:
 
@@ -166,11 +166,11 @@ Recommended baseline:
    parameters for breadth, fits with room to spare.
 2. **Pull and copy under an alias**:
    ```sh
-   erllama pull hf://Qwen/Qwen3-30B-A3B-Instruct-GGUF/qwen3-30b-a3b-instruct-q4_k_m.gguf
-   erllama copy "Qwen/Qwen3-30B-A3B-Instruct-GGUF:main" "local-coder:main"
+   barrel-inference pull hf://Qwen/Qwen3-30B-A3B-Instruct-GGUF/qwen3-30b-a3b-instruct-q4_k_m.gguf
+   barrel-inference copy "Qwen/Qwen3-30B-A3B-Instruct-GGUF:main" "local-coder:main"
    ```
 3. **Edit the manifest** at
-   `~/Library/Caches/erllama_server/models/manifests/local-coder/main.json`
+   `~/Library/Caches/barrel_inference_server/models/manifests/local-coder/main.json`
    to set `loader.context_opts.n_seq_max = 4` (required for
    sticky-seq + Claude Code; see
    [clients.md](clients.md#sticky-seq-kv-reuse-across-turns)).

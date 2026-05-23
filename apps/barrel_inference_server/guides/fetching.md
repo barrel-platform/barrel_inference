@@ -1,16 +1,16 @@
 # Fetching models
 
-`erllama_server_fetch:fetch/1,2` pulls a GGUF from a remote source
+`barrel_inference_server_fetch:fetch/1,2` pulls a GGUF from a remote source
 onto the local disk and returns the path you can then pass to
-`erllama:load_model/1`. Supports HuggingFace, the Ollama registry,
+`barrel_inference:load_model/1`. Supports HuggingFace, the Ollama registry,
 plain HTTPS URLs, and local paths (passthrough). Resumable, sha256-
 verified, with progress events.
 
 ```erlang
-1> {ok, _} = application:ensure_all_started(erllama_server).
-2> {ok, Path} = erllama_server_fetch:fetch(<<"hf://TheBloke/TinyLlama-1.1B-Chat-GGUF/tinyllama-1.1b-chat.Q4_K_M.gguf">>).
-{ok, "/Users/me/Library/Caches/erllama_server/models/blobs/sha256-cf46c7....gguf"}
-3> {ok, M} = erllama:load_model(#{model_path => Path, ...}).
+1> {ok, _} = application:ensure_all_started(barrel_inference_server).
+2> {ok, Path} = barrel_inference_server_fetch:fetch(<<"hf://TheBloke/TinyLlama-1.1B-Chat-GGUF/tinyllama-1.1b-chat.Q4_K_M.gguf">>).
+{ok, "/Users/me/Library/Caches/barrel_inference_server/models/blobs/sha256-cf46c7....gguf"}
+3> {ok, M} = barrel_inference:load_model(#{model_path => Path, ...}).
 ```
 
 ## Spec syntax
@@ -33,21 +33,21 @@ use the async API: kick off the fetch, get a `JobRef` back, then
 either subscribe to the completion message or poll status:
 
 ```erlang
-1> {ok, Ref} = erllama_server_fetch:fetch_async(<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF">>).
+1> {ok, Ref} = barrel_inference_server_fetch:fetch_async(<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF">>).
 {ok,<<"a3f1...">>}
 
-2> erllama_server_fetch:fetch_status(Ref).
+2> barrel_inference_server_fetch:fetch_status(Ref).
 {pending, #{bytes => 1048576, total => 4368450208}}
 
 3> receive
-       {erllama_fetch_done, Ref, {ok, Path}} -> Path;
-       {erllama_fetch_done, Ref, {error, Reason}} -> {error, Reason}
+       {barrel_inference_fetch_done, Ref, {ok, Path}} -> Path;
+       {barrel_inference_fetch_done, Ref, {error, Reason}} -> {error, Reason}
    end.
-"/Users/me/Library/Caches/erllama_server/models/blobs/sha256-cf46c7....gguf"
+"/Users/me/Library/Caches/barrel_inference_server/models/blobs/sha256-cf46c7....gguf"
 ```
 
 The caller of `fetch_async/1,2` is auto-subscribed: the message
-`{erllama_fetch_done, JobRef, Result}` is delivered exactly once
+`{barrel_inference_fetch_done, JobRef, Result}` is delivered exactly once
 when the fetch completes. To subscribe an additional pid (a UI
 process, a status page, etc.) use `fetch_subscribe/2`.
 
@@ -55,9 +55,9 @@ To block synchronously on a previously-started job (with an optional
 timeout), use `fetch_await/1,2`:
 
 ```erlang
-{ok, Ref}  = erllama_server_fetch:fetch_async(Spec).
-{ok, Path} = erllama_server_fetch:fetch_await(Ref).            % infinity
-{ok, Path} = erllama_server_fetch:fetch_await(Ref, 60_000).    % 60 s, returns `timeout` past that
+{ok, Ref}  = barrel_inference_server_fetch:fetch_async(Spec).
+{ok, Path} = barrel_inference_server_fetch:fetch_await(Ref).            % infinity
+{ok, Path} = barrel_inference_server_fetch:fetch_await(Ref, 60_000).    % 60 s, returns `timeout` past that
 ```
 
 The `done` map keeps each completed job around for 5 minutes so
@@ -72,25 +72,25 @@ files and picks a GGUF for you. The preference order is `Q4_K_M >
 Q5_K_M > Q4_0 > Q8_0`, falling back to the first `.gguf` alphabetically:
 
 ```erlang
-{ok, Path} = erllama_server_fetch:fetch(<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF">>).
+{ok, Path} = barrel_inference_server_fetch:fetch(<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF">>).
 %% picks Qwen2.5-7B-Instruct-Q4_K_M.gguf
 ```
 
 Pass an explicit file path to override the pick:
 
 ```erlang
-{ok, Path} = erllama_server_fetch:fetch(<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q8_0.gguf">>).
+{ok, Path} = barrel_inference_server_fetch:fetch(<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q8_0.gguf">>).
 ```
 
 ## Searching
 
-`erllama_server_search:search/1,2` queries HuggingFace and the
+`barrel_inference_server_search:search/1,2` queries HuggingFace and the
 Ollama registry and returns a unified hit list. Each hit's `id` is
 a fetch spec you can hand straight to
-`erllama_server_fetch:fetch/1`.
+`barrel_inference_server_fetch:fetch/1`.
 
 ```erlang
-1> {ok, Hits} = erllama_server_search:search(<<"qwen">>, #{limit => 5, sources => [hf]}).
+1> {ok, Hits} = barrel_inference_server_search:search(<<"qwen">>, #{limit => 5, sources => [hf]}).
 2> [maps:get(id, H) || H <- Hits].
 [<<"hf://lmstudio-community/Qwen2.5-7B-Instruct-GGUF">>,
  <<"hf://Qwen/Qwen2.5-Coder-7B-Instruct-GGUF">>,
@@ -138,7 +138,7 @@ rebar3 shell
 ```
 
 ```erlang
-1> erllama_server_fetch:fetch(<<"hf://meta-llama/Llama-3.1-8B-Instruct-GGUF/llama-3.1-8b-instruct.Q4_K_M.gguf">>).
+1> barrel_inference_server_fetch:fetch(<<"hf://meta-llama/Llama-3.1-8B-Instruct-GGUF/llama-3.1-8b-instruct.Q4_K_M.gguf">>).
 ```
 
 Plain HTTPS sources currently do not support per-call basic auth or
@@ -148,7 +148,7 @@ and pass the resulting path through `file://`.
 ## Options
 
 ```erlang
-erllama_server_fetch:fetch(Spec, #{
+barrel_inference_server_fetch:fetch(Spec, #{
     sha256   => <<"cf46c7128b...">>,    % verify against this digest
     progress => self(),                  % receive progress messages
     timeout  => 60_000,                  % per-request, default 30 s
@@ -161,7 +161,7 @@ erllama_server_fetch:fetch(Spec, #{
   compared against this value. A mismatch deletes the partial file
   and returns `{error, {sha256_mismatch, Got, Want}}`.
 - `progress` a pid that receives
-  `{erllama_fetch_progress, Ref, BytesDone, Total :: integer() | undefined}`
+  `{barrel_inference_fetch_progress, Ref, BytesDone, Total :: integer() | undefined}`
   every ~100 ms during the stream. `Total` is `undefined` if the
   server omitted `Content-Length`.
 - `timeout` per-request HTTP timeout. The whole fetch can take much
@@ -173,19 +173,19 @@ erllama_server_fetch:fetch(Spec, #{
 
 Cache root resolution, in order:
 
-1. `application:get_env(erllama_server, model_cache_dir)`.
-2. `$XDG_CACHE_HOME/erllama_server/models` (Linux/BSD when set).
-3. `filename:basedir(user_cache, "erllama_server")/models` the
+1. `application:get_env(barrel_inference_server, model_cache_dir)`.
+2. `$XDG_CACHE_HOME/barrel_inference_server/models` (Linux/BSD when set).
+3. `filename:basedir(user_cache, "barrel_inference_server")/models` the
    OTP-native per-platform location
-   (`~/Library/Caches/erllama_server/models` on macOS,
-   `~/.cache/erllama_server/models` on Linux,
-   `%LOCALAPPDATA%\erllama_server\models` on Windows).
+   (`~/Library/Caches/barrel_inference_server/models` on macOS,
+   `~/.cache/barrel_inference_server/models` on Linux,
+   `%LOCALAPPDATA%\barrel_inference_server\models` on Windows).
 
 Override per-deployment in `sys.config`:
 
 ```erlang
-{erllama_server, [
-    {model_cache_dir, "/srv/erllama/cache"}
+{barrel_inference_server, [
+    {model_cache_dir, "/srv/barrel_inference/cache"}
 ]}.
 ```
 
@@ -219,14 +219,14 @@ than re-downloading.
 
 ## Concurrent-fetch dedupe
 
-`erllama_server_fetch_srv` keys in-flight jobs by spec hash. If two
+`barrel_inference_server_fetch_srv` keys in-flight jobs by spec hash. If two
 callers ask for the same spec while a worker is running, the second
 caller attaches to the existing subscriber list instead of spawning
 a second worker. Both receive the same final reply (and progress
 events, if requested).
 
 This means a multi-process server can call
-`erllama_server_fetch:fetch/1` from every request handler without
+`barrel_inference_server_fetch:fetch/1` from every request handler without
 coordinating; the first one to ask triggers the download, every
 other concurrent request blocks on the shared worker.
 

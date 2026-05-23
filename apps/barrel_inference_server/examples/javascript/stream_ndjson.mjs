@@ -1,7 +1,7 @@
 // Streaming Ollama NDJSON from Node 18+ or the browser.
 // Run: node examples/javascript/stream_ndjson.mjs
 
-const HOST = process.env.ERLLAMA_HOST ?? "http://127.0.0.1:8080";
+const HOST = process.env.BARREL_INFERENCE_HOST ?? "http://127.0.0.1:8080";
 const MODEL = process.env.MODEL ?? "Qwen/Qwen2.5-7B-Instruct-GGUF:main";
 
 const resp = await fetch(`${HOST}/api/generate`, {

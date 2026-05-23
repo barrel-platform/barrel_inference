@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Ollama /api/generate: streaming, preload, unload.
 set -euo pipefail
-HOST="${ERLLAMA_HOST:-http://127.0.0.1:8080}"
+HOST="${BARREL_INFERENCE_HOST:-http://127.0.0.1:8080}"
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct-GGUF:main}"
 
 echo "==> streaming generate"

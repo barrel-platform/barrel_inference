@@ -1,20 +1,20 @@
 # Roadmap & backlog
 
-Tracked follow-ups for erllama_server. Shipped work lives in the git
+Tracked follow-ups for Barrel Inference Server. Shipped work lives in the git
 history and the guides; this file is the not-yet-done list.
 
 ## Server-side tool executors
 
-- **MCP bridge - DONE.** erllama_server connects (as an MCP client)
+- **MCP bridge - DONE.** Barrel Inference Server connects (as an MCP client)
   to the servers in `mcp_servers` via `barrel_mcp`, and offers their
   tools on every request through the continue-loop
-  (`erllama_server_mcp` manager + catalog -> translate injection ->
-  `erllama_server_tool_executor_mcp`). See `guides/tools.md`.
+  (`barrel_inference_server_mcp` manager + catalog -> translate injection ->
+  `barrel_inference_server_tool_executor_mcp`). See `guides/tools.md`.
   The catalog refreshes on `tools/list_changed` (timer is a fallback);
   stdio transport is verified against the Python reference server
   (gated CT); a server's resources are bridged as `<id>__list_resources`
   / `<id>__read_resource` meta-tools (capability-gated). Remaining:
-  expose erllama's *own* tools as an MCP server (the other direction).
+  expose Barrel Inference's *own* tools as an MCP server (the other direction).
   MCP prompts are deliberately not bridged into the model loop (they
   are user-facing macros); a client-facing prompts surface is a
   possible later feature.
@@ -25,7 +25,7 @@ history and the guides; this file is the not-yet-done list.
   + embeddings) and fold hits into context. Medium effort.
 - **Trivial:** `current_time`, `calculator`. Cheap, marginal value.
 
-## Hardening (erllama_server)
+## Hardening (Barrel Inference Server)
 
 - **Done in web_fetch:** SSRF guard (http(s) only; block
   loopback/private/link-local unless `allow_private`), TLS
@@ -38,17 +38,17 @@ history and the guides; this file is the not-yet-done list.
   `anthropic_api_keys` for any non-localhost bind; document in the
   deployment guide.
 
-## erllama (engine) upstream
+## Barrel Inference (engine) upstream
 
-These need fixing in erllama (the NIF over llama.cpp), not here.
+These need fixing in Barrel Inference (the NIF over llama.cpp), not here.
 Ready-to-hand-off briefs live in `docs/`:
 
-- `docs/erllama_engine_hardening_prompt.md` - the engine-robustness
+- `docs/barrel_inference_engine_hardening_prompt.md` - the engine-robustness
   items below (decode wedges, continue/3 grammar, byte-exact replay).
-- `docs/erllama_nif_hardening_prompt.md` - SIGSEGV / input-validation
+- `docs/barrel_inference_nif_hardening_prompt.md` - SIGSEGV / input-validation
   hardening (oversized prompts, malformed GGUF, chat-template badarg).
 
-Hand either prompt to an erllama-focused session pointed at the
+Hand either prompt to an barrel_inference-focused session pointed at the
 sibling repo. Engine-robustness headlines:
 
 - **Cold-admit wedge / unbounded non-interruptible decode (critical).**
@@ -69,7 +69,7 @@ sibling repo. Engine-robustness headlines:
 - **KV-warm loop iterations.** The continue-loop pins the session
   (warm path), but `continue/3` carrying the grammar + byte-exact
   replay are engine prerequisites for fully reliable warm rounds; see
-  the erllama items.
+  the Barrel Inference items.
 - **`store: false`** on `/v1/responses` - skip the response-store put
   when the client opts out.
 - **`parallel_tool_calls: true`** - a multi-call GBNF root rule so the

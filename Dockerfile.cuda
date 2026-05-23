@@ -1,0 +1,87 @@
+# CUDA-enabled umbrella build. Compiles the NIF's llama.cpp with
+# -DGGML_CUDA=ON so models offload to NVIDIA GPUs at load time (set
+# loader.n_gpu_layers in the manifest, or model_default_opts in sys.config).
+#
+# Run with --gpus all (or --runtime=nvidia):
+#   docker run --gpus all -p 8080:8080 \
+#     -v barrel_inference-cache:/home/barrel_inference/.cache \
+#     ghcr.io/barrel-platform/barrel_inference_server:cuda
+#
+# Multi-stage: erlang:28-bookworm + CUDA toolkit to compile, then an
+# nvidia/cuda runtime image with just the assembled release. Both stages
+# are glibc-based so the NIF's libstdc++ ABI matches.
+
+ARG OTP_VERSION=28
+ARG CUDA_VERSION=12.4.1
+
+# NOTE: erlang:28 is Debian 13 (trixie). The CUDA apt repo below targets
+# debian12 and the runtime stage is ubuntu22.04, so this image needs
+# verification on a GPU runner (CUDA repo suite + libstdc++ ABI across
+# the trixie builder / ubuntu22.04 runtime). The CPU Dockerfile is the
+# tested path.
+
+# ============================================================================
+# Stage 1: builder (Erlang + CUDA toolkit)
+# ============================================================================
+FROM erlang:${OTP_VERSION} AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl gnupg ca-certificates cmake build-essential git \
+    && curl -fsSL \
+       https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
+       -o cuda-keyring.deb \
+    && dpkg -i cuda-keyring.deb \
+    && rm cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       cuda-toolkit-12-4 \
+       libcurand-dev-12-4 libcublas-dev-12-4 libcusparse-dev-12-4 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/usr/local/cuda/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
+    CUDA_PATH=/usr/local/cuda \
+    BARREL_INFERENCE_OPTS="-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
+
+WORKDIR /src
+
+COPY rebar.config rebar.lock ./
+COPY config ./config
+COPY apps ./apps
+
+RUN rebar3 as prod release \
+    && rebar3 as prod escriptize \
+    && cp _build/prod/bin/barrel-inference \
+          _build/prod/rel/barrel_inference_server/bin/barrel-inference
+
+# ============================================================================
+# Stage 2: runtime (NVIDIA CUDA runtime + the assembled release)
+# ============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 libgomp1 libssl3 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash barrel_inference
+
+WORKDIR /opt/barrel_inference_server
+
+COPY --from=builder --chown=barrel_inference:barrel_inference \
+     /src/_build/prod/rel/barrel_inference_server ./
+
+USER barrel_inference
+
+ENV XDG_CACHE_HOME=/home/barrel_inference/.cache
+
+# NVIDIA Container Runtime exposes these at run time; declaring them makes
+# `docker run --gpus all` enable compute + utility caps by default.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+
+ENTRYPOINT ["./bin/barrel_inference_server"]
+CMD ["foreground"]

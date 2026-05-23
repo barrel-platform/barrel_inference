@@ -1,0 +1,32 @@
+# VCS + build output (the image rebuilds deps + the NIF from scratch)
+.git/
+.github/
+_build/
+**/_build/
+.rebar3/
+**/.rebar3/
+**/erl_crash.dump
+**/rebar3.crashdump
+.DS_Store
+log/
+**/log/
+
+# Host-built NIF artefact; the builder stage recompiles it.
+apps/*/priv/
+
+# App docs/tests/benches are not needed to build the release. Scoped to
+# apps/* (one level) so the vendored apps/*/c_src/llama.cpp tree is kept.
+apps/*/test/
+apps/*/docs/
+apps/*/guides/
+apps/*/internals/
+apps/*/examples/
+apps/*/bench/
+apps/*/*.md
+apps/*/mkdocs.yml
+apps/*/openapi.yaml
+
+# Top-level docs / tests / compose
+test/
+*.md
+docker-compose.yml
