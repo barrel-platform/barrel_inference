@@ -13,7 +13,7 @@ info:
     - `/v1/*`  OpenAI (chat, completions, embeddings, models) + Anthropic (messages)
     - `/api/*` Ollama (generate, chat, embed, pull, tags, show, ps, version, ...)
     - top-level: `/health`, `/health/ready`, `/metrics`
-  version: "0.1.0"
+  version: "0.8.0"
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT

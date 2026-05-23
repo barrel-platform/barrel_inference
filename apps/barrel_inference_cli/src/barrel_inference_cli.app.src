@@ -3,7 +3,7 @@
 %%
 {application, barrel_inference_cli, [
     {description, "Command-line client and launcher for Barrel Inference"},
-    {vsn, "0.1.0"},
+    {vsn, "0.8.0"},
     {registered, []},
     {applications, [
         kernel,

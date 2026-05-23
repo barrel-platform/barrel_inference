@@ -77,7 +77,7 @@ split_repo(Repo) ->
 headers() ->
     [
         {<<"User-Agent">>,
-            <<"barrel_inference_server/0.1.0 (+https://github.com/barrel-platform/barrel_inference)">>},
+            <<"barrel_inference_server/0.8.0 (+https://github.com/barrel-platform/barrel_inference)">>},
         {<<"Accept">>, <<"application/json">>}
     ].
 
