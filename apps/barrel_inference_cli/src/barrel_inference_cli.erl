@@ -6,9 +6,9 @@
 Command-line front end for Barrel Inference.
 
 Built as a `rebar3 escriptize` artefact at `_build/default/bin/barrel-inference`.
-`serve` boots `barrel_inference_server` in-process; every other subcommand
-speaks to a running daemon over HTTP (hackney). Nothing here loads
-inference modules directly.
+`serve` launches the release daemon; every other subcommand speaks to a
+running daemon over HTTP (hackney). Nothing here loads inference modules
+directly.
 
 Subcommands:
 
@@ -113,21 +113,56 @@ dispatch(_, _) ->
 %% Subcommands
 %% =============================================================================
 
-%% `serve`: boot the API daemon in-process and block. Works when run
-%% from the release (beams + the NIF .so are on disk). As a bare escript
-%% the NIF cannot load, so use the release for real serving.
-cmd_serve(_Args) ->
-    {ok, Started} = application:ensure_all_started(barrel_inference_server),
-    Port = application:get_env(barrel_inference_server, port, 8080),
-    io:put_chars(
-        io_lib:format(
-            "barrel_inference_server listening on port ~p (started: ~p)~n",
-            [Port, Started]
-        )
-    ),
-    %% The OTP supervision tree owns all work; block the escript forever.
+%% `serve`: launch the release's barrel_inference_server start script
+%% (foreground by default) and relay its output. Running the release
+%% rather than booting in-process means the NIF and beams load from disk;
+%% a bare escript cannot load the NIF from inside its archive.
+cmd_serve(Args) ->
+    case release_daemon() of
+        {ok, Daemon} ->
+            SubArgs =
+                case Args of
+                    [] -> ["foreground"];
+                    _ -> Args
+                end,
+            Port = open_port(
+                {spawn_executable, Daemon},
+                [{args, SubArgs}, exit_status, stderr_to_stdout, binary]
+            ),
+            relay_daemon(Port);
+        {error, not_found} ->
+            io:put_chars(
+                "serve launches the release daemon, but the "
+                "barrel_inference_server start script was not found next to "
+                "this binary or on PATH. Run serve from an installed release.\n"
+            ),
+            halt(1)
+    end.
+
+relay_daemon(Port) ->
     receive
-    after infinity -> ok
+        {Port, {data, Bytes}} ->
+            io:put_chars(Bytes),
+            relay_daemon(Port);
+        {Port, {exit_status, Status}} ->
+            halt(Status)
+    end.
+
+%% Locate the barrel_inference_server release start script: next to this
+%% escript (the release ships both in bin/), else on PATH.
+release_daemon() ->
+    Sibling = filename:join(
+        filename:dirname(filename:absname(escript:script_name())),
+        "barrel_inference_server"
+    ),
+    case filelib:is_regular(Sibling) of
+        true ->
+            {ok, Sibling};
+        false ->
+            case os:find_executable("barrel_inference_server") of
+                false -> {error, not_found};
+                Path -> {ok, Path}
+            end
     end.
 
 cmd_pull(Base, Name) ->
@@ -670,7 +705,7 @@ usage() ->
         "barrel-inference - command-line client and launcher for Barrel Inference\n"
         "\n"
         "Usage:\n"
-        "  barrel-inference serve                    run the API server in-process\n"
+        "  barrel-inference serve                    run the API server (release daemon)\n"
         "  barrel-inference pull <name>              pull a model into the registry\n"
         "  barrel-inference run <name> [prompt..]    stream a single chat completion\n"
         "  barrel-inference ps                       list currently-loaded models\n"

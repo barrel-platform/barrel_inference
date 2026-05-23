@@ -8,8 +8,7 @@
     {applications, [
         kernel,
         stdlib,
-        hackney,
-        barrel_inference_server
+        hackney
     ]},
     {modules, []},
     {licenses, ["MIT"]},

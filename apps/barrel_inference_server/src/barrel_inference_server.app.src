@@ -32,7 +32,6 @@
         "config",
         "guides",
         "rebar.config",
-        "rebar.lock",
         "README.md",
         "CHANGELOG.md",
         "LICENSE",
