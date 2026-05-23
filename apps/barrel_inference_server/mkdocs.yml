@@ -1,0 +1,96 @@
+site_name: erllama_server
+site_description: >
+  OpenAI-, Anthropic-, and Ollama-compatible HTTP server on top of
+  erllama. One Erlang/OTP node; real GGUF inference via llama.cpp.
+site_url: https://erllama.github.io/erllama_server/
+repo_url: https://github.com/erllama/erllama_server
+repo_name: erllama/erllama_server
+edit_uri: edit/main/
+
+docs_dir: guides
+site_dir: _site
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - content.code.annotate
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: '(prefers-color-scheme: light)'
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: '(prefers-color-scheme: dark)'
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - render_swagger:
+      allow_arbitrary_locations: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path:
+        - .
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - HTTP API:
+      - Reference (curl): api.md
+      - OpenAPI spec: openapi.md
+  - Clients:
+      - SDK examples: clients.md
+  - Registry:
+      - Models + Modelfile: registry.md
+      - Fetching: fetching.md
+  - Deployment: deployment.md
+  - Changelog: changelog.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/erllama/erllama_server
+
+copyright: Copyright &copy; 2026 Benoit Chesneau

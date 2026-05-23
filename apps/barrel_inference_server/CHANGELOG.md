@@ -1,0 +1,323 @@
+# Changelog
+
+All notable changes to erllama_server are documented here. The
+format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and this project adheres to [Semantic Versioning](https://semver.org).
+
+## [Unreleased]
+
+### erllama 0.5.0 + tool-call exact-replay
+
+- Bumped to erllama 0.5.0 (`{erllama, "0.5.0"}` in `rebar.config`).
+  v0.5 exposes per-model `tool_call_markers`, the
+  `{tool_call_delta, _}` / `erllama_tool_call_end` streaming wire,
+  greedy-on-syntax sampling, sticky-seq KV reuse (`session_id` on
+  `infer/4`, `end_session/2`), and the `prefill_only/3` cache-
+  warming primitive.
+- `loader.tool_call_markers` plumbed from the manifest into the
+  Config map passed to `erllama:load_model/2`, mirroring the
+  existing `thinking_markers` path. Required keys `start` / `end`;
+  optional `payload_start` / `payload_end`.
+- New `erllama_server_tool_format` behaviour and registry. Each
+  model family ships a module implementing `parse/1` (FullBin ->
+  `#{name, arguments}`) and `canonicalise/1` (the reverse). The
+  registry resolves a canonical model id via the manifest's
+  `loader.tool_call_format` field.
+- Five built-in format families shipped in the default registry,
+  covering the major open-weights backends:
+  - `qwen-xml` (Qwen3 / Qwen2.5: `<tool_call>{...}</tool_call>`).
+    Tolerates Hermes-style string `arguments`.
+  - `dsml` (DeepSeek-V3 / R1:
+    `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n\`\`\`json\n{...}\n\`\`\`<｜tool▁call▁end｜>`).
+    Tolerates batch wrapper, missing type prefix, missing fence.
+  - `llama-python-tag` (Llama 3.1 / 3.2 / 3.3:
+    `<|python_tag|>{"name":..., "parameters":...}<|eom_id|>`).
+    Accepts `arguments` as well as `parameters`.
+  - `mistral-tool-calls` (Mistral / Mixtral v3:
+    `[TOOL_CALLS][{"name":..., "arguments":...}]</s>`). Returns
+    the first call from a multi-call array; multi-call extraction
+    is a documented follow-up.
+  - `bare-json` (fallback for models that emit raw JSON without
+    delimiters).
+- New `erllama_server_tool_replay` DETS-backed exact-replay store
+  (supervised gen_server). Public ETS table for the O(1) hot-path
+  read; sibling DETS file under `<cache_root>/replay/replay.dets`
+  persists writes across restarts; periodic gc evicts rows past
+  the TTL. Configuration knobs: `tool_replay_dir`,
+  `tool_replay_ttl_ms` (default 30 days),
+  `tool_replay_gc_interval_ms` (default 1h). All optional with
+  sensible defaults.
+- Both `/v1/messages` and `/v1/chat/completions` consume the v0.5
+  tool-call wire when the model has `tool_call_markers` configured:
+  every `erllama_tool_call_end` triggers `tool_format:parse/2`, a
+  fresh `toolu_...` id is minted, the parsed JSON + raw `FullBin` +
+  model id are persisted in the replay map, and the corresponding
+  Anthropic SSE frames (`content_block_start` / `input_json_delta`
+  / `content_block_stop`) or OpenAI `chat.completion.chunk` with
+  `tool_calls` are emitted. The legacy `mode = tool_buffer` first-
+  byte heuristic stays as the fallback for models without
+  `tool_call_markers` set.
+- Render path in `erllama_server_pipeline` walks the message
+  history before `apply_chat_template/2` and consults the replay
+  map for every prior `tool_use` block. Outcome lands on the new
+  `erllama_tool_replay_lookups_total` counter, labelled by `model`
+  and `result` (`hit` / `miss` / `no_format`). Byte-exact splice
+  awaits an engine-side ask (return-rendered-string variant of
+  `apply_chat_template/2` or a verbatim content-block escape);
+  tracked locally and documented in the asks prompt.
+
+### Sticky-seq session id derivation + engine pin
+
+- New `erllama_server_session:derive/2` that yields a stable
+  `session_id` for every request via a layered chain:
+  `x-conversation-id` header > `metadata.user_id` >
+  `base64(sha256(model || first user message bytes))`. Stamped
+  onto `#erllama_request{}` in both handlers' fast phase. Per-
+  request stable id without requiring the SDK to send an explicit
+  conversation header.
+- Engine pin live: `build_params/1` now forwards the derived id
+  on `Params.session_id` to `erllama:infer/4`. The engine pins
+  the seq_id across turns so a continuing conversation truncates-
+  and-prefills in place on warm KV cells instead of restoring
+  from disk.
+- `{error, sticky_busy}` (two concurrent admits on the same
+  session) maps to 503 with retry-after; the Anthropic handler
+  remaps 503 to 529 so SDKs honour the documented backoff.
+- Handler `cleanup/1` calls `erllama:end_session/2` only when the
+  request was cancelled mid-flight (`received_done = false`).
+  Cleanly-completed turns leave the pinned session alive for
+  cross-turn KV reuse.
+- **Operational note**: with sticky pinning enabled, the engine's
+  `context_opts.n_seq_max` (default 1) must exceed the expected
+  concurrent-session count. A pinned session occupies a seq even
+  between its turns; with `n_seq_max=1` and traffic from more than
+  one session, admission deadlocks. Set
+  `n_seq_max => N` on the model's load config (typical N = 4 or
+  matching the queue's `concurrency`).
+
+### Cache-reuse profile (TinyLlama-1.1B, 3-turn conversation)
+
+`test/erllama_server_real_model_SUITE.erl:multi_turn_cache_delta_profile/1`
+drives a stable-session three-turn conversation and logs the
+per-turn `cache_read_input_tokens` / `cache_creation_input_tokens`:
+
+| Turn | input | output | cache_read | cache_creation |
+| --- | --- | --- | --- | --- |
+| 1 | 21 | 32 | 0 | 53 |
+| 2 | 73 | 32 | **0** | 105 |
+| 3 | 125 | 32 | 64 | 93 |
+
+Turn 2 sees zero sticky reuse even with `Params.session_id` pinned.
+The chat-template re-renders the first user turn differently in a
+multi-turn context, so the engine's strict-prefix check fails and
+admits cold. Turn 3 catches up via the disk cache (read=64).
+
+This rules out `prefill_only/3` server-side cache warming
+(originally PR 8): the bottleneck is **token-level prefix
+divergence from the chat template**, not lack of an explicit
+`parent_key` hint. The engine's natural longest-prefix walk on
+admit already finds every available reuse row; an explicit
+`prefill_only` call would compute the same prefix-match
+and arrive at the same `read` count. PR 8 is closed as wontfix.
+
+The leverage point is upstream: a chat-template rendering that
+keeps leading-turn bytes stable across single- and multi-turn
+calls, OR an engine-side primitive that splices the prior turn's
+stored tokens verbatim into the new prompt (effectively the
+verbatim-content escape already proposed for tool-call replay).
+Captured in `/Users/benoitc/Projects/erllama_anthropic_support_prompt.md`.
+
+### erllama 0.6.0: caller-asserted continuation (`continue/3`)
+
+The leverage-point ask above landed upstream as
+`erllama:continue/3`: the caller passes `(Model, SuffixTokens,
+Opts)`, the engine prefills only the suffix on top of the
+session's stored tokens without verifying the prefix. Two-PR
+integration:
+
+- Bump `rebar.config` to erllama 0.6.0. The new surface also
+  carries `cache_hit_kind = continuation` to make the call-path
+  distinguishable from engine-verified `sticky` reuse in Stats.
+- New `erllama_server_session_state` (supervised gen_server +
+  public ETS) caches `{Model, SessionId} -> committed_tokens`.
+  No disk persistence; restart drops the count and the next
+  turn falls back to a full `infer/4`.
+- Pipeline `accept_tokens/2` arms a continuation slice when a
+  prior count is on file:
+  `lists:nthtail(N, NewTokens)` becomes the suffix passed to
+  `erllama:continue/3`. First-turn / no-state requests still
+  take the `infer/4` path.
+- `{error, no_session}` from `continue/3` (TTL eviction, server
+  restart, end_session-from-cancel) clears the stale local
+  state and retries with the full token list via `infer/4`.
+- Both handlers stash `committed_tokens` from `erllama_done`
+  Stats; `maybe_end_session/1` on cancel-mid-flight clears the
+  local entry alongside the engine's.
+
+Profile against TinyLlama-1.1B with `continue/3` live:
+
+| Turn | input | output | cache_read | cache_creation |
+| --- | --- | --- | --- | --- |
+| 1 | 21 | 32 | 0 | 53 |
+| 2 | 73 | 32 | **53** | 52 |
+| 3 | 125 | 32 | **105** | 52 |
+
+Every turn after the first reuses the predecessor's entire
+committed state. `cache_creation` collapses to roughly the new
+tail plus the generated output. The
+`multi_turn_cache_delta_profile/1` CT case now asserts `Read2 > 0`
+and `Read3 > Read2` so a slicing or state regression fails the
+build.
+
+**Risk**: the slice is **optimistic** - `continue/3` does not
+verify that the suffix is the correct continuation of the
+engine's stored prefix. If a model's chat template re-renders
+prior turns differently across turns (different role-marker
+bytes), the model emits garbage tokens on the continuation path.
+The `cache_hit_kind = continuation` reported in Stats makes this
+diagnosable. TinyLlama is stable; production models need a
+per-model test against `multi_turn_cache_delta_profile/1` before
+relying on continuation.
+
+## [0.1.0] - 2026-05-11
+
+Initial public release. OpenAI-, Anthropic-, and Ollama-compatible
+HTTP server on top of `erllama`.
+
+### OpenAI surface
+
+- `POST /v1/chat/completions` (streaming + non-streaming)
+- `POST /v1/completions`
+- `POST /v1/embeddings`
+- `GET  /v1/models[/:id]` with alias passthrough
+- Tool / function calling via grammar-constrained sampling. Tool
+  arrays converted to JSON Schema then to GBNF and passed as the
+  `grammar` field on `erllama:infer/4`. Tool-call output buffered
+  and emitted as one final `tool_calls` frame.
+- `response_format` (`text`, `json_object`, `{type: "json_schema",
+  json_schema: {schema: ...}}`). All three compile to GBNF.
+
+### Anthropic surface
+
+- `POST /v1/messages` with named SSE events (`message_start`,
+  `content_block_start`, `content_block_delta`, `content_block_stop`,
+  `message_delta`, `message_stop`). No `[DONE]` sentinel.
+- Tool calling buffered as one `content_block_*` frame.
+- `thinking` parameter recognised; reasoning tokens flow as
+  `thinking_delta` events.
+
+### Ollama surface
+
+- `POST /api/generate` (streaming NDJSON / non-streaming). Empty
+  `prompt` triggers a preload returning
+  `{done: true, done_reason: "load", load_duration: N}`.
+- `POST /api/chat` (same semantics over messages).
+- `POST /api/embed` + `POST /api/embeddings` (legacy single-prompt).
+- `POST /api/pull` with HF, Ollama-registry, HTTPS, and `file://`
+  sources. NDJSON progress: `pulling manifest` -> `pulling sha256:...`
+  with rate-limited byte counts -> `verifying sha256 digest` ->
+  `writing manifest` -> `success`.
+- `GET  /api/tags`, `POST /api/show`, `POST /api/copy`,
+  `DELETE /api/delete`, `POST /api/create` (with `FROM`, `PARAMETER`,
+  `SYSTEM`, `TEMPLATE` directives), `POST /api/search`,
+  `GET /api/ps`, `GET /api/version`.
+- `keep_alive` parsing: integer seconds, duration strings
+  (`"5m"`, `"30s"`, `"1h"`), `0` to unload immediately, `-1` /
+  negative to keep loaded forever. `0` triggers a synchronous
+  unload so the response is a real acknowledgement.
+- `format: "json"` and `format: {schema}` for structured output.
+  Both compile to GBNF via the same path the OpenAI
+  `response_format` uses.
+
+### Registry
+
+- Models stored under `<cache_root>/manifests/<name>/<tag>.json`,
+  blobs deduplicated under `<cache_root>/blobs/sha256-<hex>.gguf`.
+- GGUF metadata reader (`erllama_server_gguf`, pure Erlang, no
+  NIF). Extracts architecture, family, parameter size,
+  quantisation, context length, embedding length, chat template
+  at pull time. Stored verbatim in the manifest.
+- Manifest Modelfile overrides: `system`, `template`,
+  `parameters` (which `loader` merges into the
+  `erllama:load_model/2` opts).
+
+### Inference plumbing
+
+- Per-model loader: `erllama_server_loader` spawns a monitored
+  worker for `erllama:load_model/2` so the gen_server stays
+  responsive while a load is in flight. Subscribers receive
+  `{erllama_load_progress, ModelId}` every 2 s and
+  `{erllama_load_done, ModelId, ok | {error, _}}` exactly once.
+- Pipeline forwards load progress as `{pipeline, loading, _}`;
+  chat handlers emit `: loading\n\n` SSE comments and Anthropic
+  `event: ping` events so clients see activity during multi-second
+  loads.
+- Per-model keepalive (`erllama_server_keepalive`) with active
+  request counter. Eviction timer only arms when active count
+  reaches zero, so long generations never trigger a mid-stream
+  unload.
+- Per-model FIFO semaphore queue with `pool_exhausted` returning
+  429. `concurrency`, `depth`, `timeout_ms` configurable per model.
+- Cancel-on-disconnect: TCP close fires `terminate/3`, which calls
+  `erllama:cancel/1`, releases the queue slot, kills the pipeline
+  worker.
+- Cowboy listener `idle_timeout` bumped to 30 min (configurable
+  via `{idle_timeout_ms, _}`) so long fetches / loads do not get
+  closed at cowboy's default 60 s.
+- Loader `manifest_to_config/1` caps `context_size` at
+  `max_context_size` (default 4096) so models advertising 128 K
+  contexts in their GGUF do not OOM at load time.
+- Pipeline wraps every call into `erllama` in try/catch; a
+  crashing model gen_statem returns a 500 JSON envelope or an
+  SSE / Anthropic error frame instead of killing the cowboy
+  request process.
+
+### Observability
+
+- `instrument`-backed metrics with Prometheus text format at
+  `/metrics`. Counters, gauges, and histograms for requests,
+  prefill / generation latency, tokens, queue depth, active
+  streams.
+- `GET /health` (liveness) and `GET /health/ready` (readiness).
+- `X-Request-ID` propagation: echoed if present, minted as
+  `req_<int>` if absent.
+- Per-request access log via a Cowboy `stream_handler`.
+
+### CORS
+
+- Off by default. When set to a map, full preflight handling +
+  `Access-Control-Allow-*` headers on every response. Allow-list
+  and `max_age` configurable.
+
+### CLI
+
+- `erllama` escript (`rebar3 escriptize` -> `_build/default/bin/erllama`).
+  Subcommands: `pull`, `list` (ls), `ps`, `show`, `rm` (delete),
+  `copy` (cp), `search`, `run`, `embed`, `unload`, `version`, `help`.
+- Talks to the daemon over HTTP. Base URL via `ERLLAMA_HOST`
+  (default `http://127.0.0.1:8080`).
+
+### Body-shape caps
+
+- `max_messages` (default 1024), `max_tools` (default 128),
+  `max_request_body_bytes` (default 1 MiB), `max_embedding_inputs`
+  (default 256). Bad inputs return 400 before the slow phase.
+
+### Tooling
+
+- erlfmt + rebar3_lint + dialyzer + xref integration with
+  project-specific rule overrides.
+- 127 eunit + 106 CT cases. CT real-model suite (`LLAMA_TEST_MODEL`
+  gated) for end-to-end smoke against an actual GGUF.
+- OpenAPI 3.1 spec at `openapi.yaml`.
+- GitHub Actions CI (format, lint, xref, dialyzer, build matrix
+  ubuntu + macos, eunit, ct).
+
+### Out of scope for 0.1
+
+- `POST /api/push` (publish to registry).
+- Multi-modal inputs (images, audio).
+- Modelfile `ADAPTER` (LoRA), `MESSAGE`, `LICENSE` directives.
+- On-the-fly quantisation.
+- Garbage collection of orphan blobs (deleting a manifest leaves
+  the blob in place even if no other manifest references it).

@@ -1,0 +1,89 @@
+# CUDA-enabled build. Compiles erllama's llama.cpp NIF with
+# `-DGGML_CUDA=ON` so the model offloads to NVIDIA GPUs at load
+# time (set `loader.n_gpu_layers` in the manifest, or pass through
+# `model_default_opts` in sys.config).
+#
+# Run with --gpus all (or --runtime=nvidia):
+#   docker run --gpus all -p 8080:8080 \
+#     -v erllama-cache:/home/erllama/.cache \
+#     ghcr.io/erllama/erllama_server:cuda
+#
+# The build uses a multi-stage layout: erlang:28-bookworm + CUDA
+# toolkit for compilation, then an nvidia/cuda runtime image with
+# just the assembled release. Both stages share glibc-based Debian
+# / Ubuntu so the NIF's libstdc++ ABI matches.
+
+ARG OTP_VERSION=28
+ARG DEBIAN_VERSION=bookworm
+ARG CUDA_VERSION=12.4.1
+
+# ============================================================================
+# Stage 1: builder (Erlang + CUDA toolkit on Debian)
+# ============================================================================
+FROM erlang:${OTP_VERSION}-${DEBIAN_VERSION} AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl gnupg ca-certificates cmake build-essential git \
+    && curl -fsSL \
+       https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
+       -o cuda-keyring.deb \
+    && dpkg -i cuda-keyring.deb \
+    && rm cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       cuda-toolkit-12-4 \
+       libcurand-dev-12-4 libcublas-dev-12-4 libcusparse-dev-12-4 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/usr/local/cuda/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
+    CUDA_PATH=/usr/local/cuda \
+    ERLLAMA_OPTS="-DGGML_CUDA=ON -DGGML_NATIVE=OFF"
+
+WORKDIR /src
+
+# Cache deps separately from sources.
+COPY rebar.config rebar.lock ./
+RUN rebar3 deps
+
+COPY src ./src
+COPY include ./include
+COPY config ./config
+COPY LICENSE ./
+
+RUN rebar3 as prod release
+
+# ============================================================================
+# Stage 2: runtime (NVIDIA CUDA runtime + the assembled release)
+# ============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 libgomp1 libssl3 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash erllama
+
+WORKDIR /opt/erllama_server
+
+COPY --from=builder --chown=erllama:erllama \
+     /src/_build/prod/rel/erllama_server ./
+
+USER erllama
+
+# XDG cache lives under the user's home so a bind mount survives
+# image rebuilds.
+ENV XDG_CACHE_HOME=/home/erllama/.cache
+
+# NVIDIA Container Runtime exposes these at run time; declaring them
+# makes `docker run --gpus all` enable compute + utility caps by
+# default.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+
+ENTRYPOINT ["./bin/erllama_server"]
+CMD ["foreground"]
