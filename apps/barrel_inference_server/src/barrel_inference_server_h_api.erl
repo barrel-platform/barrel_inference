@@ -21,7 +21,7 @@
     name :: binary(),
     tag :: binary(),
     spec :: binary(),
-    job_ref :: undefined | binary(),
+    coord :: undefined | pid(),
     last_progress = 0 :: integer()
 }).
 
@@ -50,7 +50,11 @@ init(Req0, #{op := version} = Opts) ->
 init(Req0, #{op := ps} = Opts) ->
     expect(<<"GET">>, Req0, Opts, fun handle_ps/2).
 
-info({barrel_inference_fetch_progress, Ref, Bytes, Total}, Req, #pull{job_ref = Ref} = St) ->
+%% Pull progress/status/outcome events come from the per-pull coordinator
+%% (barrel_inference_server_pull), which owns persistence. The handler only
+%% relays them to the client as NDJSON; if it dies, the coordinator still
+%% finishes and persists.
+info({pull_event, Coord, {progress, Bytes, Total}}, Req, #pull{coord = Coord} = St) ->
     Now = erlang:monotonic_time(millisecond),
     case Now - St#pull.last_progress >= 100 of
         true ->
@@ -59,8 +63,20 @@ info({barrel_inference_fetch_progress, Ref, Bytes, Total}, Req, #pull{job_ref = 
         false ->
             {ok, Req, St}
     end;
-info({barrel_inference_fetch_done, Ref, Result}, Req, #pull{job_ref = Ref} = St) ->
-    finalise_pull(Req, St, Result);
+info({pull_event, Coord, {phase, Phase}}, Req, #pull{coord = Coord} = St) ->
+    ok = ndjson_line(Req, #{<<"status">> => atom_to_binary(Phase, utf8)}),
+    {ok, Req, St};
+info({pull_event, Coord, {status, Status}}, Req, #pull{coord = Coord} = St) ->
+    ok = ndjson_line(Req, #{<<"status">> => Status}),
+    {ok, Req, St};
+info({pull_event, Coord, {success, _Manifest}}, Req, #pull{coord = Coord} = St) ->
+    ok = ndjson_line(Req, #{<<"status">> => <<"success">>}),
+    cowboy_req:stream_body(<<>>, fin, Req),
+    {stop, Req, St};
+info({pull_event, Coord, {error, Reason}}, Req, #pull{coord = Coord} = St) ->
+    ok = ndjson_line(Req, error_body(reason_string(Reason))),
+    cowboy_req:stream_body(<<>>, fin, Req),
+    {stop, Req, St};
 info(_, Req, St) ->
     {ok, Req, St}.
 
@@ -491,12 +507,42 @@ pick_tag(undefined, Default) -> Default;
 pick_tag(<<>>, Default) -> Default;
 pick_tag(Tag, _) when is_binary(Tag) -> Tag.
 
+%% Non-streaming pull. Drive the same coordinator, but block on its
+%% outcome. On timeout we reply with an HTTP error yet leave the
+%% coordinator running, so the download still completes and the manifest
+%% still persists in the background.
 blocking_pull(Req0, Opts, Spec, Name, Tag) ->
-    case barrel_inference_server_models:pull(Spec, #{name => Name, tag => Tag}) of
-        {ok, _} ->
-            reply(Req0, Opts, 200, #{<<"status">> => <<"success">>});
+    case barrel_inference_server_pull_sup:start_pull(Spec, Name, Tag, #{}, [self()]) of
+        {ok, Coord} ->
+            Mon = monitor(process, Coord),
+            Timeout = application:get_env(
+                barrel_inference_server, pull_blocking_timeout_ms, 1800000
+            ),
+            await_blocking_pull(Req0, Opts, Coord, Mon, Timeout);
         {error, Reason} ->
             reply(Req0, Opts, 500, error_body(reason_string(Reason)))
+    end.
+
+await_blocking_pull(Req0, Opts, Coord, Mon, Timeout) ->
+    receive
+        {pull_event, Coord, {success, _Manifest}} ->
+            demonitor(Mon, [flush]),
+            reply(Req0, Opts, 200, #{<<"status">> => <<"success">>});
+        {pull_event, Coord, {error, Reason}} ->
+            demonitor(Mon, [flush]),
+            reply(Req0, Opts, 500, error_body(reason_string(Reason)));
+        {pull_event, Coord, _Other} ->
+            await_blocking_pull(Req0, Opts, Coord, Mon, Timeout);
+        {'DOWN', Mon, process, Coord, _Reason} ->
+            reply(Req0, Opts, 500, error_body(<<"pull failed">>))
+    after Timeout ->
+        demonitor(Mon, [flush]),
+        reply(
+            Req0,
+            Opts,
+            504,
+            error_body(<<"pull timed out; continuing in background">>)
+        )
     end.
 
 stream_pull(Req0, Spec, Name, Tag) ->
@@ -504,16 +550,13 @@ stream_pull(Req0, Spec, Name, Tag) ->
         200, #{<<"content-type">> => <<"application/x-ndjson">>}, Req0
     ),
     ok = ndjson_line(Req1, #{<<"status">> => <<"pulling manifest">>}),
-    case
-        barrel_inference_server_fetch:fetch_async(
-            Spec, #{progress => self()}
-        )
-    of
-        {ok, JobRef} ->
-            St = #pull{name = Name, tag = Tag, spec = Spec, job_ref = JobRef},
+    case barrel_inference_server_pull_sup:start_pull(Spec, Name, Tag, #{}, [self()]) of
+        {ok, Coord} ->
+            St = #pull{name = Name, tag = Tag, spec = Spec, coord = Coord},
             {cowboy_loop, Req1, St, hibernate};
         {error, Reason} ->
             ok = ndjson_line(Req1, error_body(reason_string(Reason))),
+            cowboy_req:stream_body(<<>>, fin, Req1),
             {ok, Req1, #pull{name = Name, tag = Tag, spec = Spec}}
     end.
 
@@ -527,24 +570,6 @@ ndjson_progress(Req, St, Bytes, Total) ->
 
 digest_status(#pull{spec = Spec}) ->
     iolist_to_binary([<<"pulling ">>, Spec]).
-
-finalise_pull(Req, #pull{name = Name, tag = Tag, spec = Spec} = St, {ok, BlobPath}) ->
-    ok = ndjson_line(Req, #{<<"status">> => <<"verifying sha256 digest">>}),
-    case barrel_inference_server_models:persist_manifest(Spec, Name, Tag, BlobPath) of
-        {ok, _} ->
-            ok = ndjson_line(Req, #{<<"status">> => <<"writing manifest">>}),
-            ok = ndjson_line(Req, #{<<"status">> => <<"success">>}),
-            cowboy_req:stream_body(<<>>, fin, Req),
-            {stop, Req, St};
-        {error, Reason} ->
-            ok = ndjson_line(Req, error_body(reason_string(Reason))),
-            cowboy_req:stream_body(<<>>, fin, Req),
-            {stop, Req, St}
-    end;
-finalise_pull(Req, St, {error, Reason}) ->
-    ok = ndjson_line(Req, error_body(reason_string(Reason))),
-    cowboy_req:stream_body(<<>>, fin, Req),
-    {stop, Req, St}.
 
 %% =============================================================================
 %% Utilities

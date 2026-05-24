@@ -481,7 +481,13 @@ stream_recv_ndjson(Ref, Buf, State) ->
         {hackney_response, Ref, done} ->
             {_, State1} = print_ndjson_lines(<<Buf/binary, "\n">>, State),
             _ = finalize_progress(State1),
-            ok;
+            %% A 200 stream can still carry an {"error": ...} event
+            %% (the status line is sent before the outcome is known),
+            %% so surface it as a non-zero exit rather than a clean ok.
+            case maps:get(last_error, State1, undefined) of
+                undefined -> ok;
+                Err -> {error, {pull, Err}}
+            end;
         {hackney_response, Ref, {error, Reason}} ->
             _ = finalize_progress(State),
             {error, Reason};
@@ -526,7 +532,12 @@ print_ndjson_lines(Buf, State) ->
 %% starts. In non-TTY mode (pipe / CI / logs) we keep the old
 %% line-per-update output so the stream stays parseable.
 progress_state() ->
-    #{last_status => undefined, on_progress_line => false, tty => is_tty()}.
+    #{
+        last_status => undefined,
+        last_error => undefined,
+        on_progress_line => false,
+        tty => is_tty()
+    }.
 
 is_tty() ->
     case io:columns() of
@@ -562,7 +573,7 @@ render_event(#{<<"status">> := S}, State) ->
 render_event(#{<<"error">> := E}, State) ->
     State1 = finalize_progress(State),
     io:put_chars(io_lib:format("error: ~ts~n", [E])),
-    State1;
+    State1#{last_error => E};
 render_event(Other, State) ->
     State1 = finalize_progress(State),
     io:put_chars(io_lib:format("~p~n", [Other])),

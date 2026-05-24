@@ -161,12 +161,16 @@ decode(Bin) ->
 
 write_atomic(Path, Bin) ->
     Tmp = <<(to_bin(Path))/binary, ".tmp">>,
-    ok = filelib:ensure_dir(Path),
-    case file:write_file(Tmp, Bin) of
+    case filelib:ensure_dir(Path) of
         ok ->
-            case file:rename(Tmp, Path) of
-                ok -> ok;
-                {error, _} = E -> E
+            case file:write_file(Tmp, Bin) of
+                ok ->
+                    case file:rename(Tmp, Path) of
+                        ok -> ok;
+                        {error, _} = E -> E
+                    end;
+                {error, _} = E ->
+                    E
             end;
         {error, _} = E ->
             E
