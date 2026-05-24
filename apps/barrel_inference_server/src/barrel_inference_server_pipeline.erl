@@ -40,6 +40,8 @@
 -export([start_link/2, abort/1]).
 %% Exported for unit tests (pure).
 -export([build_params/1]).
+%% Exported for unit tests (grammar-skip decision; step_grammar/1 is private).
+-export([build_grammar/1]).
 %% Exported for unit tests (timeout + worker-kill behavior).
 -export([call_engine/3]).
 
@@ -266,8 +268,21 @@ apply_chat_template_with_truncate(W, System, Tools, Messages) ->
             E
     end.
 
-render_template(W, System, Tools, Messages) ->
+render_template(W, System0, Tools0, Messages) ->
     ModelId = model_id(W),
+    %% On the native tool path, render the model's own tool block into the
+    %% system prompt (with schemas) and stop passing `tools' to the NIF so
+    %% it doesn't also append its prose list. Gating on native_turn/1 (not
+    %% the model alone) guarantees Tools0 is a non-empty list and
+    %% tool_choice = auto here. Same decision as build_grammar/1, so the
+    %% skip and the render stay in lockstep.
+    {System, Tools} =
+        case barrel_inference_server_tool_format:native_turn(W#work.request) of
+            {ok, Mod} ->
+                {barrel_inference_server_tool_format:render(Mod, Tools0, System0), undefined};
+            none ->
+                {System0, Tools0}
+        end,
     Req = #{messages => Messages, system => System, tools => Tools},
     Call = fun() -> barrel_inference:apply_chat_template(ModelId, Req) end,
     case call_engine_with_recovery(W, Call, apply_chat_template) of
@@ -509,25 +524,37 @@ context_size(ModelId) ->
 
 step_grammar(W) ->
     R = W#work.request,
-    %% Tools-driven grammar wins if a non-empty tools array is set.
-    %% Otherwise honour the response_format / format directive.
-    Build =
-        case has_tools(R) of
-            true ->
-                barrel_inference_server_grammar:from_tools(
-                    R#barrel_inference_request.tools, R#barrel_inference_request.tool_choice
-                );
-            false ->
-                barrel_inference_server_grammar:from_response_format(
-                    R#barrel_inference_request.response_format
-                )
-        end,
-    case Build of
+    case build_grammar(R) of
         {ok, Bin} ->
             W1 = W#work{request = R#barrel_inference_request{grammar = nullable_bin(Bin)}},
             {ok, W1};
         {error, Reason} ->
             {error, 400, Reason}
+    end.
+
+%% Decide the grammar source for a request. On the native free-decode
+%% tool path (marker model + native renderer + tool_choice = auto) emit
+%% an empty grammar so the model decodes freely and the marker capture
+%% path (barrel_inference_tool_call_end) collects the calls - the GBNF
+%% grammar is ~40x slower per token and pure overhead there. Otherwise:
+%% a non-empty tools array builds the tool grammar, else the
+%% response_format / format directive drives it. nullable_bin/1 maps the
+%% empty grammar to `undefined' (no constraint).
+build_grammar(R) ->
+    case barrel_inference_server_tool_format:native_turn(R) of
+        {ok, _Format} ->
+            {ok, <<>>};
+        none ->
+            case has_tools(R) of
+                true ->
+                    barrel_inference_server_grammar:from_tools(
+                        R#barrel_inference_request.tools, R#barrel_inference_request.tool_choice
+                    );
+                false ->
+                    barrel_inference_server_grammar:from_response_format(
+                        R#barrel_inference_request.response_format
+                    )
+            end
     end.
 
 has_tools(#barrel_inference_request{tools = undefined}) -> false;

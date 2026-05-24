@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Native tool-call prompting and the no-grammar fast path. A model whose
+  manifest declares `loader.tool_call_format` + valid `loader.tool_call_markers`
+  and whose format module implements the new optional `render_prompt/2` callback
+  now renders tools in the model's own format (with full JSON schemas) and skips
+  the GBNF tool grammar under `tool_choice = auto`. The engine captures the calls
+  from its markers on free decode, so a tool request completes in ~chat latency
+  instead of wedging on grammar-constrained sampling. `render_prompt/2` ships for
+  `qwen-xml`, `dsml` (DeepSeek), `llama-python-tag`, and `mistral-tool-calls`;
+  `barrel_inference_server_tool_format:native_turn/1` is the single gate shared by the
+  pipeline (skip grammar + render) and the handlers (suppress the legacy
+  first-byte tool_buffer heuristic). `required`/`named`/non-marker requests keep
+  the grammar.
+- Parallel tool calls. The model can emit several tool calls in one generation;
+  all three handlers (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`)
+  accumulate them and surface N `tool_use` / `tool_calls` / function-call items
+  (streaming and non-streaming). `parallel_tool_calls = false` (and Anthropic
+  `tool_choice.disable_parallel_tool_use`) caps the turn to the first call.
+  Server-side executor calls in one turn run concurrently via a coordinator
+  (`barrel_inference_server_tool_batch`) and re-infer once; a mixed batch runs the
+  server calls and continues the turn (client calls deferred to that
+  continuation), so a turn never both continues and finishes.
 - Embeddings support for embedding GGUFs. The pull pipeline detects embedding
   models from GGUF metadata (`barrel_inference_server_gguf:is_embedding_model/1`:
   a declared `*.pooling_type`, or a bidirectional-encoder architecture like
