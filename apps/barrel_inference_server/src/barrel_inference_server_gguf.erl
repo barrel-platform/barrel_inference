@@ -32,7 +32,9 @@ quantization, chat_template, tokenizer_model.
     embedding_length/1,
     quantization/1,
     chat_template/1,
-    tokenizer_model/1
+    tokenizer_model/1,
+    pooling_type/1,
+    is_embedding_model/1
 ]).
 
 -export_type([gguf_metadata/0, gguf_value/0]).
@@ -115,6 +117,33 @@ context_length(M) ->
 -spec embedding_length(gguf_metadata()) -> pos_integer() | undefined.
 embedding_length(M) ->
     arch_int(<<".embedding_length">>, M).
+
+%% Pooling type for embedding models, as the GGUF uint enum
+%% (1=mean, 2=cls, 3=last). `arch_int/2` already drops 0 (none) and
+%% absent, so a defined result means the model pools into a sentence
+%% embedding.
+-spec pooling_type(gguf_metadata()) -> pos_integer() | undefined.
+pooling_type(M) ->
+    arch_int(<<".pooling_type">>, M).
+
+%% A GGUF is an embedding model if it declares a real pooling type, or
+%% uses a known bidirectional-encoder architecture. Conservative: a plain
+%% decoder LM returns false (it stays generative; embeddings 501 there).
+-spec is_embedding_model(gguf_metadata()) -> boolean().
+is_embedding_model(M) ->
+    case pooling_type(M) of
+        P when is_integer(P) ->
+            true;
+        _ ->
+            lists:member(architecture(M), [
+                <<"bert">>,
+                <<"nomic-bert">>,
+                <<"jina-bert">>,
+                <<"jina-bert-v2">>,
+                <<"gte">>,
+                <<"new">>
+            ])
+    end.
 
 -spec quantization(gguf_metadata()) -> binary() | undefined.
 quantization(M) ->

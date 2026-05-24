@@ -34,6 +34,7 @@
     pull_detects_thinking_tag_thinking_markers/1,
     pull_leaves_thinking_markers_unset_when_no_tags/1,
     pull_caps_large_context/1,
+    pull_detects_embedding_model/1,
     pull_coordinator_persists_after_subscriber_dies/1,
     pull_coordinator_reports_success_to_subscriber/1,
     pull_coordinator_persist_error_reports_error/1
@@ -67,6 +68,7 @@ all() ->
         pull_detects_thinking_tag_thinking_markers,
         pull_leaves_thinking_markers_unset_when_no_tags,
         pull_caps_large_context,
+        pull_detects_embedding_model,
         pull_coordinator_persists_after_subscriber_dies,
         pull_coordinator_reports_success_to_subscriber,
         pull_coordinator_persist_error_reports_error
@@ -279,6 +281,18 @@ pull_caps_large_context(Config) ->
     ?assertEqual(32768, maps:get(<<"context_size">>, M)),
     ?assertEqual(32768, maps:get(<<"n_ctx">>, maps:get(<<"loader">>, M))).
 
+%% An embedding GGUF (declared pooling type) is flagged in the manifest so
+%% the loader opens its context in embeddings mode.
+pull_detects_embedding_model(Config) ->
+    Cwd = ?config(cwd, Config),
+    Path = filename:join(Cwd, "embed.gguf"),
+    ok = file:write_file(Path, embed_gguf()),
+    Spec = list_to_binary("file://" ++ Path),
+    {ok, M} = barrel_inference_server_models:pull(Spec, #{
+        name => <<"embed">>, tag => <<"latest">>
+    }),
+    ?assertEqual(true, maps:get(<<"embeddings">>, maps:get(<<"loader">>, M))).
+
 %% The pull coordinator (barrel_inference_server_pull) owns the fetch +
 %% manifest persistence so a completed download always registers, even
 %% if the HTTP handler that requested it has gone away. A file:// spec
@@ -414,6 +428,20 @@ synthetic_gguf(Template, CtxLen) ->
         {<<"general.temperature">>, ?T_FLOAT32, 0.8},
         {<<"tokenizer.chat_template">>, ?T_STRING, Template},
         {<<"tokenizer.ggml.model">>, ?T_STRING, <<"gpt2">>}
+    ],
+    Body = iolist_to_binary([encode_kv(K, T, V) || {K, T, V} <- KVs]),
+    <<"GGUF", 3:32/little, 0:64/little, (length(KVs)):64/little, Body/binary>>.
+
+%% A minimal embedding-model GGUF: bidirectional arch + a declared pooling
+%% type, which barrel_inference_server_gguf:is_embedding_model/1 detects.
+embed_gguf() ->
+    KVs = [
+        {<<"general.architecture">>, ?T_STRING, <<"nomic-bert">>},
+        {<<"nomic-bert.context_length">>, ?T_UINT32, 2048},
+        {<<"nomic-bert.embedding_length">>, ?T_UINT32, 768},
+        {<<"nomic-bert.pooling_type">>, ?T_UINT32, 1},
+        {<<"general.file_type">>, ?T_UINT32, 15},
+        {<<"tokenizer.ggml.model">>, ?T_STRING, <<"bert">>}
     ],
     Body = iolist_to_binary([encode_kv(K, T, V) || {K, T, V} <- KVs]),
     <<"GGUF", 3:32/little, 0:64/little, (length(KVs)):64/little, Body/binary>>.

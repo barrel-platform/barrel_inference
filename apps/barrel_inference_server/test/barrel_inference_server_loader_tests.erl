@@ -309,6 +309,30 @@ manifest_to_config_ignores_zero_n_seq_max_test() ->
     CtxOpts = maps:get(context_opts, Config),
     ?assertNot(maps:is_key(n_seq_max, CtxOpts)).
 
+%% `loader.embeddings = true` opens the context in embeddings mode so
+%% barrel_inference:embed/2 returns vectors (set at pull for embedding GGUFs).
+manifest_to_config_propagates_embeddings_test() ->
+    Manifest = (manifest(<<"sha256:000c">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{<<"quant_bits">> => 4, <<"embeddings">> => true}
+    },
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    CtxOpts = maps:get(context_opts, Config),
+    ?assertEqual(true, maps:get(embeddings, CtxOpts)).
+
+manifest_to_config_omits_embeddings_when_absent_test() ->
+    Manifest = manifest(<<"sha256:000d">>, <<"q4_k_m">>, 4096, 4),
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ?assertNot(maps:is_key(embeddings, maps:get(context_opts, Config))).
+
+%% `parameters.embeddings` (an /api/edit override) wins over the loader.
+manifest_to_config_parameters_embeddings_overrides_test() ->
+    Manifest = (manifest(<<"sha256:000e">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{<<"quant_bits">> => 4},
+        <<"parameters">> => #{<<"embeddings">> => true}
+    },
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ?assertEqual(true, maps:get(embeddings, maps:get(context_opts, Config))).
+
 %% =============================================================================
 %% default_opts/1
 %% =============================================================================
