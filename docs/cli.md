@@ -1,0 +1,1 @@
+../apps/barrel_inference_cli/README.md

@@ -10,5 +10,6 @@ rebar3.crashdump
 
 # Generated docs
 /doc/
+/_site/
 
 .DS_Store

@@ -42,6 +42,21 @@ Or with Docker:
 
     docker compose up
 
+## Documentation
+
+One site covers the whole project, for both operators and contributors:
+<https://barrel-platform.github.io/barrel_inference/>. It is a mkdocs build at
+the repo root (`mkdocs.yml`, `docs/`) that surfaces each app's guides in place.
+
+Function-level API reference ships per package on hexdocs:
+[barrel_inference](https://hexdocs.pm/barrel_inference) and
+[barrel_inference_server](https://hexdocs.pm/barrel_inference_server).
+
+Build the site locally:
+
+    pip install -r docs-requirements.txt
+    mkdocs serve
+
 ## License
 
 MIT. Part of the [barrel-platform](https://github.com/barrel-platform) project.

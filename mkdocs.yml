@@ -1,0 +1,121 @@
+site_name: Barrel Inference
+site_description: >
+  OTP-native LLM inference for the BEAM. Dirty NIFs over llama.cpp, supervised
+  per-model processes, a token-exact tiered KV cache, and an OpenAI-,
+  Anthropic-, and Ollama-compatible HTTP daemon on top.
+site_url: https://barrel-platform.github.io/barrel_inference/
+repo_url: https://github.com/barrel-platform/barrel_inference
+repo_name: barrel-platform/barrel_inference
+
+# The site is assembled at the umbrella root. Each app's guides/ and internals/
+# are symlinked into docs/ (nested per app so their relative links resolve),
+# so the prose lives once in the app that ships it to Hex and is surfaced here
+# as one site. Function-level API reference stays on hexdocs.pm via ex_doc.
+docs_dir: docs
+site_dir: _site
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: '(prefers-color-scheme: light)'
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: '(prefers-color-scheme: dark)'
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - render_swagger:
+      allow_arbitrary_locations: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      # Resolved against the process cwd (repo root). The server changelog
+      # page pulls in apps/barrel_inference_server/CHANGELOG.md.
+      base_path:
+        - apps/barrel_inference_server
+        - apps/barrel_inference
+        - .
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Home: index.md
+  - Server overview: server/guides/index.md
+  - Running it:
+      - Quickstart: server/guides/quickstart.md
+      - CLI reference: cli.md
+      - HTTP API: server/guides/api.md
+      - OpenAPI spec: server/guides/openapi.md
+      - Clients & SDKs: server/guides/clients.md
+      - Server-side tools: server/guides/tools.md
+      - Model registry: server/guides/registry.md
+      - Fetching models: server/guides/fetching.md
+      - Sizing: server/guides/sizing.md
+      - Deployment: server/guides/deployment.md
+  - Runtime library:
+      - Loading a model: runtime/guides/loading.md
+      - Configuration: runtime/guides/configuration.md
+      - Caching: runtime/guides/caching.md
+      - Tool calls: runtime/guides/tool-calls.md
+      - Examples: runtime/guides/examples.md
+      - Building from source: runtime/guides/building.md
+  - Internals:
+      - Cache design: runtime/internals/cache-design.md
+      - Request lifecycle: runtime/internals/request-lifecycle.md
+      - Publish protocol: runtime/internals/publish-protocol.md
+      - NIF safety: runtime/internals/nif-safety.md
+      - C safety audit: runtime/internals/c-safety-audit.md
+      - Updating llama.cpp: runtime/UPDATE_LLAMA.md
+  - API reference:
+      - barrel_inference (hexdocs): https://hexdocs.pm/barrel_inference
+      - barrel_inference_server (hexdocs): https://hexdocs.pm/barrel_inference_server
+  - Changelog: server/guides/changelog.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/barrel-platform/barrel_inference
+
+copyright: Copyright &copy; 2026 Benoit Chesneau
