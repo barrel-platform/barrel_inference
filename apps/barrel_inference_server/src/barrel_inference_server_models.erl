@@ -42,6 +42,7 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
     copy/2,
     resolve_spec/1,
     persist_manifest/4,
+    persist_manifest_overrides/5,
     cache_root/0
 ]).
 

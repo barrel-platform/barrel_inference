@@ -95,6 +95,17 @@ init([]) ->
             shutdown => 5000
         },
 
+        %% Per-pull coordinators. Owns fetch + manifest persistence
+        %% independent of the HTTP handler, so a completed download
+        %% always registers. Depends on fetch_sup/fetch_srv, so it sits
+        %% after them in this rest_for_one list.
+        #{
+            id => barrel_inference_server_pull_sup,
+            start => {barrel_inference_server_pull_sup, start_link, []},
+            type => supervisor,
+            shutdown => infinity
+        },
+
         #{
             id => barrel_inference_server_keepalive,
             start => {barrel_inference_server_keepalive, start_link, []},

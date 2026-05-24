@@ -33,7 +33,10 @@
     pull_detects_think_tag_thinking_markers/1,
     pull_detects_thinking_tag_thinking_markers/1,
     pull_leaves_thinking_markers_unset_when_no_tags/1,
-    pull_caps_large_context/1
+    pull_caps_large_context/1,
+    pull_coordinator_persists_after_subscriber_dies/1,
+    pull_coordinator_reports_success_to_subscriber/1,
+    pull_coordinator_persist_error_reports_error/1
 ]).
 
 %% GGUF value type tags (mirroring the gguf parser).
@@ -63,7 +66,10 @@ all() ->
         pull_detects_think_tag_thinking_markers,
         pull_detects_thinking_tag_thinking_markers,
         pull_leaves_thinking_markers_unset_when_no_tags,
-        pull_caps_large_context
+        pull_caps_large_context,
+        pull_coordinator_persists_after_subscriber_dies,
+        pull_coordinator_reports_success_to_subscriber,
+        pull_coordinator_persist_error_reports_error
     ].
 
 init_per_suite(Config) ->
@@ -273,9 +279,99 @@ pull_caps_large_context(Config) ->
     ?assertEqual(32768, maps:get(<<"context_size">>, M)),
     ?assertEqual(32768, maps:get(<<"n_ctx">>, maps:get(<<"loader">>, M))).
 
+%% The pull coordinator (barrel_inference_server_pull) owns the fetch +
+%% manifest persistence so a completed download always registers, even
+%% if the HTTP handler that requested it has gone away. A file:// spec
+%% resolves as a cache hit, so the coordinator can run without the fetch
+%% srv; we start it directly via start_link/5.
+
+pull_coordinator_persists_after_subscriber_dies(Config) ->
+    Spec = file_spec(Config),
+    %% Only subscriber is a pid that is already dead before the
+    %% coordinator emits anything (models the handler that timed out).
+    Dead = spawn(fun() -> ok end),
+    wait_down(Dead),
+    {ok, Coord} = barrel_inference_server_pull:start_link(
+        Spec, <<"coord-survivor">>, <<"latest">>, #{}, [Dead]
+    ),
+    ok = wait_down(Coord),
+    {ok, M} = barrel_inference_server_models:get(<<"coord-survivor">>),
+    ?assertEqual(<<"coord-survivor">>, maps:get(<<"name">>, M)),
+    ?assertEqual(<<"latest">>, maps:get(<<"tag">>, M)).
+
+pull_coordinator_reports_success_to_subscriber(Config) ->
+    Spec = file_spec(Config),
+    {ok, Coord} = barrel_inference_server_pull:start_link(
+        Spec, <<"sub-model">>, <<"v9">>, #{}, [self()]
+    ),
+    Events = collect_events(Coord, []),
+    ?assert(lists:member({status, <<"verifying sha256 digest">>}, Events)),
+    ?assert(lists:member({status, <<"writing manifest">>}, Events)),
+    ?assert(
+        lists:any(
+            fun
+                ({success, _}) -> true;
+                (_) -> false
+            end,
+            Events
+        )
+    ),
+    {ok, M} = barrel_inference_server_models:get(<<"sub-model:v9">>),
+    ?assertEqual(<<"sub-model">>, maps:get(<<"name">>, M)).
+
+pull_coordinator_persist_error_reports_error(Config) ->
+    %% A read-only cache makes the manifest write fail; the coordinator
+    %% must report an error event (not crash) and register nothing.
+    RoCache = filename:join(?config(cwd, Config), "ro_cache"),
+    ok = file:make_dir(RoCache),
+    ok = file:change_mode(RoCache, 8#500),
+    application:set_env(barrel_inference_server, model_cache_dir, RoCache),
+    try
+        Spec = file_spec(Config),
+        {ok, Coord} = barrel_inference_server_pull:start_link(
+            Spec, <<"err-model">>, <<"latest">>, #{}, [self()]
+        ),
+        ok = await_error(Coord),
+        ?assertEqual([], barrel_inference_server_models:list())
+    after
+        %% Restore perms so end_per_testcase's rm -rf can clean up.
+        file:change_mode(RoCache, 8#700)
+    end.
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
+
+file_spec(Config) ->
+    list_to_binary("file://" ++ ?config(blob, Config)).
+
+wait_down(Pid) ->
+    Ref = monitor(process, Pid),
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    after 5000 ->
+        ct:fail({coordinator_timeout, Pid})
+    end.
+
+collect_events(Coord, Acc) ->
+    receive
+        {pull_event, Coord, {success, M}} ->
+            lists:reverse([{success, M} | Acc]);
+        {pull_event, Coord, {error, R}} ->
+            lists:reverse([{error, R} | Acc]);
+        {pull_event, Coord, Ev} ->
+            collect_events(Coord, [Ev | Acc])
+    after 5000 ->
+        ct:fail(coordinator_timeout)
+    end.
+
+await_error(Coord) ->
+    receive
+        {pull_event, Coord, {error, _}} -> ok;
+        {pull_event, Coord, _Other} -> await_error(Coord)
+    after 5000 ->
+        ct:fail(no_error_event)
+    end.
 
 pull_synthetic(Config, Name, Tag) ->
     Blob = ?config(blob, Config),

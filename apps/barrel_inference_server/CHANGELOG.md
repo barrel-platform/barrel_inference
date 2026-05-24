@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   left running. New `barrel_inference_engine_admit_duration_seconds` histogram
   (labelled by op `infer`/`continue`) makes admission latency observable, with a
   slow-admit warning log.
+- `pull` now registers a manifest even when the client disconnects or the
+  request times out mid-download. Persistence moved off the HTTP handler into
+  a supervised per-pull coordinator (`barrel_inference_server_pull`), so a
+  completed download is never orphaned. Previously a multi-GB download could
+  outrun cowboy's `idle_timeout`, the handler died before the fetch finished,
+  and the blob landed in the cache with no manifest (so `list` showed nothing).
+- The non-streaming pull path returns `504` on timeout while the download
+  continues in the background, rather than losing the manifest.
+- `barrel_inference_server_models_store:write_atomic/2` returns `{error, _}` on
+  an unwritable cache dir instead of crashing.
+- CLI `barrel-inference pull` exits non-zero when the stream reports an error
+  (was always `0`).
 
 ### Barrel Inference 0.5.0 + tool-call exact-replay
 

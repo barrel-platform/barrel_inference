@@ -193,7 +193,8 @@ handle_cast({progress, WorkerPid, Bytes, Total}, #state{jobs = Jobs} = St) ->
     end;
 handle_cast({phase, WorkerPid, Phase}, #state{jobs = Jobs} = St) ->
     case find_by_worker(WorkerPid, Jobs) of
-        {ok, Hash, #job{progress = P0} = Job} ->
+        {ok, Hash, #job{progress = P0, progress_pids = Pids} = Job} ->
+            _ = [Pid ! {barrel_inference_fetch_phase, Hash, Phase} || Pid <- Pids],
             P = P0#progress{phase = Phase},
             {noreply, St#state{jobs = Jobs#{Hash := Job#job{progress = P}}}};
         error ->
