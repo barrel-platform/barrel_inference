@@ -14,7 +14,7 @@
 -include("barrel_inference_server.hrl").
 
 -export([lookup/1, parse/2, canonicalise/2]).
--export([native_turn/1, native_render/1, render/3]).
+-export([native_turn/1, native_render/1, render/3, markers/1, scanner_for/1]).
 %% Shared rendering helpers for the per-family render_prompt/2 callbacks.
 -export([tool_signatures/1, append_system/2]).
 
@@ -104,12 +104,39 @@ native_render(ModelId) when is_binary(ModelId) ->
             Loader = maps:get(<<"loader">>, Manifest, #{}),
             Markers = maps:get(<<"tool_call_markers">>, Loader, undefined),
             Format = maps:get(<<"tool_call_format">>, Loader, undefined),
-            case valid_markers(Markers) of
+            %% Per-model opt-out: `loader.tool_mode' is a manifest binary
+            %% (default <<"native">>). <<"grammar">> forces the grammar
+            %% path even on tool_choice=auto - the reliability fallback for
+            %% weak local models / strict setups. Any other value -> native.
+            case native_mode(Loader) andalso valid_markers(Markers) of
                 true -> render_module(Format);
                 false -> none
             end;
         {error, _} ->
             none
+    end.
+
+native_mode(Loader) ->
+    maps:get(<<"tool_mode">>, Loader, <<"native">>) =/= <<"grammar">>.
+
+%% The model's tool-call marker strings (for the streaming text scanner),
+%% or `undefined' when not configured / malformed. Same validity shape as
+%% valid_markers/1 (start and end are non-empty binaries).
+-spec markers(binary()) -> #{start := binary(), 'end' := binary()} | undefined.
+markers(ModelId) when is_binary(ModelId) ->
+    case barrel_inference_server_models:get(ModelId) of
+        {ok, Manifest} ->
+            Loader = maps:get(<<"loader">>, Manifest, #{}),
+            case maps:get(<<"tool_call_markers">>, Loader, undefined) of
+                #{<<"start">> := S, <<"end">> := E} when
+                    is_binary(S), is_binary(E), S =/= <<>>, E =/= <<>>
+                ->
+                    #{start => S, 'end' => E};
+                _ ->
+                    undefined
+            end;
+        {error, _} ->
+            undefined
     end.
 
 render_module(Format) when is_binary(Format), Format =/= <<>> ->
@@ -145,6 +172,31 @@ valid_markers(_) ->
 -spec render(module(), [tool()], binary() | undefined) -> binary().
 render(Mod, Tools, System) ->
     Mod:render_prompt(Tools, System).
+
+%% Config for the handlers' streaming text scanner (barrel_inference_server_tool_scan)
+%% on the native path: the resolved render module + the model's marker
+%% strings + the request's tool names. `none' off the native path or when
+%% markers are missing. Centralised here so the three handlers don't each
+%% re-derive it.
+-spec scanner_for(#barrel_inference_request{}) ->
+    {ok, #{start := binary(), 'end' := binary(), format := module(), tool_names := [binary()]}}
+    | none.
+scanner_for(#barrel_inference_request{model_id = Id, tools = Tools} = R) ->
+    case native_turn(R) of
+        {ok, Mod} ->
+            case markers(Id) of
+                #{start := S, 'end' := E} ->
+                    Names = [N || #{name := N} <- tool_list(Tools), is_binary(N)],
+                    {ok, #{start => S, 'end' => E, format => Mod, tool_names => Names}};
+                undefined ->
+                    none
+            end;
+        none ->
+            none
+    end.
+
+tool_list(L) when is_list(L) -> L;
+tool_list(_) -> [].
 
 %% OpenAI-style function-signature objects, the shape qwen-xml / dsml /
 %% mistral list inside their tool blocks. Shared so the per-family

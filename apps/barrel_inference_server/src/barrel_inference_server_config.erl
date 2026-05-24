@@ -109,14 +109,15 @@ pool_policy_for(ModelId) ->
             end
     end.
 
+%% Admission concurrency tracks the engine's seq pool: use the SAME
+%% resolver the loader uses (`parameters.num_seq_max' > `loader.n_seq_max'
+%% > default), so the two layers never drift - including when only
+%% `parameters.num_seq_max' is set, or neither (both then take the
+%% default). Returns undefined only when the model can't be read.
 manifest_n_seq_max(ModelId) ->
     try barrel_inference_server_models:get(ModelId) of
         {ok, M} when is_map(M) ->
-            Loader = maps:get(<<"loader">>, M, #{}),
-            case maps:get(<<"n_seq_max">>, Loader, undefined) of
-                N when is_integer(N), N > 0 -> N;
-                _ -> undefined
-            end;
+            barrel_inference_server_models:resolve_n_seq_max(M);
         _ ->
             undefined
     catch

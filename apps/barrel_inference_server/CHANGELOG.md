@@ -6,20 +6,33 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Tool requests no longer hang for 60-180 s. The real cause was the engine seq
+  pool defaulting to 1 (`n_seq_max`): a sticky session pins the only sequence and
+  every other session blocks on admission. A shared resolver
+  (`barrel_inference_server_models:resolve_n_seq_max/1`, precedence
+  `parameters.num_seq_max` > `loader.n_seq_max` > 4) now drives **both** the engine
+  seq pool and the server's admission concurrency (`pool_policy_for/1`), so they
+  stay coupled and existing models get a safe default without re-pulling.
+  `admission_on_full = error` is enabled so a genuinely full pool returns a
+  retryable 503/529 instead of blocking.
+
 ### Added
 
-- Native tool-call prompting and the no-grammar fast path. A model whose
-  manifest declares `loader.tool_call_format` + valid `loader.tool_call_markers`
-  and whose format module implements the new optional `render_prompt/2` callback
-  now renders tools in the model's own format (with full JSON schemas) and skips
-  the GBNF tool grammar under `tool_choice = auto`. The engine captures the calls
-  from its markers on free decode, so a tool request completes in ~chat latency
-  instead of wedging on grammar-constrained sampling. `render_prompt/2` ships for
-  `qwen-xml`, `dsml` (DeepSeek), `llama-python-tag`, and `mistral-tool-calls`;
-  `barrel_inference_server_tool_format:native_turn/1` is the single gate shared by the
-  pipeline (skip grammar + render) and the handlers (suppress the legacy
-  first-byte tool_buffer heuristic). `required`/`named`/non-marker requests keep
-  the grammar.
+- Tool calling on `tool_choice = auto` uses native prompting + a tolerant
+  streaming text parser (Ollama-style); `required`/`named` and a per-model
+  `loader.tool_mode = grammar` opt-out use the GBNF grammar (forced,
+  schema-enforced). A model whose manifest declares `loader.tool_call_format` +
+  valid `loader.tool_call_markers`, implements the optional `render_prompt/2`
+  callback, and is not pinned to `tool_mode = grammar` renders tools in its own
+  format and free-decodes; `barrel_inference_server_tool_scan` then extracts tool
+  calls from the generated text (configured markers, a generic `<tag>` wrapper, or
+  bare JSON), validating the name against the request's tools and falling back to
+  content otherwise. `render_prompt/2` ships for `qwen-xml`, `dsml` (DeepSeek),
+  `llama-python-tag`, and `mistral-tool-calls`. The parser is bounded (capped
+  holdback + region buffer) and does not enforce argument schemas - use
+  `tool_mode = grammar` / `required` for that.
 - Parallel tool calls. The model can emit several tool calls in one generation;
   all three handlers (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`)
   accumulate them and surface N `tool_use` / `tool_calls` / function-call items

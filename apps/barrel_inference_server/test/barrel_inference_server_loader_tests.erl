@@ -293,21 +293,23 @@ manifest_to_config_propagates_n_seq_max_test() ->
     CtxOpts = maps:get(context_opts, Config),
     ?assertEqual(4, maps:get(n_seq_max, CtxOpts)).
 
-manifest_to_config_omits_n_seq_max_when_absent_test() ->
+manifest_to_config_defaults_n_seq_max_when_absent_test() ->
+    %% A manifest that omits n_seq_max now resolves to the shared default
+    %% (4), not the engine's deadlock-prone 1; the same resolver drives
+    %% admission concurrency so the two layers stay coupled.
     Manifest = manifest(<<"sha256:000a">>, <<"q4_k_m">>, 4096, 4),
     Config = barrel_inference_server_loader:manifest_to_config(Manifest),
     CtxOpts = maps:get(context_opts, Config),
-    ?assertNot(maps:is_key(n_seq_max, CtxOpts)).
+    ?assertEqual(4, maps:get(n_seq_max, CtxOpts)).
 
 manifest_to_config_ignores_zero_n_seq_max_test() ->
-    %% `0` and negatives collapse to `undefined` so the engine
-    %% keeps its own default rather than admitting nothing.
+    %% `0` and negatives are invalid and collapse to the default (4).
     Manifest = (manifest(<<"sha256:000b">>, <<"q4_k_m">>, 4096, 4))#{
         <<"loader">> => #{<<"quant_bits">> => 4, <<"n_seq_max">> => 0}
     },
     Config = barrel_inference_server_loader:manifest_to_config(Manifest),
     CtxOpts = maps:get(context_opts, Config),
-    ?assertNot(maps:is_key(n_seq_max, CtxOpts)).
+    ?assertEqual(4, maps:get(n_seq_max, CtxOpts)).
 
 %% `loader.embeddings = true` opens the context in embeddings mode so
 %% barrel_inference:embed/2 returns vectors (set at pull for embedding GGUFs).

@@ -81,6 +81,9 @@
     %% emits in one generation; dispatched once on barrel_inference_done.
     captured_calls = [] ::
         [#{id := binary(), name := binary(), input := map(), full_bin := binary()}],
+    %% Streaming tool-call text scanner for the native `tool_mode' path;
+    %% undefined on the grammar path.
+    tool_scan = undefined :: undefined | barrel_inference_server_tool_scan:state(),
     %% Built-in tools the server executes in-process, keyed by the
     %% model-facing name. Empty unless an executor is registered for a
     %% requested built-in; drives the agentic continue-loop.
@@ -226,11 +229,18 @@ init_state(R, Requested, Api, Worker, Mon) ->
         response_id = barrel_inference_server_translate:make_id(<<"resp_">>),
         msg_id = barrel_inference_server_translate:make_id(<<"msg_">>),
         tool_format = resolve_tool_format(R#barrel_inference_request.model_id),
+        tool_scan = init_tool_scan(R),
         server_tools = R#barrel_inference_request.server_tools,
         max_tool_iter = barrel_inference_server_config:max_tool_iterations(),
         loop_request = R,
         loop_messages = R#barrel_inference_request.messages
     }.
+
+init_tool_scan(R) ->
+    case barrel_inference_server_tool_format:scanner_for(R) of
+        {ok, Cfg} -> barrel_inference_server_tool_scan:new(Cfg);
+        none -> undefined
+    end.
 
 resolve_tool_format(ModelId) ->
     case barrel_inference_server_tool_format:lookup(ModelId) of
@@ -340,7 +350,7 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
             %% Captured tool calls (if any) are dispatched here: server
             %% calls continue the turn, client calls finish as function
             %% call items. No captured calls -> legacy / plain finish.
-            dispatch_done(Req, demonitor_engine(S1));
+            dispatch_done(Req, flush_scan(Req, demonitor_engine(S1)));
         _ ->
             %% A server-tool batch is running for this round; the engine
             %% round is done but the turn continues once the results
@@ -456,6 +466,11 @@ keepalive_release(#st{model = Model}) ->
 %% Token handling
 %%====================================================================
 
+%% Native tool path: route tokens through the streaming scanner (content
+%% vs tool calls); the engine emits no marker events here.
+handle_token(Tok, Req, S0 = #st{tool_scan = Scan}) when Scan =/= undefined ->
+    {Emits, Scan1} = barrel_inference_server_tool_scan:feed(Scan, Tok),
+    apply_scan_emits(Emits, Req, first_token(S0#st{tool_scan = Scan1}));
 handle_token(Tok, Req, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
     %% First token under grammar: if it's a JSON `{` switch to
     %% tool_buffer mode (legacy heuristic, used when no
@@ -483,7 +498,15 @@ handle_token(Tok, Req, S = #st{mode = text, out_tokens = 0}) ->
 handle_token(Tok, Req, S = #st{mode = text}) ->
     emit_text(Tok, Req, S).
 
-emit_text(Tok, Req, S = #st{stream = true}) ->
+emit_text(Tok, Req, S) ->
+    {ok, Req, rearm_idle(stream_text(Tok, Req, S)), hibernate}.
+
+%% Emit one text fragment (output_text.delta or buffer) and return the
+%% updated state - the reusable core of emit_text, also used for the
+%% scanner's {text,_} emits.
+stream_text(<<>>, _Req, S) ->
+    S;
+stream_text(Tok, Req, S = #st{stream = true}) ->
     Payload = barrel_inference_server_translate:internal_to_responses_text_delta(
         S#st.out_index, S#st.content_index, Tok
     ),
@@ -491,17 +514,27 @@ emit_text(Tok, Req, S = #st{stream = true}) ->
         <<"response.output_text.delta">>, Payload
     ),
     cowboy_req:stream_body(Frame, nofin, Req),
-    {ok, Req,
-        rearm_idle(S#st{
-            buf_text = [S#st.buf_text, Tok],
-            out_tokens = S#st.out_tokens + 1
-        }), hibernate};
-emit_text(Tok, Req, S = #st{stream = false}) ->
-    {ok, Req,
-        rearm_idle(S#st{
-            buf_text = [S#st.buf_text, Tok],
-            out_tokens = S#st.out_tokens + 1
-        }), hibernate}.
+    S#st{buf_text = [S#st.buf_text, Tok], out_tokens = S#st.out_tokens + 1};
+stream_text(Tok, _Req, S = #st{stream = false}) ->
+    S#st{buf_text = [S#st.buf_text, Tok], out_tokens = S#st.out_tokens + 1}.
+
+apply_scan_emits(Emits, Req, S0) ->
+    S = lists:foldl(fun(E, Sx) -> apply_scan_emit(E, Req, Sx) end, S0, Emits),
+    {ok, Req, rearm_idle(S), hibernate}.
+
+apply_scan_emit({text, Bin}, Req, S) ->
+    stream_text(Bin, Req, S);
+apply_scan_emit({tool, #{name := Name, arguments := Args, raw := Raw}}, _Req, S) ->
+    FcId = barrel_inference_server_translate:make_id(<<"fc_">>),
+    maybe_persist_replay(S#st.tool_format, FcId, S#st.model, Raw, Name, Args),
+    Call = #{id => FcId, name => Name, input => Args, full_bin => Raw},
+    S#st{captured_calls = S#st.captured_calls ++ [Call]}.
+
+flush_scan(_Req, S = #st{tool_scan = undefined}) ->
+    S;
+flush_scan(Req, S = #st{tool_scan = Scan}) ->
+    {Emits, _} = barrel_inference_server_tool_scan:finish(Scan),
+    lists:foldl(fun(E, Sx) -> apply_scan_emit(E, Req, Sx) end, S#st{tool_scan = undefined}, Emits).
 
 %%====================================================================
 %% Tool-call (wire-driven path; barrel_inference 0.5+)

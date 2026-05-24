@@ -43,7 +43,8 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
     resolve_spec/1,
     persist_manifest/4,
     persist_manifest_overrides/5,
-    cache_root/0
+    cache_root/0,
+    resolve_n_seq_max/1
 ]).
 
 -export_type([manifest/0, name_or_tag/0, pull_opts/0]).
@@ -53,6 +54,14 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
 %% of GB of KV. Operators raise it per-model via /api/edit num_ctx or the
 %% server-wide max_context_size.
 -define(DEFAULT_PULL_MAX_CTX, 32768).
+
+%% Default engine seq-pool size when a manifest does not pin one. The
+%% engine's own default is 1, which deadlocks under sticky-seq pinning
+%% the moment a second session admits; 4 gives headroom. This drives
+%% BOTH the engine seq pool (loader) and the server's admission
+%% concurrency (barrel_inference_server_config:pool_policy_for/1) via the
+%% shared resolve_n_seq_max/1, so the two layers never drift.
+-define(DEFAULT_N_SEQ_MAX, 4).
 
 -type manifest() :: barrel_inference_server_models_store:manifest().
 -type name_or_tag() :: binary() | string().
@@ -337,11 +346,26 @@ build_manifest(Spec, Name, Tag, BlobPath, Metadata) ->
         <<"modified_at">> => iso8601_now()
     }.
 
+%% Resolve the engine seq-pool size from a manifest, shared by the loader
+%% (engine `context_opts.n_seq_max') and the server's admission concurrency
+%% (`barrel_inference_server_config:pool_policy_for/1') so both layers use the
+%% same number. Precedence: `parameters.num_seq_max' (operator /api/edit) >
+%% `loader.n_seq_max' (as-pulled) > ?DEFAULT_N_SEQ_MAX.
+-spec resolve_n_seq_max(manifest()) -> pos_integer().
+resolve_n_seq_max(Manifest) when is_map(Manifest) ->
+    Params = maps:get(<<"parameters">>, Manifest, #{}),
+    Loader = maps:get(<<"loader">>, Manifest, #{}),
+    case maps:get(<<"num_seq_max">>, Params, maps:get(<<"n_seq_max">>, Loader, undefined)) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> ?DEFAULT_N_SEQ_MAX
+    end.
+
 loader_opts(Quant, Ctx, Tpl, IsEmbed) ->
     Base0 = #{
         <<"n_gpu_layers">> => 0,
         <<"n_ctx">> => default_int(Ctx, 4096),
         <<"n_batch">> => 512,
+        <<"n_seq_max">> => ?DEFAULT_N_SEQ_MAX,
         <<"quant_type">> => or_null(Quant),
         <<"quant_bits">> => or_null(quant_bits(Quant))
     },
