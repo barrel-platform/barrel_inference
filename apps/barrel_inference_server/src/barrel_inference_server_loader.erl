@@ -392,6 +392,11 @@ manifest_to_config(Manifest) ->
     %% CUDA / ROCm) with the manifest's 0 placeholder and force CPU
     %% inference, which is slow and breaks the compute-buffer sizing
     %% for the larger contexts SDK clients send.
+    %% Embedding models open the context in embeddings mode so
+    %% barrel_inference:embed/2 returns pooled vectors instead of
+    %% {error, not_supported}. Opt-in via `loader.embeddings` (set at pull
+    %% for detected embedding GGUFs) or a Modelfile PARAMETER override.
+    Embeddings = manifest_param(<<"embeddings">>, Loader, Params),
     Config0 = BaseOpts#{
         backend => application:get_env(?APP, model_backend, barrel_inference_model_llama),
         model_path => path_string(maps:get(<<"blob_path">>, Manifest)),
@@ -400,12 +405,15 @@ manifest_to_config(Manifest) ->
         quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
         quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
         context_size => Ctx,
-        context_opts => maybe_put_decode_budget_ms(
-            maybe_put_n_seq_max(
-                #{n_ctx => Ctx, n_batch => NBatch},
-                NSeqMax
+        context_opts => maybe_put_embeddings(
+            maybe_put_decode_budget_ms(
+                maybe_put_n_seq_max(
+                    #{n_ctx => Ctx, n_batch => NBatch},
+                    NSeqMax
+                ),
+                DecodeBudget
             ),
-            DecodeBudget
+            Embeddings
         ),
         model_opts => model_opts_from(Loader, Params)
     },
@@ -470,6 +478,11 @@ maybe_put_n_seq_max(Opts, N) -> Opts#{n_seq_max => N}.
 
 maybe_put_decode_budget_ms(Opts, undefined) -> Opts;
 maybe_put_decode_budget_ms(Opts, N) -> Opts#{decode_budget_ms => N}.
+
+%% Only `true` opens the context in embeddings mode; undefined / false leave
+%% the key off so the model stays generative.
+maybe_put_embeddings(Opts, true) -> Opts#{embeddings => true};
+maybe_put_embeddings(Opts, _) -> Opts.
 
 %% Build the model_opts map. Only set keys the manifest actually
 %% supplies; let llama.cpp pick its own platform-appropriate default

@@ -120,7 +120,28 @@ extractors_test() ->
     ?assertEqual(4096, barrel_inference_server_gguf:embedding_length(M)),
     ?assertEqual(<<"q5_k_m">>, barrel_inference_server_gguf:quantization(M)),
     ?assertEqual(<<"chat-template-body">>, barrel_inference_server_gguf:chat_template(M)),
-    ?assertEqual(<<"gpt2">>, barrel_inference_server_gguf:tokenizer_model(M)).
+    ?assertEqual(<<"gpt2">>, barrel_inference_server_gguf:tokenizer_model(M)),
+    %% A generative model is not an embedding model.
+    ?assertEqual(undefined, barrel_inference_server_gguf:pooling_type(M)),
+    ?assertNot(barrel_inference_server_gguf:is_embedding_model(M)).
+
+%% A declared pooling type marks the GGUF as an embedding model.
+is_embedding_model_via_pooling_type_test() ->
+    KVs = [
+        {<<"general.architecture">>, ?T_STRING, <<"nomic-bert">>},
+        {<<"nomic-bert.context_length">>, ?T_UINT32, 2048},
+        {<<"nomic-bert.pooling_type">>, ?T_UINT32, 1}
+    ],
+    {ok, M} = with_synthetic_gguf(3, KVs, fun barrel_inference_server_gguf:read_metadata/1),
+    ?assertEqual(1, barrel_inference_server_gguf:pooling_type(M)),
+    ?assert(barrel_inference_server_gguf:is_embedding_model(M)).
+
+%% A known bidirectional-encoder architecture counts even without a
+%% pooling_type key.
+is_embedding_model_via_architecture_test() ->
+    KVs = [{<<"general.architecture">>, ?T_STRING, <<"bert">>}],
+    {ok, M} = with_synthetic_gguf(3, KVs, fun barrel_inference_server_gguf:read_metadata/1),
+    ?assert(barrel_inference_server_gguf:is_embedding_model(M)).
 
 family_unknown_arch_passes_through_test() ->
     KVs = [{<<"general.architecture">>, ?T_STRING, <<"weird-new-arch">>}],

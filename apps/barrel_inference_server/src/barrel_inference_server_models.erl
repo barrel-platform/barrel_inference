@@ -331,18 +331,27 @@ build_manifest(Spec, Name, Tag, BlobPath, Metadata) ->
         <<"context_size">> => or_null(Ctx),
         <<"embedding_length">> => or_null(barrel_inference_server_gguf:embedding_length(Metadata)),
         <<"chat_template">> => or_null(Tpl),
-        <<"loader">> => loader_opts(Quant, Ctx, Tpl),
+        <<"loader">> => loader_opts(
+            Quant, Ctx, Tpl, barrel_inference_server_gguf:is_embedding_model(Metadata)
+        ),
         <<"modified_at">> => iso8601_now()
     }.
 
-loader_opts(Quant, Ctx, Tpl) ->
-    Base = #{
+loader_opts(Quant, Ctx, Tpl, IsEmbed) ->
+    Base0 = #{
         <<"n_gpu_layers">> => 0,
         <<"n_ctx">> => default_int(Ctx, 4096),
         <<"n_batch">> => 512,
         <<"quant_type">> => or_null(Quant),
         <<"quant_bits">> => or_null(quant_bits(Quant))
     },
+    %% Embedding GGUFs load with the context in embeddings mode (the loader
+    %% maps this to context_opts.embeddings); generative models stay unflagged.
+    Base =
+        case IsEmbed of
+            true -> Base0#{<<"embeddings">> => true};
+            false -> Base0
+        end,
     Base1 = maybe_merge_tool_call(Base, detect_tool_call_format(Tpl)),
     maybe_merge_thinking(Base1, detect_thinking_markers(Tpl)).
 

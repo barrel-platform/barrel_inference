@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Embeddings support for embedding GGUFs. The pull pipeline detects embedding
+  models from GGUF metadata (`barrel_inference_server_gguf:is_embedding_model/1`:
+  a declared `*.pooling_type`, or a bidirectional-encoder architecture like
+  `bert`/`nomic-bert`/`jina-bert`/`gte`) and marks the manifest `loader.embeddings`.
+  The loader then opens the context in embeddings mode (`context_opts.embeddings`),
+  so `/v1/embeddings` and `/api/embed` return vectors instead of 501. A Modelfile
+  `PARAMETER`/`/api/edit` can set `embeddings` explicitly. Embedding models are
+  embeddings-only (chat to them errors).
+- Default model aliases `fast` -> `coder-7b:main` and `big` -> `qwen3-coder:30b`.
+
 ### Fixed
 
 - Pulled manifests cap the default context at 32768 instead of baking the model's
