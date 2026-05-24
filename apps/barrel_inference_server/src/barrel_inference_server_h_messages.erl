@@ -1067,7 +1067,7 @@ tool_use_frame(S, Idx, #{id := Id, name := Name, input := Input}) ->
         <<"index">> => Idx,
         <<"delta">> => #{
             <<"type">> => <<"input_json_delta">>,
-            <<"partial_json">> => json:encode(Input)
+            <<"partial_json">> => iolist_to_binary(json:encode(Input))
         }
     },
     Stop = barrel_inference_server_translate:internal_to_anthropic_event(
@@ -1232,7 +1232,7 @@ finish_ok(Req0, S0 = #st{stream = true, mode = tool_buffer}, Stats) ->
         <<"index">> => Idx,
         <<"delta">> => #{
             <<"type">> => <<"input_json_delta">>,
-            <<"partial_json">> => json:encode(Input)
+            <<"partial_json">> => iolist_to_binary(json:encode(Input))
         }
     },
     Stop = barrel_inference_server_translate:internal_to_anthropic_event(

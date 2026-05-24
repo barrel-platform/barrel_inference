@@ -60,14 +60,14 @@ new(#{start := S, 'end' := E, format := Mod, tool_names := Names}) ->
 
 -spec feed(state(), binary()) -> {[emit()], state()}.
 feed(St = #st{buf = B}, Text) when is_binary(Text) ->
-    {Rev, St1} = loop(St#st{buf = <<B/binary, Text/binary>>}, []),
+    {Rev, St1} = loop(St#st{buf = <<B/binary, Text/binary>>}, [], false),
     {lists:reverse(Rev), St1}.
 
-%% Flush: whatever is still held did not resolve to a tool call, so it is
-%% content. (A complete region would already have been emitted by loop/2.)
+%% Flush: resolve the held buffer treating it as final (so a region whose
+%% closing marker never arrived still parses), then anything left is text.
 -spec finish(state()) -> {[emit()], state()}.
 finish(St) ->
-    {Rev, St1} = loop(St, []),
+    {Rev, St1} = loop(St, [], true),
     case St1#st.buf of
         <<>> -> {lists:reverse(Rev), St1};
         Rest -> {lists:reverse([{text, Rest} | Rev]), St1#st{buf = <<>>}}
@@ -78,42 +78,74 @@ finish(St) ->
 %%====================================================================
 
 %% Consume St.buf as far as possible, accumulating emits (reversed) and
-%% leaving an unresolved tail in St.buf.
-loop(St = #st{buf = Buf}, Rev) ->
+%% leaving an unresolved tail in St.buf. `Final' is true on finish/1, when
+%% a region whose closing marker never arrived is parsed anyway.
+loop(St = #st{buf = Buf}, Rev, Final) ->
     case region_start(Buf, St) of
         none ->
             %% No region indicator: emit safe text, hold a possible split
             %% marker tail.
             {Safe, Hold} = split_hold(Buf, St),
             {push_text(Safe, Rev), St#st{buf = Hold}};
+        {hold, RS} ->
+            %% A start marker is present but its JSON `{' has not arrived
+            %% yet: emit text before the marker, hold the marker onward so
+            %% it is never streamed as content. Bounded by ?MAX_REGION.
+            hold_region(Buf, RS, Rev, St);
         {RS, JsonStart, Kind} ->
             Pre = binary:part(Buf, 0, RS),
             case balanced(Buf, JsonStart) of
                 incomplete ->
-                    Held = suffix_from(Buf, RS),
-                    case byte_size(Held) > ?MAX_REGION of
-                        true ->
-                            %% Runaway candidate: give up, emit as text.
-                            {push_text(Buf, Rev), St#st{buf = <<>>}};
-                        false ->
-                            {push_text(Pre, Rev), St#st{buf = Held}}
-                    end;
+                    hold_region(Buf, RS, Rev, St);
                 JsonEnd ->
                     RegionEnd = consume_end(Buf, JsonEnd, Kind, St),
-                    Region = binary:part(Buf, RS, RegionEnd - RS),
-                    Json = binary:part(Buf, JsonStart, JsonEnd - JsonStart),
-                    case classify(Kind, Region, Json, St) of
-                        {tool, Call} ->
-                            Rev1 = [{tool, Call} | push_text(Pre, Rev)],
-                            loop(St#st{buf = suffix_from(Buf, RegionEnd)}, Rev1);
-                        not_tool ->
-                            %% Not a tool call: this JSON is content. Emit up
-                            %% to its close and keep scanning the remainder.
-                            Upto = binary:part(Buf, 0, JsonEnd),
-                            loop(St#st{buf = suffix_from(Buf, JsonEnd)}, push_text(Upto, Rev))
+                    case settled(Kind, RS, JsonStart, JsonEnd, RegionEnd, St, Final) of
+                        false ->
+                            %% JSON is closed but the region's closing marker
+                            %% hasn't streamed in yet: hold so it is not leaked.
+                            hold_region(Buf, RS, Rev, St);
+                        true ->
+                            Region = binary:part(Buf, RS, RegionEnd - RS),
+                            Json = binary:part(Buf, JsonStart, JsonEnd - JsonStart),
+                            case classify(Kind, Region, Json, St) of
+                                {tool, Call} ->
+                                    Rev1 = [{tool, Call} | push_text(Pre, Rev)],
+                                    loop(St#st{buf = suffix_from(Buf, RegionEnd)}, Rev1, Final);
+                                not_tool ->
+                                    %% Not a tool call: this JSON is content.
+                                    %% Emit up to its close and keep scanning.
+                                    Upto = binary:part(Buf, 0, JsonEnd),
+                                    loop(
+                                        St#st{buf = suffix_from(Buf, JsonEnd)},
+                                        push_text(Upto, Rev),
+                                        Final
+                                    )
+                            end
                     end
             end
     end.
+
+%% Hold from RS (emit text before it), bounded: a runaway candidate is
+%% flushed as text rather than buffered without limit.
+hold_region(Buf, RS, Rev, St) ->
+    Held = suffix_from(Buf, RS),
+    case byte_size(Held) > ?MAX_REGION of
+        true -> {push_text(Buf, Rev), St#st{buf = <<>>}};
+        false -> {push_text(binary:part(Buf, 0, RS), Rev), St#st{buf = Held}}
+    end.
+
+%% Is the region complete enough to parse? A marker region needs its end
+%% marker consumed (unless the format has none, or we are flushing); a
+%% wrapped bare region needs its closing tag; a plain bare object is
+%% settled as soon as its braces balance.
+settled(_Kind, _RS, _JsonStart, _JsonEnd, _RegionEnd, _St, true) ->
+    true;
+settled(marker, _RS, _JsonStart, JsonEnd, RegionEnd, #st{stop = Stop}, false) ->
+    RegionEnd > JsonEnd orelse Stop =:= <<>>;
+settled(bare, RS, JsonStart, _JsonEnd, _RegionEnd, _St, false) when RS =:= JsonStart ->
+    true;
+settled(bare, _RS, _JsonStart, JsonEnd, RegionEnd, _St, false) ->
+    RegionEnd > JsonEnd.
 
 %% Earliest region indicator in Buf: the configured start marker, a
 %% generic `<tag>'/`[tag]' wrapper-open immediately before a `{`, or a bare
@@ -127,9 +159,10 @@ region_start(Buf, #st{start = Start}) ->
         {none, none} ->
             none;
         {M, B} when is_integer(M) andalso (B =:= none orelse M =< B) ->
-            %% configured marker first; JSON object begins at the next `{'
+            %% configured marker first; JSON object begins at the next `{'.
+            %% If the `{' has not streamed in yet, hold from the marker.
             case first_index_from(Buf, <<"{">>, M) of
-                none -> none;
+                none -> {hold, M};
                 J -> {M, J, marker}
             end;
         {_, B} when is_integer(B) ->
@@ -173,10 +206,14 @@ consume_end(Buf, JsonEnd, marker, #st{stop = Stop}) when Stop =/= <<>> ->
 consume_end(Buf, JsonEnd, _Kind, _St) ->
     skip_wrapper_close(Buf, JsonEnd).
 
-classify(marker, Region, _Json, St = #st{format = Mod}) ->
+classify(marker, Region, Json, St = #st{format = Mod}) ->
+    %% Prefer the family parser (exact format, e.g. mistral arrays); fall
+    %% back to decoding the inner JSON object directly so a region still
+    %% parses when its closing marker is absent (flush) or the family
+    %% parser is strict.
     case safe_parse(Mod, Region) of
         {ok, Name, Args} -> accept(Name, Args, Region, St);
-        error -> not_tool
+        error -> classify(bare, Region, Json, St)
     end;
 classify(bare, Region, Json, St) ->
     case decode_bare(Json) of

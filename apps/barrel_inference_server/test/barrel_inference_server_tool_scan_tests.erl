@@ -52,7 +52,25 @@ marker_split_across_chunks_test() ->
     E = run_split(
         <<"<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>">>
     ),
-    ?assertMatch([#{name := <<"get_weather">>}], tools(E)).
+    ?assertMatch([#{name := <<"get_weather">>}], tools(E)),
+    %% The markers must not leak as content even when the start marker
+    %% arrives before its `{' (the streaming-leak regression).
+    ?assertEqual(<<>>, text(E)).
+
+marker_then_json_in_separate_feeds_test() ->
+    %% Feed 1 is the complete start marker with no `{' yet; it must be held,
+    %% not streamed as text.
+    S0 = new(),
+    {E1, S1} = barrel_inference_server_tool_scan:feed(S0, <<"<tool_call>\n">>),
+    ?assertEqual(<<>>, text(E1)),
+    ?assertEqual([], tools(E1)),
+    {E2, S2} = barrel_inference_server_tool_scan:feed(
+        S1, <<"{\"name\":\"search\",\"arguments\":{\"q\":\"x\"}}</tool_call>">>
+    ),
+    {E3, _} = barrel_inference_server_tool_scan:finish(S2),
+    All = E1 ++ E2 ++ E3,
+    ?assertMatch([#{name := <<"search">>}], tools(All)),
+    ?assertEqual(<<>>, text(All)).
 
 surrounding_prose_kept_as_text_test() ->
     E = run(
