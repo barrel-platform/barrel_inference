@@ -75,3 +75,31 @@ sibling repo. Engine-robustness headlines:
 - **`parallel_tool_calls: true`** - a multi-call GBNF root rule so the
   model can emit more than one tool call per turn (today one per
   round; `false` is honoured exactly).
+
+## Client compatibility (ollama parity)
+
+Found benchmarking barrel_memory (which drives the server like ollama).
+Cases that work against ollama but fail here:
+
+- **`/api/generate` 400s an oversized raw prompt instead of truncating.**
+  The chat/messages path drops the oldest non-system message and retries
+  (`pipeline.erl:258`); the raw-`prompt` path does not (`pipeline.erl:296`),
+  so a prompt over `n_ctx` returns `400 "prompt is too long: N > M"`.
+  ollama truncates raw prompts to `num_ctx`. Clients that send one big
+  `prompt` (barrel_memory summarize/extract) get a hard error. Fix:
+  truncate raw `/api/generate` prompts to fit `n_ctx` (head/tail), or make
+  it configurable.
+- **Per-request `num_ctx` is ignored; context is locked at load.**
+  `options.num_ctx` is never read (`translate.erl`); `n_ctx` is fixed at
+  load from the manifest / `max_context_size` (capped 32768). ollama lets
+  a request size the window. Fix: honor `options.num_ctx` up to a server
+  max, or surface the loaded context so clients can chunk.
+- **No embedding-model path.** `/v1/embeddings` + `/api/embed` call
+  llama.cpp embed on whatever model is loaded; a generative model returns
+  `not_supported` -> 501 (`h_embeddings.erl:185`). Clients (barrel_memory)
+  need an embedding model (nomic-embed-text class). Fix: support loading an
+  embedding-capable GGUF (pooling) and route embeddings to it.
+- **Minor: ollama-style model names 404.** barrel_memory's
+  `context_models`/router use `qwen2.5:14b`, `codestral:22b`,
+  `qwen2.5:0.5b`; unknown names 404 (no auto-pull by default). Alias them
+  or enable `auto_pull` for drop-in parity.
