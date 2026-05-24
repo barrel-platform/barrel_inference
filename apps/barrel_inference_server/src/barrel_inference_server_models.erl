@@ -47,6 +47,12 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
 
 -export_type([manifest/0, name_or_tag/0, pull_opts/0]).
 
+%% Cap the as-pulled default context. A model may advertise a huge native
+%% context (e.g. 262144); baking that as the load default would allocate tens
+%% of GB of KV. Operators raise it per-model via /api/edit num_ctx or the
+%% server-wide max_context_size.
+-define(DEFAULT_PULL_MAX_CTX, 32768).
+
 -type manifest() :: barrel_inference_server_models_store:manifest().
 -type name_or_tag() :: binary() | string().
 -type pull_opts() :: #{
@@ -305,7 +311,7 @@ read_metadata_safe(BlobPath) ->
 
 build_manifest(Spec, Name, Tag, BlobPath, Metadata) ->
     Quant = barrel_inference_server_gguf:quantization(Metadata),
-    Ctx = barrel_inference_server_gguf:context_length(Metadata),
+    Ctx = cap_ctx(barrel_inference_server_gguf:context_length(Metadata)),
     Tpl = barrel_inference_server_gguf:chat_template(Metadata),
     #{
         <<"name">> => Name,
@@ -338,6 +344,9 @@ loader_opts(Quant, Ctx, Tpl) ->
     },
     Base1 = maybe_merge_tool_call(Base, detect_tool_call_format(Tpl)),
     maybe_merge_thinking(Base1, detect_thinking_markers(Tpl)).
+
+cap_ctx(undefined) -> undefined;
+cap_ctx(N) when is_integer(N) -> min(N, ?DEFAULT_PULL_MAX_CTX).
 
 maybe_merge_tool_call(Base, undefined) ->
     Base;

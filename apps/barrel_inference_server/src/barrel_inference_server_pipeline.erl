@@ -40,6 +40,8 @@
 -export([start_link/2, abort/1]).
 %% Exported for unit tests (pure).
 -export([build_params/1]).
+%% Exported for unit tests (timeout + worker-kill behavior).
+-export([call_engine/3]).
 
 -record(work, {
     handler :: pid(),
@@ -314,7 +316,7 @@ tokenise_raw(W, Prompt) ->
 call_engine(Fun, ModelId, Op) ->
     Self = self(),
     Tag = make_ref(),
-    _Worker = spawn(fun() ->
+    Worker = spawn(fun() ->
         Result =
             try Fun() of
                 R -> {ok, R}
@@ -334,6 +336,13 @@ call_engine(Fun, ModelId, Op) ->
             "barrel_inference_server: engine call timed out: model=~ts op=~p",
             [ModelId, Op]
         ),
+        %% Don't leak the worker or its late reply. The engine-side work is
+        %% aborted by the reset_session recovery path (call_engine_with_recovery).
+        exit(Worker, kill),
+        receive
+            {Tag, _} -> ok
+        after 0 -> ok
+        end,
         {error, 504, engine_unresponsive}
     end.
 
@@ -544,7 +553,17 @@ step_queue(W) ->
 step_infer(W) ->
     Params = build_params(W#work.request),
     Call = fun() -> do_infer(W, Params) end,
-    case call_engine_with_recovery(W, Call, infer) of
+    %% do_infer picks infer/4 vs continue/3 from W#work.continuation; label
+    %% the admission metric the same way so the two paths are distinguishable.
+    Op =
+        case W#work.continuation of
+            undefined -> infer;
+            _ -> continue
+        end,
+    T0 = erlang:monotonic_time(millisecond),
+    Result = call_engine_with_recovery(W, Call, Op),
+    observe_admit_latency(W, Op, T0),
+    case Result of
         {ok, {ok, Ref}} ->
             {ok, W#work{infer_ref = Ref}};
         {ok, {error, busy}} ->
@@ -568,6 +587,25 @@ step_infer(W) ->
         {error, _, _} = E ->
             E
     end.
+
+%% Record admission latency (grammar compile + prefill) per infer/continue
+%% op, in seconds (house convention), via the metrics module. A slow admit
+%% is logged so a too-low engine_call_timeout_ms is visible in the logs.
+observe_admit_latency(W, Op, T0) ->
+    Ms = erlang:monotonic_time(millisecond) - T0,
+    barrel_inference_server_metrics:observe_engine_admit(model_id(W), Op, Ms / 1000),
+    case Ms >= admit_warn_ms() of
+        true ->
+            logger:warning(
+                "barrel_inference_server: slow engine admit: model=~ts op=~p ~Bms",
+                [model_id(W), Op, Ms]
+            );
+        false ->
+            ok
+    end.
+
+admit_warn_ms() ->
+    application:get_env(barrel_inference_server, engine_admit_warn_ms, 10000).
 
 %% Try `continue/3' when the work record carries a suffix; fall
 %% through to a full `infer/4' on `no_session' (engine has no
