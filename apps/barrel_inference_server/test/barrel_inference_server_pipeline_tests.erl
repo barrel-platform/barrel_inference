@@ -134,3 +134,19 @@ collect(Collector, Timeout) ->
         {dump, Msgs} -> Msgs
     after Timeout -> []
     end.
+
+%% On the engine_call_timeout, call_engine/3 returns 504, kills the spawned
+%% worker, and leaves no stale reply in the caller's mailbox.
+call_engine_timeout_returns_504_and_kills_worker_test() ->
+    application:set_env(barrel_inference_server, engine_call_timeout_ms, 100),
+    Fun = fun() -> timer:sleep(infinity) end,
+    R = barrel_inference_server_pipeline:call_engine(Fun, <<"unit-test-model">>, infer),
+    application:unset_env(barrel_inference_server, engine_call_timeout_ms),
+    ?assertEqual({error, 504, engine_unresponsive}, R),
+    ?assertEqual([], flush_mailbox()).
+
+flush_mailbox() ->
+    receive
+        M -> [M | flush_mailbox()]
+    after 50 -> []
+    end.

@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Pulled manifests cap the default context at 32768 instead of baking the model's
+  full native context (e.g. 262144). A large-context model no longer allocates tens
+  of GB of KV by default and trips `system_memory_high_watermark`; raise it per-model
+  via `/api/edit num_ctx` or the server-wide `max_context_size`.
+- Heavy tool-grammar requests no longer crash-loop. `engine_call_timeout_ms` is
+  raised to 120000 so a large model plus a large MCP tool grammar can compile and
+  prefill during admission, and a timed-out engine worker is now killed instead of
+  left running. New `barrel_inference_engine_admit_duration_seconds` histogram
+  (labelled by op `infer`/`continue`) makes admission latency observable, with a
+  slow-admit warning log.
+
 ### Barrel Inference 0.5.0 + tool-call exact-replay
 
 - Bumped to Barrel Inference 0.5.0 (`{barrel_inference, "0.5.0"}` in `rebar.config`).

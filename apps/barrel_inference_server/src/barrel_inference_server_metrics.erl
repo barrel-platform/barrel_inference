@@ -15,6 +15,7 @@
     record_request/4,
     observe_request_duration/3,
     observe_prefill/2,
+    observe_engine_admit/3,
     observe_generation_tps/2,
     inc_completion_tokens/2,
     inc_prompt_tokens/2,
@@ -96,6 +97,19 @@ init() ->
             <<"barrel_inference_prefill_duration_seconds">>,
             #{
                 description => <<"Prefill latency from admit to first token">>,
+                unit => <<"s">>,
+                boundaries => ?PREFILL_BUCKETS
+            }
+        )
+    ),
+    put_inst(
+        engine_admit_duration,
+        instrument_meter:create_histogram(
+            M,
+            <<"barrel_inference_engine_admit_duration_seconds">>,
+            #{
+                description =>
+                    <<"Engine admission latency (grammar compile + prefill) per infer op">>,
                 unit => <<"s">>,
                 boundaries => ?PREFILL_BUCKETS
             }
@@ -212,6 +226,12 @@ observe_prefill(Model, DurationSec) ->
         inst(prefill_duration),
         DurationSec,
         #{model => Model}
+    ).
+observe_engine_admit(Model, Op, DurationSec) ->
+    instrument_meter:record(
+        inst(engine_admit_duration),
+        DurationSec,
+        #{model => Model, op => Op}
     ).
 
 observe_generation_tps(Model, TokensPerSec) ->

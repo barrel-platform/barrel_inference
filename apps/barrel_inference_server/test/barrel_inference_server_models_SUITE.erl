@@ -32,7 +32,8 @@
     pull_leaves_loader_untouched_when_no_markers/1,
     pull_detects_think_tag_thinking_markers/1,
     pull_detects_thinking_tag_thinking_markers/1,
-    pull_leaves_thinking_markers_unset_when_no_tags/1
+    pull_leaves_thinking_markers_unset_when_no_tags/1,
+    pull_caps_large_context/1
 ]).
 
 %% GGUF value type tags (mirroring the gguf parser).
@@ -61,7 +62,8 @@ all() ->
         pull_leaves_loader_untouched_when_no_markers,
         pull_detects_think_tag_thinking_markers,
         pull_detects_thinking_tag_thinking_markers,
-        pull_leaves_thinking_markers_unset_when_no_tags
+        pull_leaves_thinking_markers_unset_when_no_tags,
+        pull_caps_large_context
     ].
 
 init_per_suite(Config) ->
@@ -257,6 +259,20 @@ resolve_spec_for_known_schemes(_Config) ->
     ?assertEqual(<<"bar">>, N3),
     ?assertEqual(<<"latest">>, T3).
 
+%% A model that advertises a huge native context must not bake that as the
+%% pulled load default (it would allocate tens of GB of KV); cap_ctx/1 clamps
+%% context_size and loader.n_ctx to DEFAULT_PULL_MAX_CTX (32768).
+pull_caps_large_context(Config) ->
+    Cwd = ?config(cwd, Config),
+    Path = filename:join(Cwd, "bigctx.gguf"),
+    ok = file:write_file(Path, synthetic_gguf(<<"{{ x }}">>, 262144)),
+    Spec = list_to_binary("file://" ++ Path),
+    {ok, M} = barrel_inference_server_models:pull(Spec, #{
+        name => <<"bigctx">>, tag => <<"latest">>
+    }),
+    ?assertEqual(32768, maps:get(<<"context_size">>, M)),
+    ?assertEqual(32768, maps:get(<<"n_ctx">>, maps:get(<<"loader">>, M))).
+
 %% =============================================================================
 %% Helpers
 %% =============================================================================
@@ -289,9 +305,12 @@ synthetic_gguf() ->
     synthetic_gguf(<<"{% for x in y %}{{ x }}{% endfor %}">>).
 
 synthetic_gguf(Template) ->
+    synthetic_gguf(Template, 4096).
+
+synthetic_gguf(Template, CtxLen) ->
     KVs = [
         {<<"general.architecture">>, ?T_STRING, <<"qwen2">>},
-        {<<"qwen2.context_length">>, ?T_UINT32, 4096},
+        {<<"qwen2.context_length">>, ?T_UINT32, CtxLen},
         {<<"qwen2.embedding_length">>, ?T_UINT32, 4096},
         {<<"general.file_type">>, ?T_UINT32, 15},
         {<<"general.size_label">>, ?T_STRING, <<"7B">>},
