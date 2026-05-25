@@ -629,11 +629,14 @@ finish_ok(Req0, S = #st{stream = false, api = Api}, Stats) ->
     {stop, Req1, S}.
 
 finish_err(Req0, S = #st{stream = true}, Reason) ->
+    %% Route through the same status/type/code mapping as the non-stream
+    %% path so a recovered decode_failed surfaces as a retryable error
+    %% (not a generic server_error).
     Err = json:encode(#{
         <<"error">> => #{
-            <<"message">> => to_bin(Reason),
-            <<"type">> => <<"server_error">>,
-            <<"code">> => to_bin(Reason)
+            <<"message">> => error_message(Reason),
+            <<"type">> => error_type(http_status(Reason)),
+            <<"code">> => error_code(Reason)
         }
     }),
     cowboy_req:stream_body(
@@ -880,12 +883,20 @@ error_message({context_overflow, Tokens, Ctx}) ->
             [Tokens, Ctx]
         )
     );
+error_message({error, {decode_failed, _}}) ->
+    error_message(decode_failed);
+error_message({decode_failed, _}) ->
+    error_message(decode_failed);
+error_message(decode_failed) ->
+    <<"the model was overloaded and could not process this request; please retry">>;
 error_message(Reason) ->
     to_bin(Reason).
 
 %% Stable atom-style code for tooling; OpenAI uses these for retry /
 %% UX decisions (e.g. `context_length_exceeded' is well-known).
 error_code({context_overflow, _, _}) -> <<"context_length_exceeded">>;
+error_code({error, {decode_failed, _}}) -> <<"server_overloaded">>;
+error_code({decode_failed, _}) -> <<"server_overloaded">>;
 error_code(Reason) -> to_bin(Reason).
 
 error_type(400) -> <<"invalid_request_error">>;
@@ -899,6 +910,8 @@ error_type(_) -> <<"server_error">>.
 http_status(prefill_timeout) -> 504;
 http_status(generation_idle_timeout) -> 504;
 http_status(total_timeout) -> 504;
+http_status({error, {decode_failed, _}}) -> 503;
+http_status({decode_failed, _}) -> 503;
 http_status(_) -> 500.
 
 sse_headers() ->

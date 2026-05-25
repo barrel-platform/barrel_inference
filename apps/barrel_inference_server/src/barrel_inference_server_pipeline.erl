@@ -42,6 +42,8 @@
 -export([build_params/1]).
 %% Exported for unit tests (grammar-skip decision; step_grammar/1 is private).
 -export([build_grammar/1]).
+%% Exported for unit tests (pure context-fitting math).
+-export([prompt_budget/2, keep_tail/2]).
 %% Exported for unit tests (timeout + worker-kill behavior).
 -export([call_engine/3]).
 
@@ -308,13 +310,23 @@ tokenise_raw(W, Prompt) ->
                     accept_tokens(W, Tokens);
                 {error, _, _} = E ->
                     E;
-                {overflow, Ctx} ->
-                    {error, 400, {context_overflow, length(Tokens), Ctx}}
+                {overflow, Budget} ->
+                    %% Ollama-style: truncate the raw prompt to fit (keep
+                    %% the most-recent tokens) rather than 400. The chat
+                    %% path truncates by dropping oldest messages.
+                    accept_tokens(W, keep_tail(Tokens, Budget))
             end;
         {ok, {error, Reason}} ->
             {error, 400, Reason};
         {error, _, _} = E ->
             E
+    end.
+
+keep_tail(Tokens, N) ->
+    Len = length(Tokens),
+    case Len > N of
+        true -> lists:nthtail(Len - N, Tokens);
+        false -> Tokens
     end.
 
 %% Wrap a blocking engine call (gen_statem:call to barrel_inference_model,
@@ -495,11 +507,48 @@ maybe_arm_continuation(W, Tokens) ->
 %% gen_statem:call into the model itself; cheap enough to call once
 %% per template attempt.
 fits_context(W, NToks) ->
-    case context_size(model_id(W)) of
+    case prompt_budget(W) of
         undefined -> {error, 503, not_loaded};
-        Ctx when NToks >= Ctx -> {overflow, Ctx};
-        _Ctx -> ok
+        Budget when NToks >= Budget -> {overflow, Budget};
+        _Budget -> ok
     end.
+
+%% Per-request effective context: the loaded context, optionally capped
+%% DOWN by the request's `num_ctx` (`context_cap`). A request can only
+%% shrink the window - the KV cache is sized at load - so a larger
+%% `num_ctx` is clamped to the loaded context (no reload).
+effective_context(W) ->
+    case context_size(model_id(W)) of
+        undefined ->
+            undefined;
+        Loaded ->
+            case (W#work.request)#barrel_inference_request.context_cap of
+                N when is_integer(N), N > 0 -> min(N, Loaded);
+                _ -> Loaded
+            end
+    end.
+
+%% Token budget for the PROMPT, reserving room for the requested
+%% generation so prompt + generation <= effective context (llama.cpp
+%% decode-fails when the two together exceed n_ctx). Reserve up to the
+%% requested `max_tokens`, capped at half the window so neither prompt nor
+%% generation is starved; at least 1 token each. `clamp_response_tokens/2`
+%% is the matching hard guarantee on the generation side.
+prompt_budget(W) ->
+    case effective_context(W) of
+        undefined ->
+            undefined;
+        EffCtx ->
+            prompt_budget(EffCtx, (W#work.request)#barrel_inference_request.max_tokens)
+    end.
+
+%% Pure: prompt token budget given the effective context and the
+%% requested generation (`max_tokens`). Reserve up to `MaxTokens`, capped
+%% at half the window so neither prompt nor generation is starved; >= 1
+%% each.
+prompt_budget(EffCtx, MaxTokens) ->
+    Reserve = max(1, min(MaxTokens, EffCtx div 2)),
+    max(1, EffCtx - Reserve).
 
 %% Drop the OLDEST non-system message. System messages anchor the
 %% conversation's persona / tool contract and Ollama preserves them
@@ -561,6 +610,22 @@ has_tools(#barrel_inference_request{tools = undefined}) -> false;
 has_tools(#barrel_inference_request{tools = []}) -> false;
 has_tools(#barrel_inference_request{tools = [_ | _]}) -> true.
 
+%% Cap the generation budget to the room left after the (already
+%% truncated) prompt, so prompt + generation never exceed the effective
+%% context. The hard guarantee behind prompt_budget/1; applied with the
+%% rendered prompt token count known (W#work.tokens).
+clamp_response_tokens(W, Params) ->
+    case effective_context(W) of
+        undefined ->
+            Params;
+        EffCtx ->
+            Room = max(1, EffCtx - length(W#work.tokens)),
+            case maps:get(response_tokens, Params, undefined) of
+                N when is_integer(N), N > Room -> Params#{response_tokens => Room};
+                _ -> Params
+            end
+    end.
+
 step_queue(W) ->
     Model = model_id(W),
     Timeout = queue_timeout(Model),
@@ -578,7 +643,7 @@ step_queue(W) ->
     end.
 
 step_infer(W) ->
-    Params = build_params(W#work.request),
+    Params = clamp_response_tokens(W, build_params(W#work.request)),
     Call = fun() -> do_infer(W, Params) end,
     %% do_infer picks infer/4 vs continue/3 from W#work.continuation; label
     %% the admission metric the same way so the two paths are distinguishable.

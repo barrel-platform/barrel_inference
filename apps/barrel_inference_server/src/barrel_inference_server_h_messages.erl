@@ -1612,6 +1612,12 @@ error_message({context_overflow, Tokens, Ctx}) ->
             [Tokens, Ctx]
         )
     );
+error_message({error, {decode_failed, _}}) ->
+    error_message(decode_failed);
+error_message({decode_failed, _}) ->
+    error_message(decode_failed);
+error_message(decode_failed) ->
+    <<"the model was overloaded and could not process this request; please retry">>;
 error_message(Reason) ->
     to_bin(Reason).
 
@@ -1629,6 +1635,10 @@ anthropic_error_type(_) -> <<"api_error">>.
 http_status(prefill_timeout) -> 504;
 http_status(generation_idle_timeout) -> 504;
 http_status(total_timeout) -> 504;
+%% A recovered decode failure (KV exhaustion under concurrency) is
+%% retryable: 503 -> Anthropic `overloaded_error` (529 + Retry-After).
+http_status({error, {decode_failed, _}}) -> 503;
+http_status({decode_failed, _}) -> 503;
 http_status(_) -> 500.
 
 sse_headers() ->
