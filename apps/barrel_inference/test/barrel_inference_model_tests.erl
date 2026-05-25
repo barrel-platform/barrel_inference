@@ -202,6 +202,34 @@ long_prompt_fires_cold_save_test() ->
         ?assertMatch({ok, _Row}, wait_for_key(ColdKey, 1000))
     end).
 
+ladder_fires_multiple_cold_saves_test() ->
+    %% With max_ladder_rows > 0 a cold prefill writes a cold save at each
+    %% ladder boundary below the trim, plus the trim boundary itself -
+    %% more than the single legacy checkpoint.
+    Policy = #{
+        ladder_interval => 8,
+        max_ladder_rows => 3,
+        boundary_align_tokens => 1,
+        cold_min_tokens => 4
+    },
+    Prompt = list_to_binary(
+        string:join([integer_to_list(N) || N <- lists:seq(1, 40)], " ")
+    ),
+    with_model(Policy, fun(Cfg) ->
+        Before = maps:get(saves_cold, barrel_inference_cache:get_counters()),
+        {ok, _} = barrel_inference_model:complete(<<"test_model">>, Prompt, #{
+            response_tokens => 2
+        }),
+        timer:sleep(100),
+        After = maps:get(saves_cold, barrel_inference_cache:get_counters()),
+        %% ladder 8,16,24 + trim 40 = 4 cold saves (allow for a dropped
+        %% async write under the 2-worker test writer).
+        ?assert(After - Before >= 2),
+        %% A head-boundary cold row (first 8 tokens) is reusable.
+        HeadKey = key_for_tokens(lists:sublist(prompt_tokens(Prompt), 8), Cfg),
+        ?assertMatch({ok, _Row}, wait_for_key(HeadKey, 1000))
+    end).
+
 %% =============================================================================
 %% Finish save fires at end-of-stream when total is above min
 %% =============================================================================
@@ -612,6 +640,63 @@ sticky_seq_continues_on_same_session_test() ->
         ?assertEqual(ok, barrel_inference:end_session(<<"test_model">>, SessionId)),
         %% Idempotent: a second end_session on the same id is a no-op.
         ?assertEqual(ok, barrel_inference:end_session(<<"test_model">>, SessionId))
+    end).
+
+sticky_partial_reuses_common_prefix_on_divergence_test() ->
+    %% Same session, but turn 2 is NOT a strict extension of turn 1's
+    %% committed tokens (re-render / mid-history edit). The engine reuses
+    %% the longest common prefix of the pinned seq's live KV
+    %% (cache_hit_kind = partial) instead of admitting cold.
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        ok = barrel_inference_model_stub:reset_seq_rm_last_calls(),
+        {ok, #{generated := Gen1}} = barrel_inference_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        L = length(Turn1Tokens) - 2,
+        Shared = lists:sublist(Turn1Tokens, L),
+        Divergent = prompt_tokens(<<"a completely different tail here now">>),
+        FullTokens = Shared ++ Divergent,
+        {ok, Ref} = barrel_inference_model:infer(
+            <<"test_model">>,
+            FullTokens,
+            #{response_tokens => 2, session_id => SessionId},
+            self()
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(partial, maps:get(cache_hit_kind, Stats)),
+        Delta = maps:get(cache_delta, Stats),
+        ?assertEqual(L, maps:get(read, Delta)),
+        %% The range-trim primer ran with N = L (the common-prefix length).
+        Calls = barrel_inference_model_stub:seq_rm_last_calls(),
+        ?assert(lists:any(fun({_SeqId, N}) -> N =:= L end, Calls))
+    end).
+
+sticky_partial_below_floor_admits_cold_test() ->
+    %% A common prefix shorter than max(1, min_tokens) is not worth a
+    %% partial reuse: fall back to a full cold admit (which clears the
+    %% pinned stale KV).
+    SessionId = make_ref(),
+    with_model(#{min_tokens => 8}, fun(_Cfg) ->
+        {ok, _} = barrel_inference_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 2, session_id => SessionId}
+        ),
+        Shared = lists:sublist(prompt_tokens(long_prompt()), 2),
+        Divergent = prompt_tokens(<<"zzz yyy xxx www different entirely">>),
+        FullTokens = Shared ++ Divergent,
+        {ok, Ref} = barrel_inference_model:infer(
+            <<"test_model">>,
+            FullTokens,
+            #{response_tokens => 2, session_id => SessionId},
+            self()
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(cold, maps:get(cache_hit_kind, Stats))
     end).
 
 sticky_seq_does_not_affect_non_session_callers_test() ->

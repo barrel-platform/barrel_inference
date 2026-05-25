@@ -392,12 +392,15 @@ concurrently through one decode call per tick.
     %% Tokens to prefill AFTER the next cold save fires. Cold-save
     %% policy splits the prompt into a trimmed prefix (which lands
     %% as the cold save) and a remainder. The trimmed prefix goes
-    %% into prefill_cursor; this field holds the remainder. After
-    %% the trim's prefill tick fires the cold save, this gets
-    %% rotated into prefill_cursor on the next tick. `undefined`
-    %% when no cold save is pending (no_save policy, prefill_only
-    %% mode, or warm-restore path).
-    cold_save_remaining = undefined :: undefined | [non_neg_integer()],
+    %% Cold-prefill checkpoint ladder: the prompt is split into prefill
+    %% segments; the first goes into prefill_cursor and this field holds
+    %% the segments still to prefill. Each time the cursor drains to a
+    %% (non-final) segment boundary, maybe_fire_cold_save/2 fires a cold
+    %% save and rotates the next segment in. The final segment is a
+    %% non-saving remainder, so cold saves = length(initial segments) - 1.
+    %% `undefined` when no cold ladder is pending (prefill_only mode or
+    %% warm-restore path); `[]` once the final remainder is reached.
+    cold_save_segments = undefined :: undefined | [[non_neg_integer()]],
     %% Set when this request has emitted its final result. The next
     %% step_tick iteration drops it from req_table; deferring the
     %% removal lets the tick walk results without mid-iteration
@@ -1136,6 +1139,8 @@ admit(Item, Data) ->
     case resolve_admission_seq(Item, Data) of
         {sticky, SeqId, StoredTokens, NewData} ->
             start_admission(Item, SeqId, {sticky, StoredTokens}, NewData);
+        {sticky_partial, SeqId, L, NewData} ->
+            start_admission(Item, SeqId, {sticky_partial, L}, NewData);
         {normal, NewData} ->
             admit_normal(Item, NewData);
         {sticky_busy, _SessionId} ->
@@ -1263,6 +1268,7 @@ start_admission(Item, SeqId, Mode, Data) ->
             Data1 =
                 case Mode of
                     {sticky, _} -> Data;
+                    {sticky_partial, _} -> Data;
                     {continue, _} -> Data;
                     normal -> Data#data{idle_seq_ids = [SeqId | Data#data.idle_seq_ids]}
                 end,
@@ -1310,16 +1316,33 @@ resolve_sticky_continuation(SessionId, SeqId, StoredTokens, Item, Data) ->
         true ->
             {sticky, SeqId, StoredTokens, Data};
         false ->
-            %% Divergence: drop the sticky mapping, free the seq's
-            %% live KV, return the seq to the idle pool. The
-            %% caller's normal admission picks it back up.
-            backend_seq_clear_for(SeqId, Data),
-            NewData = Data#data{
-                session_seq = maps:remove(SessionId, Data#data.session_seq),
-                idle_seq_ids = [SeqId | Data#data.idle_seq_ids]
-            },
-            {normal, NewData}
+            %% Not a clean extension (re-render, retokenisation, or a
+            %% mid-history edit). Reuse the longest common prefix of the
+            %% pinned seq's live KV in place: keep cells [0, L), re-prefill
+            %% the divergent suffix. L >= max(1, min_tokens) is required -
+            %% min_tokens may be 0, and an L = 0 partial would leave the
+            %% stale KV uncleared (setup_warm with an empty prefix is a
+            %% no-op). Below the floor, fall back to a full cold admit.
+            L = longest_common_prefix_len(StoredTokens, Prompt),
+            Floor = max(1, maps:get(min_tokens, Data#data.policy, 1)),
+            case L >= Floor of
+                true ->
+                    {sticky_partial, SeqId, L, Data};
+                false ->
+                    backend_seq_clear_for(SeqId, Data),
+                    NewData = Data#data{
+                        session_seq = maps:remove(SessionId, Data#data.session_seq),
+                        idle_seq_ids = [SeqId | Data#data.idle_seq_ids]
+                    },
+                    {normal, NewData}
+            end
     end.
+
+%% Length of the longest common prefix of two token lists.
+longest_common_prefix_len(A, B) -> lcp_len(A, B, 0).
+
+lcp_len([X | As], [X | Bs], N) -> lcp_len(As, Bs, N + 1);
+lcp_len(_, _, N) -> N.
 
 backend_seq_clear_for(SeqId, #data{backend = Mod, backend_state = S}) ->
     case erlang:function_exported(Mod, seq_rm, 2) of
@@ -1660,7 +1683,18 @@ setup_admission_path(Req, {continue, StoredTokens}, Suffix, _Opts, _Data) ->
         context_tokens = StoredTokens,
         cache_hit_kind = continuation,
         cache_hit_prefix_len = length(StoredTokens)
-    }.
+    };
+setup_admission_path(Req, {sticky_partial, L}, Prompt, _Opts, Data) ->
+    %% Reuse the longest common prefix of the pinned seq's live KV. Keep
+    %% the first L prompt tokens and route through setup_warm/5: its
+    %% warm_restore_primer/3 calls seq_rm_last(SeqId, L), which removes the
+    %% position RANGE [L-1, inf) - dropping the stale tail [L, M) AND
+    %% priming cell L-1 - then re-prefills cell L-1 plus the divergent
+    %% suffix, regenerating correct logits.
+    barrel_inference_cache_counters:incr(?C_HITS_STICKY_PARTIAL),
+    Keep = lists:sublist(Prompt, L),
+    Suffix = lists:nthtail(L, Prompt),
+    setup_warm(Req, Keep, Suffix, partial, Data).
 
 %% Run the cache lookup for this request's prompt and set up the
 %% #req's `prefill_cursor` and `context_tokens` accordingly. The
@@ -1698,31 +1732,27 @@ setup_warm(Req, ContextTokens, RemainingTokens, HitKind, Data) ->
     end.
 
 %% Reset the seq's KV before a cold prefill so per_seq.next_pos
-%% starts at 0, then split the prompt per the cold-save policy.
-%% The trim slice goes into prefill_cursor; the remainder is held
-%% in cold_save_remaining and rotated in by maybe_fire_cold_save
-%% after the trim's prefill tick has fired the save.
+%% starts at 0, then split the prompt into checkpoint-ladder segments.
+%% The first segment goes into prefill_cursor; the rest are held in
+%% cold_save_segments and rotated in by maybe_fire_cold_save as each
+%% boundary's prefill tick fires its cold save. cold_save_segments/2
+%% always returns at least one (remainder) segment, so the split is
+%% total.
 setup_cold(Req, Data) ->
     ok = backend_seq_clear(Req#req.seq_id, Data),
     Tokens = Req#req.prompt_tokens,
-    case barrel_inference_cache_policy:cold_save_split(Tokens, Data#data.policy) of
-        {trim, TrimmedPrefix, RemainingTokens} ->
-            Req#req{
-                prefill_cursor = TrimmedPrefix,
-                cold_save_remaining = RemainingTokens,
-                context_tokens = [],
-                cache_hit_kind = cold,
-                cache_hit_prefix_len = 0
-            };
-        no_save ->
-            Req#req{
-                prefill_cursor = Tokens,
-                cold_save_remaining = undefined,
-                context_tokens = [],
-                cache_hit_kind = cold,
-                cache_hit_prefix_len = 0
-            }
-    end.
+    [Seg1 | Rest] = barrel_inference_cache_policy:cold_save_segments(Tokens, Data#data.policy),
+    Req#req{
+        prefill_cursor =
+            case Seg1 of
+                [] -> undefined;
+                _ -> Seg1
+            end,
+        cold_save_segments = Rest,
+        context_tokens = [],
+        cache_hit_kind = cold,
+        cache_hit_prefix_len = 0
+    }.
 
 %% Wipe seq's KV state so prefill starts at position 0. Used on the
 %% cold path to defend against leftover cells from a prior
@@ -2646,27 +2676,33 @@ mark_terminal(Data) ->
         Reqs
     ).
 
-%% Cold-save firing between the trim-prefill tick and the remainder
-%% tick. At this point the seq's KV holds exactly the trimmed
-%% prefix — kv_pack captures that state. The remainder is rotated
-%% into prefill_cursor so the next tick continues the prefill. With
-%% cold_save_remaining = undefined nothing fires (no_save policy,
-%% prefill_only mode, or warm path).
-maybe_fire_cold_save(Req = #req{cold_save_remaining = undefined}, _Data) ->
+%% Cold-save firing as each ladder segment finishes prefilling. When
+%% cold_save_segments still has entries, the just-drained boundary is an
+%% internal one: the seq's KV holds exactly context_tokens (an aligned
+%% prefix), kv_pack captures it, and the next segment rotates into
+%% prefill_cursor. An empty list means the final remainder just drained:
+%% no cold save (the finish save covers the full prompt). `undefined`
+%% means no cold ladder (prefill_only mode or warm path).
+maybe_fire_cold_save(Req = #req{cold_save_segments = undefined}, _Data) ->
     Req;
+maybe_fire_cold_save(Req = #req{cold_save_segments = []}, _Data) ->
+    Req#req{cold_save_segments = undefined, prefill_cursor = undefined};
 maybe_fire_cold_save(
-    Req = #req{cold_save_remaining = Remaining, context_tokens = Trimmed},
+    Req = #req{cold_save_segments = [Next | Rest], context_tokens = Ctx},
     Data
 ) ->
-    Req0 = fire_save_for_tokens(cold, Trimmed, Req, Data),
+    Req0 = fire_save_for_tokens(cold, Ctx, Req, Data),
+    %% Next is the following segment to prefill. When the trim boundary is
+    %% the full prompt length the trailing remainder is empty: treat it as
+    %% no further prefill (undefined cursor) rather than an empty cursor.
     NextCursor =
-        case Remaining of
+        case Next of
             [] -> undefined;
-            _ -> Remaining
+            _ -> Next
         end,
     Req0#req{
-        cold_save_remaining = undefined,
-        last_save_at = length(Trimmed),
+        cold_save_segments = Rest,
+        last_save_at = length(Ctx),
         prefill_cursor = NextCursor
     }.
 

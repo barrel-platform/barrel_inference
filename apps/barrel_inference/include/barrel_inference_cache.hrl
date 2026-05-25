@@ -59,7 +59,11 @@
 %% fire-and-forget; this counter is the only surface that reveals a
 %% back-pressured writer dropping a save the model wanted to fire.
 -define(C_SAVES_DROPPED, 20).
--define(C_NSLOTS, 20).
+%% Bumped when the engine reuses the longest common prefix of a pinned
+%% session's live KV in place (sticky_partial admission). Distinct from
+%% hits_longest_prefix, which counts the persisted-cache resume path.
+-define(C_HITS_STICKY_PARTIAL, 21).
+-define(C_NSLOTS, 21).
 
 %% Public types live in `barrel_inference_cache.erl`. Refer to them as
 %% `barrel_inference_cache:cache_key()` etc. from outside this header.
