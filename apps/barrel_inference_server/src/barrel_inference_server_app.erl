@@ -117,19 +117,23 @@ default_cache_policy() ->
     #{
         min_tokens => 64,
         cold_min_tokens => 128,
-        %% Upper bound on the prompt length that gets a cold prefix
-        %% checkpoint at admission. Agent clients (Claude Code et al.)
-        %% ship 25-32k-token system + tool + history prompts; at the old
-        %% 8192 cap cold_save_split returned no_save for every such
-        %% request, so the only stored keys were full-prompt finish-saves
-        %% and the longest-prefix lookup never warmed across turns. Cover
-        %% a full 32k context; the pack cost matches the finish-save we
-        %% already take. Deriving this from the model's loaded context is
-        %% a follow-up.
-        cold_max_tokens => 32768,
+        %% Upper bound on the prompt length that gets cold prefix
+        %% checkpoints at admission. Agent clients (Claude Code et al.)
+        %% ship large system + tool + history prompts; below this cap
+        %% cold_save returns no_save and the longest-prefix lookup never
+        %% warms across turns. Cover a full 64k context (n_ctx is raised to
+        %% match); the pack cost matches the finish-save we already take.
+        cold_max_tokens => 65536,
         continued_interval => 2048,
         boundary_trim_tokens => 0,
         boundary_align_tokens => 16,
+        %% Cold-save checkpoint ladder: write up to max_ladder_rows cold
+        %% prefix checkpoints during a cold prefill, spaced ~ladder_interval
+        %% tokens apart (aligned to boundary_align_tokens), so a later turn
+        %% that diverges mid-prompt can still resume from a shared-head
+        %% checkpoint. 0 disables (finish-save still covers the full prompt).
+        ladder_interval => 16384,
+        max_ladder_rows => 4,
         session_resume_wait_ms => 500
     }.
 
