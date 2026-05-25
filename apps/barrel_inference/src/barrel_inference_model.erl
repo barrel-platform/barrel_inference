@@ -3156,15 +3156,15 @@ lookup_or_resume(PromptTokens, ParentKey, Req, Data) ->
             barrel_inference_cache_counters:incr(?C_HITS_EXACT),
             {warm, ContextTokens, [], exact};
         miss when ParentKey =/= undefined ->
-            try_session_resume(PromptBytes, ParentKey, Req, Data);
+            try_session_resume(PromptTokens, PromptBytes, ParentKey, Req, Data);
         miss ->
-            try_longest_prefix(PromptBytes, Req, Data)
+            try_longest_prefix(PromptTokens, PromptBytes, Req, Data)
     end.
 
 %% Content-addressed byte-prefix lookup: find the longest stored
 %% rendered-byte prefix of PromptBytes and resume from it. Falls
 %% through to cold only when nothing matches.
-try_longest_prefix(PromptBytes, Req, Data) ->
+try_longest_prefix(PromptTokens, PromptBytes, Req, Data) ->
     KeyMeta = #{
         fingerprint => request_fp(Req, Data),
         quant_type => Data#data.quant_type,
@@ -3173,7 +3173,7 @@ try_longest_prefix(PromptBytes, Req, Data) ->
     case barrel_inference_cache_meta_srv:lookup_longest_text_prefix(KeyMeta, PromptBytes) of
         {ok, MatchBytes, Row} ->
             resume_at_prefix(
-                element(?POS_KEY, Row), MatchBytes, PromptBytes, Req, Data
+                element(?POS_KEY, Row), MatchBytes, PromptTokens, PromptBytes, Req, Data
             );
         miss ->
             barrel_inference_cache_counters:incr(?C_MISSES),
@@ -3181,34 +3181,69 @@ try_longest_prefix(PromptBytes, Req, Data) ->
     end.
 
 %% Pin + load the matched row's exact tokens + KV, then build the
-%% suffix from the rendered bytes the checkpoint did not cover. The
-%% SHA-256 byte key is the whole verification (no token-prefix
-%% check): the matched row's stored bytes ARE the leading MatchBytes
-%% of PromptBytes. The effective prompt is
-%% `CheckpointTokens ++ tokenize(byte-suffix)`; its join may differ
-%% from a fresh full tokenisation but renders the identical byte
-%% stream (ds4's contract).
-resume_at_prefix(Key, MatchBytes, PromptBytes, Req, Data) ->
+%% suffix the checkpoint did not cover. The SHA-256 byte key is the
+%% whole verification (no token-prefix check): the matched row's
+%% stored bytes ARE the leading MatchBytes of PromptBytes.
+resume_at_prefix(Key, MatchBytes, PromptTokens, PromptBytes, Req, Data) ->
     case pin_and_load(Key, Req#req.seq_id, Data) of
         {ok, CheckpointTokens} ->
             barrel_inference_cache_counters:incr(?C_HITS_LONGEST_PREFIX),
-            {warm, CheckpointTokens, suffix_tokens(PromptBytes, MatchBytes, Data), partial};
+            Suffix = resume_suffix(PromptTokens, PromptBytes, MatchBytes, Data),
+            {warm, CheckpointTokens, Suffix, partial};
         miss ->
             barrel_inference_cache_counters:incr(?C_MISSES),
             cold
     end.
 
-%% Tokenise the rendered bytes a checkpoint of MatchBytes length did
-%% not cover. An empty suffix (exact-length byte match) tokenises to
-%% [].
-suffix_tokens(PromptBytes, MatchBytes, Data) ->
+%% Tokens for the part of the prompt a checkpoint of MatchBytes length
+%% did not cover. When the byte boundary lands exactly on a token
+%% boundary of the caller's PromptTokens (the common case: identical
+%% or cleanly-extended prompt), reuse the ORIGINAL suffix tokens so
+%% warm resume stays token-exact and a re-sent prompt reproduces its
+%% reply. Only a genuine retokenisation - the checkpoint's bytes
+%% ending mid-token - falls back to tokenising the byte remainder
+%% (`CheckpointTokens ++ tokenize(byte_suffix)`, byte-identical, ds4's
+%% contract).
+resume_suffix(PromptTokens, PromptBytes, MatchBytes, Data) ->
     case byte_size(PromptBytes) - MatchBytes of
         0 ->
             [];
         SuffixLen ->
-            SuffixBytes = binary:part(PromptBytes, MatchBytes, SuffixLen),
-            backend_call(Data, tokenize, [SuffixBytes])
+            case split_tokens_at_byte(PromptTokens, MatchBytes, Data) of
+                {aligned, SuffixTokens} ->
+                    SuffixTokens;
+                misaligned ->
+                    SuffixBytes = binary:part(PromptBytes, MatchBytes, SuffixLen),
+                    backend_call(Data, tokenize, [SuffixBytes])
+            end
     end.
+
+%% Find K such that detokenising the first K of Tokens yields exactly
+%% TargetBytes bytes, and return `{aligned, drop-first-K}`. Returns
+%% `misaligned` when TargetBytes falls inside a token. The prefix byte
+%% length is non-decreasing in K, so a binary search converges in
+%% O(log N) detokenise probes (once per warm admission, off the
+%% per-token decode path).
+split_tokens_at_byte(Tokens, TargetBytes, Data) ->
+    split_tokens_at_byte(Tokens, TargetBytes, Data, 0, length(Tokens)).
+
+split_tokens_at_byte(Tokens, TargetBytes, Data, Lo, Hi) when Lo =< Hi ->
+    Mid = (Lo + Hi) div 2,
+    case prefix_byte_size(Tokens, Mid, Data) of
+        TargetBytes ->
+            {aligned, lists:nthtail(Mid, Tokens)};
+        Bytes when Bytes < TargetBytes ->
+            split_tokens_at_byte(Tokens, TargetBytes, Data, Mid + 1, Hi);
+        _ ->
+            split_tokens_at_byte(Tokens, TargetBytes, Data, Lo, Mid - 1)
+    end;
+split_tokens_at_byte(_Tokens, _TargetBytes, _Data, _Lo, _Hi) ->
+    misaligned.
+
+prefix_byte_size(_Tokens, 0, _Data) ->
+    0;
+prefix_byte_size(Tokens, K, Data) ->
+    byte_size(backend_call(Data, detokenize, [lists:sublist(Tokens, K)])).
 
 %% Session fast path: the previous turn threaded its finish key as
 %% ParentKey. If that checkpoint is cached and its rendered bytes are
@@ -3216,7 +3251,7 @@ suffix_tokens(PromptBytes, MatchBytes, Data) ->
 %% Otherwise fall through to the general byte-prefix scan (NOT cold) -
 %% retokenisation across turns means a token-level check would
 %% needlessly miss.
-try_session_resume(PromptBytes, ParentKey, Req, Data) ->
+try_session_resume(PromptTokens, PromptBytes, ParentKey, Req, Data) ->
     Wait = maps:get(session_resume_wait_ms, Data#data.policy, 500),
     %% First wait for the row to publish (the previous turn's
     %% finish-save may still be in flight), then pin via checkout.
@@ -3225,24 +3260,25 @@ try_session_resume(PromptBytes, ParentKey, Req, Data) ->
             case pin_and_load(ParentKey, Req#req.seq_id, Data) of
                 {ok, ParentTokens} ->
                     resume_session_or_fallthrough(
-                        PromptBytes, ParentTokens, Req, Data
+                        PromptTokens, PromptBytes, ParentTokens, Req, Data
                     );
                 miss ->
-                    try_longest_prefix(PromptBytes, Req, Data)
+                    try_longest_prefix(PromptTokens, PromptBytes, Req, Data)
             end;
         miss ->
-            try_longest_prefix(PromptBytes, Req, Data)
+            try_longest_prefix(PromptTokens, PromptBytes, Req, Data)
     end.
 
-resume_session_or_fallthrough(PromptBytes, ParentTokens, Req, Data) ->
+resume_session_or_fallthrough(PromptTokens, PromptBytes, ParentTokens, Req, Data) ->
     ParentBytes = backend_call(Data, detokenize, [ParentTokens]),
     PLen = byte_size(ParentBytes),
     case PromptBytes of
         <<ParentBytes:PLen/binary, _/binary>> ->
             barrel_inference_cache_counters:incr(?C_HITS_RESUME),
-            {warm, ParentTokens, suffix_tokens(PromptBytes, PLen, Data), partial};
+            Suffix = resume_suffix(PromptTokens, PromptBytes, PLen, Data),
+            {warm, ParentTokens, Suffix, partial};
         _ ->
-            try_longest_prefix(PromptBytes, Req, Data)
+            try_longest_prefix(PromptTokens, PromptBytes, Req, Data)
     end.
 
 %% checkout the row, load + unpack the payload under the pin (into

@@ -63,9 +63,12 @@ The lookup order is:
 Any failure of 1 or 2 falls through to 3; only a byte-prefix miss is
 cold. The longest-byte-prefix lookup is still exact: it picks the
 longest stored rendered-byte prefix whose recomputed SHA-256 key
-matches, resumes from that checkpoint's exact tokens, and
-re-tokenises only the byte suffix (`checkpoint_tokens ++
-tokenize(byte_suffix)` - identical byte stream, ds4's contract).
+matches and resumes from that checkpoint's exact tokens. The suffix
+beyond the match reuses the caller's ORIGINAL tokens when the byte
+boundary lands on a token boundary (token-exact, the common case);
+only a mid-token boundary re-tokenises the byte remainder
+(`checkpoint_tokens ++ tokenize(byte_suffix)` - identical byte
+stream, ds4's contract).
 
 ## Restore or prefill
 

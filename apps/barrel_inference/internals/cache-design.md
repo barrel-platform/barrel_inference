@@ -39,9 +39,14 @@ The **longest byte-prefix** lookup
 solves "this prompt is yesterday's prompt plus a new turn": over the
 `available` rows it picks the longest stored `text_bytes <=
 byte_size(prompt_bytes)` whose recomputed key matches, restores that
-checkpoint's exact tokens + KV, and prefills only the re-tokenised
-byte suffix. The effective prompt is `checkpoint_tokens ++
-tokenize(byte_suffix)`; its token boundaries at the seam may differ
+checkpoint's exact tokens + KV, and prefills only the uncovered
+suffix. When the checkpoint's byte boundary lands on a token boundary
+of the caller's prompt (the common case, including an identical
+re-send), the suffix is the caller's ORIGINAL remaining tokens, so
+resume is token-exact and a re-sent prompt reproduces its reply. Only
+when the boundary falls mid-token (a genuine retokenisation) is the
+byte remainder re-tokenised (`checkpoint_tokens ++
+tokenize(byte_suffix)`); the token boundaries at the seam then differ
 from a fresh full tokenisation, but the byte stream is identical, so
 the resume is sound (ds4's contract). The recomputed key folds in
 the current model's `fp/quant/ctx`, so rows from another

@@ -15,9 +15,12 @@ this project adheres to [Semantic Versioning](https://semver.org).
   generated ids vs re-tokenised assistant text), where the old
   token-keyed cache went cold every turn. The longest-prefix lookup
   (`barrel_inference_cache_meta_srv:lookup_longest_text_prefix/2`)
-  scans stored byte-prefix lengths and resumes from the longest match,
-  re-tokenising only the byte suffix (`checkpoint_tokens ++
-  tokenize(byte_suffix)`; identical byte stream, sound). Hits stay
+  scans stored byte-prefix lengths and resumes from the longest match.
+  The uncovered suffix reuses the caller's original tokens when the
+  byte boundary lands on a token boundary (token-exact resume - so a
+  re-sent prompt still reproduces its reply); only a mid-token boundary
+  re-tokenises the byte remainder (`checkpoint_tokens ++
+  tokenize(byte_suffix)`, identical byte stream, sound). Hits stay
   exact (SHA-256 over the bytes; no fuzzy match). The KVC file format
   version is bumped to **v2**; old v1 (token-keyed) files are rejected
   on the startup disk scan, so the cache refills under the new scheme.

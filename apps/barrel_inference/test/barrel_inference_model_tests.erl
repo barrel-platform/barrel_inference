@@ -644,14 +644,11 @@ prefill_only_returns_finish_key_and_warm_resumes_test() ->
 prefill_only_with_parent_key_chains_warm_contexts_test() ->
     %% Warm a prefix via prefill_only/2, then extend it via
     %% prefill_only/3 with parent_key. The second call takes the
-    %% session-resume path (cache_hit_kind = partial): the checkpoint's
-    %% exact tokens are restored and the rendered-byte suffix the
-    %% checkpoint did not cover is RE-TOKENISED and prefilled. Because
-    %% the cache is byte-addressed (ds4-style), the rejoined effective
-    %% context is `checkpoint_tokens ++ tokenize(byte_suffix)`, which
-    %% may differ at the join from a fresh tokenisation of the whole
-    %% prompt - the byte stream is identical, the token boundaries at
-    %% the seam are not.
+    %% session-resume path (cache_hit_kind = partial), prefilling only
+    %% the suffix. The byte boundary lands on a token boundary of the
+    %% extended prompt (Prefix's rendered bytes are a clean prefix), so
+    %% resume stays token-exact: the rejoined context is the original
+    %% Extended and a fresh finish_key for the prefix-plus-suffix row.
     with_model(#{}, fun(Cfg) ->
         Prefix = prompt_tokens(long_prompt()),
         Suffix = prompt_tokens(short_prompt()),
@@ -660,15 +657,6 @@ prefill_only_with_parent_key_chains_warm_contexts_test() ->
             barrel_inference_model:prefill_only(<<"test_model">>, Prefix),
         ?assertEqual(key_for_tokens(Prefix, Cfg), PrefixKey),
         {ok, _} = wait_for_key(PrefixKey, 1000),
-        %% The engine restores Prefix (the checkpoint tokens) and
-        %% re-tokenises the byte suffix beyond Prefix's rendered bytes.
-        ParentBytes = list_to_binary(stub_detokenize_decimal(Prefix)),
-        PromptBytes = list_to_binary(stub_detokenize_decimal(Extended)),
-        SuffixBytes = binary:part(
-            PromptBytes, byte_size(ParentBytes), byte_size(PromptBytes) - byte_size(ParentBytes)
-        ),
-        ExpectedSuffixTokens = prompt_tokens(SuffixBytes),
-        ExpectedCtx = Prefix ++ ExpectedSuffixTokens,
         {ok, #{
             cache_hit_kind := Kind,
             context_tokens := ExtCtx,
@@ -682,13 +670,13 @@ prefill_only_with_parent_key_chains_warm_contexts_test() ->
         %% (only a prefix of the prompt was in cache); only an
         %% identical prompt produces `exact`.
         ?assertEqual(partial, Kind),
-        ?assertEqual(ExpectedCtx, ExtCtx),
-        ?assertEqual(length(ExpectedCtx), ExtN),
-        ?assertEqual(key_for_tokens(ExpectedCtx, Cfg), ExtendedKey),
+        ?assertEqual(Extended, ExtCtx),
+        ?assertEqual(length(Extended), ExtN),
+        ?assertEqual(key_for_tokens(Extended, Cfg), ExtendedKey),
         %% Read = checkpoint prefix length restored from cache;
-        %% Created = the re-tokenised suffix added by this call.
+        %% Created = the suffix tokens added by this call.
         ?assertEqual(length(Prefix), Read),
-        ?assertEqual(length(ExpectedSuffixTokens), Created)
+        ?assertEqual(length(Suffix), Created)
     end).
 
 %% =============================================================================
