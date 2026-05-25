@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   (precedence `parameters.num_seq_max` > `loader.n_seq_max` > 4) drives both the
   engine seq pool and admission concurrency (`pool_policy_for/1`) so they never
   drift; existing models get the default without re-pulling.
+- `/api/show` reports the context the model actually loads with (honours a
+  `parameters.num_ctx` override set via `/api/edit`) instead of the raw manifest
+  `context_size`, which left the override invisible. The loader resolves `n_ctx`
+  through the same new `barrel_inference_server_models:effective_context_size/1`
+  (precedence `parameters.num_ctx` > manifest `context_size`, capped by
+  `max_context_size`) so the reported and loaded contexts never drift.
 
 ### Added
 
