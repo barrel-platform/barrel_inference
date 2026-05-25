@@ -1354,10 +1354,19 @@ error_message({context_overflow, Tokens, Ctx}) ->
             [Tokens, Ctx]
         )
     );
+error_message({error, {decode_failed, _}}) ->
+    decode_failed_message();
+error_message({decode_failed, _}) ->
+    decode_failed_message();
 error_message(Reason) ->
     to_bin(Reason).
 
+decode_failed_message() ->
+    <<"the model was overloaded and could not process this request; please retry">>.
+
 error_code({context_overflow, _, _}) -> <<"context_length_exceeded">>;
+error_code({error, {decode_failed, _}}) -> <<"server_overloaded">>;
+error_code({decode_failed, _}) -> <<"server_overloaded">>;
 error_code(Reason) -> to_bin(Reason).
 
 error_type(400) -> <<"invalid_request_error">>;
@@ -1372,6 +1381,8 @@ error_type(_) -> <<"server_error">>.
 http_status(prefill_timeout) -> 504;
 http_status(generation_idle_timeout) -> 504;
 http_status(total_timeout) -> 504;
+http_status({error, {decode_failed, _}}) -> 503;
+http_status({decode_failed, _}) -> 503;
 http_status(_) -> 500.
 
 sse_headers() ->

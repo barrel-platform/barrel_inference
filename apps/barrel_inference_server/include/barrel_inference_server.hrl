@@ -44,6 +44,10 @@
     tool_choice :: tool_choice(),
     %% GBNF source built from tools
     grammar :: binary() | undefined,
+    %% Ollama `options.num_ctx`: a per-request cap on the context window
+    %% (clamped to the loaded context; can only shrink it). undefined for
+    %% OpenAI/Anthropic, which have no equivalent.
+    context_cap :: pos_integer() | undefined,
     max_tokens :: pos_integer(),
     temperature :: float(),
     top_p :: float(),

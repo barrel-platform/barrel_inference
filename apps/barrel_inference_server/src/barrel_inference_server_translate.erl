@@ -1154,6 +1154,7 @@ base_request_ollama(Body) ->
         tools = undefined,
         tool_choice = none,
         grammar = undefined,
+        context_cap = parse_optional_int(Options, <<"num_ctx">>),
         max_tokens = parse_int(Options, <<"num_predict">>, 1024),
         temperature = parse_float(Options, <<"temperature">>, 1.0),
         top_p = parse_float(Options, <<"top_p">>, 1.0),

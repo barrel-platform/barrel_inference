@@ -369,7 +369,9 @@ finish_err(Req0, S = #st{stream_started = true}, Reason) ->
     cowboy_req:stream_body(<<>>, fin, Req0),
     {stop, Req0, S};
 finish_err(Req0, S = #st{}, Reason) ->
-    Req1 = cowboy_req:reply(500, json_headers(), json:encode(error_body(Reason)), Req0),
+    Req1 = cowboy_req:reply(
+        error_status(Reason), json_headers(), json:encode(error_body(Reason)), Req0
+    ),
     {stop, Req1, S}.
 
 compute_timings(S) ->
@@ -440,12 +442,24 @@ error_body({context_overflow, Tokens, Ctx}) ->
         )
     ),
     #{<<"error">> => Msg};
+error_body({error, {decode_failed, _}}) ->
+    decode_failed_body();
+error_body({decode_failed, _}) ->
+    decode_failed_body();
 error_body(T) ->
     #{<<"error">> => iolist_to_binary(io_lib:format("~p", [T]))}.
+
+decode_failed_body() ->
+    #{
+        <<"error">> =>
+            <<"the model was overloaded and could not process this request; please retry">>
+    }.
 
 error_status(not_found) -> 404;
 error_status(not_preloaded) -> 503;
 error_status(not_loaded) -> 503;
+error_status({error, {decode_failed, _}}) -> 503;
+error_status({decode_failed, _}) -> 503;
 error_status(_) -> 500.
 
 error_response_for(_Status, S) ->
