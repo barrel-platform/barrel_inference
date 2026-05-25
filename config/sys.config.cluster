@@ -1,0 +1,33 @@
+%% Clustered (facade-node) release config. Used by the `cluster` rebar3 profile.
+%% The stock single-node release keeps its own config/sys.config untouched.
+%%
+%% Cluster isolation has no dedicated key: a cluster is delimited by a shared
+%% non-default `dist_cookie`, `auth_trust_mode` (strict + pinned keys in prod),
+%% and a shared `contact_nodes` / `discovery_backends` set.
+[
+    {mycelium, [
+        {listen_port, 9100},
+        {auth_enabled, true},
+        {auth_trust_mode, tofu},
+        {dist_cookie, 'CHANGE-ME-to-a-high-entropy-secret'},
+        {contact_nodes, []},
+        {discovery_backends, [mycelium_discovery_static]}
+    ]},
+
+    {barrel_inference_cluster, [
+        {enabled, true},
+        {service_name, inference_node},
+        %% Locality tag advertised to peers (undefined = unknown). Routing
+        %% prefers same-zone replicas, then lower-SRTT ones.
+        {zone, undefined},
+        {allow_cold_load, true},
+        %% cache_affinity | least_load | locality | round_robin | custom
+        {replica_policy, cache_affinity},
+        %% Used only when replica_policy = custom.
+        {weights, #{load => 0.2, locality => 0.3}},
+        {metadata_refresh_ms, 2000},
+        {session_ttl_ms, 600000},
+        {ref_ttl_ms, 1800000},
+        {call_timeout_ms, 120000}
+    ]}
+].

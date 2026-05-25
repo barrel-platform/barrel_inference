@@ -34,23 +34,29 @@ shipped. For reference so these are not re-filed:
 
 ## Sister project: barrel_inference_cluster (in development)
 
-A separate OTP application that coordinates a fleet of Barrel Inference nodes
-into one inference cluster. Each node still runs Barrel Inference as a
-standalone library; the cluster layer sits on top and decides which
-node serves which request.
+A separate OTP application (`apps/barrel_inference_cluster`) that **surfaces the
+runtime on the cluster**: it mirrors the `barrel_inference` API and routes each
+call to the best node, so a fleet behaves as one cluster-wide runtime. Each node
+still runs Barrel Inference as a standalone library; the facade sits on top and
+decides which node serves which request. A remote `infer/4` runs on the chosen
+peer with the original caller pid, so the peer streams straight back over the
+overlay — no proxy. (Phase 2 points the server's `engine_module` at the facade.)
 
-Three v1 strategies:
+v1 (shipping) does **request distribution with cache-affinity routing**: a
+3-signal replica choice — sticky session → locality (zone + SRTT) → load — so a
+conversation stays on the node that warmed its KV cache while new traffic spreads
+to the nearest least-loaded replica. Two further strategies plug into the
+`barrel_inference_cluster_strategy` behaviour later, gated on capability:
+**speculative decoding across nodes** (`erlang:function_exported(barrel_inference,
+verify, 4)`) and **pipeline parallelism** (`forward_partial/3`).
 
-- **Request distribution** with cache-affinity routing (follow-up
-  requests prefer the node that warmed the KV cache for the prefix).
-- **Speculative decoding across nodes** — small draft on one node,
-  large verifier on another.
-- **Pipeline parallelism** — models too large for one node split by
-  layer ranges, hidden states passed as Erlang binaries.
-
-Transport is QUIC via [erlang_quic](https://github.com/benoitc/erlang_quic)
-(pure Erlang, no C NIF in the protocol path). Repository:
-<https://github.com/barrel-platform/barrel_inference>.
+Transport is the [mycelium](https://github.com/benoitc/mycelium) overlay
+(HyParView membership, an encrypted QUIC alt-dist over
+[erlang_quic](https://github.com/benoitc/erlang_quic) with NAT traversal, a
+service registry, and replicated maps). It subsumes the earlier "QUIC via
+erlang_quic" plan. Clustering is a separate release/profile, because the QUIC
+alt-dist is a boot-time choice; the stock single-node release is unaffected.
+Repository: <https://github.com/barrel-platform/barrel_inference>.
 
 ### Pipeline parallelism: blocked on upstream llama.cpp
 

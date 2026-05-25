@@ -103,3 +103,40 @@ Cases that work against ollama but fail here:
   `context_models`/router use `qwen2.5:14b`, `codestral:22b`,
   `qwen2.5:0.5b`; unknown names 404 (no auto-pull by default). Alias them
   or enable `auto_pull` for drop-in parity.
+
+## Clustering (barrel_inference_cluster)
+
+`apps/barrel_inference_cluster` (v1, in development) is a facade that mirrors the
+`barrel_inference` runtime API and routes each call across a mycelium overlay, so
+a fleet behaves as one cluster-wide runtime. See `apps/barrel_inference/ROADMAP.md`
+for the design.
+
+**Build / run.** Clustering is **profile-only**: the stock release is unchanged.
+A clustered facade node builds from the `cluster` profile:
+
+```
+rebar3 as cluster release -n barrel_inference_cluster
+```
+
+It uses `config/sys.config.cluster` (mycelium + `barrel_inference_cluster` env) and
+`config/vm.args.cluster` (which selects the mycelium QUIC alt-dist:
+`-proto_dist mycelium -epmd_module mycelium_epmd -start_epmd false`). Set a shared
+non-default `dist_cookie` / `-setcookie` and `contact_nodes` seed set per cluster.
+The default `config/sys.config` and `config/vm.args` are untouched. (Dependency
+note: the umbrella pins `quic` to 1.4.x so hackney and mycelium share one NIF.)
+
+**Phase 2 — wire the server onto the facade (not yet done).** Add an
+`engine_module` indirection (default `barrel_inference`) and route only the
+request-path / cluster-visible call sites through `barrel_inference_cluster`;
+node-local lifecycle stays on the runtime:
+
+- → facade: `pipeline` infer/continue/apply_chat_template/tokenize/reset_session,
+  `h_messages`/`h_chat`/`h_responses` cancel/end_session, `h_ollama` cancel,
+  `h_embeddings` tokenize/embed.
+- → facade (aggregate): `h_models`/`h_api` list_models, `config` model_info readiness.
+- → LOCAL (keep runtime): `loader` load_model, `keepalive`/`h_ollama`/`pipeline`
+  unload, `h_health` list_models, `metrics` counters.
+
+Reconcile `barrel_inference_server_queue` admission vs the facade's per-node
+capacity at that point, and serve a `/cluster/*` admin endpoint for the CLI
+(`barrel-inference cluster status|nodes`).

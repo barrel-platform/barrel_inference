@@ -1,0 +1,23 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
+{application, barrel_inference_cluster, [
+    {description, "Cache-aware cluster routing facade over the Barrel Inference runtime"},
+    {vsn, "0.8.0"},
+    {registered, [barrel_inference_cluster_sup]},
+    {mod, {barrel_inference_cluster_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        sasl,
+        barrel_inference,
+        %% Overlay transport (only started when enabled; see _state).
+        mycelium,
+        %% barrel_inference_cluster_cli is a thin HTTP client.
+        hackney
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{<<"GitHub">>, <<"https://github.com/barrel-platform/barrel_inference">>}]}
+]}.

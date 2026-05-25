@@ -1,0 +1,18 @@
+## Boot args for a clustered (facade) node. Used by the `cluster` rebar3 profile.
+## The mycelium overlay is a QUIC alt-dist: it must be selected at VM boot, which
+## is why clustering is a separate release rather than a runtime toggle. The stock
+## release keeps plain distribution via config/vm.args.
+-proto_dist mycelium
+-epmd_module mycelium_epmd
+-start_epmd false
+
+## Give each node a distinct -name; keep -setcookie in sync with mycelium's
+## dist_cookie in sys.config.cluster (override both off the defaults).
+-name barrel_inference_cluster@127.0.0.1
+-setcookie CHANGE-ME-to-a-high-entropy-secret
+
++K true
++A 64
++sbwt none
++sbwtdcpu none
++sbwtdio none
