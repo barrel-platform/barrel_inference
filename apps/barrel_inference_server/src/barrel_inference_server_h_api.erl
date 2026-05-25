@@ -240,10 +240,18 @@ show_body(M) ->
             <<"general.architecture">> => maps:get(<<"architecture">>, M, null),
             <<"general.size_label">> => maps:get(<<"parameter_size">>, M, null),
             <<"general.file_type">> => Quant,
-            <<"context_length">> => maps:get(<<"context_size">>, M, null),
+            %% Report the context the model actually loads with (honours a
+            %% parameters.num_ctx override), not the raw manifest context_size.
+            <<"context_length">> => effective_context_length(M),
             <<"embedding_length">> => maps:get(<<"embedding_length">>, M, null)
         }
     }.
+
+effective_context_length(M) ->
+    case barrel_inference_server_models:effective_context_size(M) of
+        undefined -> null;
+        N -> N
+    end.
 
 modelfile_for(M) ->
     Spec = maps:get(<<"spec">>, M, <<>>),

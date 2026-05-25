@@ -44,7 +44,8 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
     persist_manifest/4,
     persist_manifest_overrides/5,
     cache_root/0,
-    resolve_n_seq_max/1
+    resolve_n_seq_max/1,
+    effective_context_size/1
 ]).
 
 -export_type([manifest/0, name_or_tag/0, pull_opts/0]).
@@ -362,6 +363,28 @@ resolve_n_seq_max(Manifest) when is_map(Manifest) ->
     case maps:get(<<"num_seq_max">>, Params, maps:get(<<"n_seq_max">>, Loader, undefined)) of
         N when is_integer(N), N > 0 -> N;
         _ -> ?DEFAULT_N_SEQ_MAX
+    end.
+
+%% Effective context the model loads with, capped by the server-wide
+%% `max_context_size'. Precedence: `parameters.num_ctx' (operator
+%% /api/edit override) > manifest `context_size' (as pulled).
+%% `undefined' only when neither is set. The loader resolves n_ctx
+%% through this same function so the reported context never drifts
+%% from the loaded one; a `num_ctx' override is reflected in /api/show
+%% without re-deriving the manifest.
+-spec effective_context_size(manifest()) -> non_neg_integer() | undefined.
+effective_context_size(Manifest) when is_map(Manifest) ->
+    Params = maps:get(<<"parameters">>, Manifest, #{}),
+    Requested =
+        case maps:get(<<"num_ctx">>, Params, undefined) of
+            undefined -> maps:get(<<"context_size">>, Manifest, undefined);
+            Override -> Override
+        end,
+    case Requested of
+        N when is_integer(N) ->
+            min(N, application:get_env(barrel_inference_server, max_context_size, 4096));
+        _ ->
+            undefined
     end.
 
 loader_opts(Quant, Ctx, Tpl, IsEmbed) ->

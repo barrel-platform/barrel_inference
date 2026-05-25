@@ -326,11 +326,16 @@ manifest_to_config(Manifest) ->
     Params = maps:get(<<"parameters">>, Manifest, #{}),
     BaseOpts = base_opts(),
     MaxCtx = application:get_env(?APP, max_context_size, 4096),
-    %% Modelfile PARAMETER num_ctx overrides the GGUF advertised value
-    %% (but the server-wide max_context_size still caps it).
-    ParamCtx = maps:get(<<"num_ctx">>, Params, undefined),
-    NativeCtx = default_int(maps:get(<<"context_size">>, Manifest, undefined), MaxCtx),
-    Ctx = min(default_int(ParamCtx, NativeCtx), MaxCtx),
+    %% Modelfile PARAMETER num_ctx overrides the manifest context_size
+    %% (both capped by the server-wide max_context_size). Resolved via
+    %% the shared barrel_inference_server_models resolver so /api/show reports the
+    %% exact context the model loads with. `undefined' (neither set)
+    %% falls back to MaxCtx, preserving the prior default.
+    Ctx =
+        case barrel_inference_server_models:effective_context_size(Manifest) of
+            undefined -> MaxCtx;
+            EffCtx -> EffCtx
+        end,
     %% n_batch sizes the per-call prefill batch the engine submits
     %% to llama.cpp. The compute buffer scales with `n_layers *
     %% n_embd * n_batch'; bigger = faster prefill, more memory.
