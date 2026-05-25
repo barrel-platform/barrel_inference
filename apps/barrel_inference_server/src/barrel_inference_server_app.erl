@@ -117,7 +117,16 @@ default_cache_policy() ->
     #{
         min_tokens => 64,
         cold_min_tokens => 128,
-        cold_max_tokens => 8192,
+        %% Upper bound on the prompt length that gets a cold prefix
+        %% checkpoint at admission. Agent clients (Claude Code et al.)
+        %% ship 25-32k-token system + tool + history prompts; at the old
+        %% 8192 cap cold_save_split returned no_save for every such
+        %% request, so the only stored keys were full-prompt finish-saves
+        %% and the longest-prefix lookup never warmed across turns. Cover
+        %% a full 32k context; the pack cost matches the finish-save we
+        %% already take. Deriving this from the model's loaded context is
+        %% a follow-up.
+        cold_max_tokens => 32768,
         continued_interval => 2048,
         boundary_trim_tokens => 0,
         boundary_align_tokens => 16,
