@@ -346,20 +346,14 @@ manifest_to_config(Manifest) ->
             default_n_batch(Manifest)
         )
     ),
-    %% `n_seq_max` controls the engine's seq pool. Sticky-seq
-    %% pinning (PR 28+) and the continue/3 path (PR 32) need at
-    %% least 2 here to avoid admission deadlock the moment a second
-    %% session arrives; documented in guides/clients.md. Resolution
-    %% mirrors n_batch: `parameters.num_seq_max' > `loader.n_seq_max'
-    %% > engine default (1). When undefined the loader leaves the
-    %% key off `context_opts' and the engine picks its own default.
-    NSeqMax = pos_int(
-        maps:get(
-            <<"num_seq_max">>,
-            Params,
-            maps:get(<<"n_seq_max">>, Loader, undefined)
-        )
-    ),
+    %% `n_seq_max` controls the engine's seq pool. Sticky-seq pinning
+    %% and the continue/3 path deadlock under the engine default of 1 the
+    %% moment a second session admits, so resolve to a non-1 default via
+    %% the shared resolver (`parameters.num_seq_max' > `loader.n_seq_max'
+    %% > ?DEFAULT_N_SEQ_MAX). The SAME resolver feeds the server's
+    %% admission concurrency (barrel_inference_server_config), so the engine
+    %% seq pool and the queue never drift. Always set (never engine-default).
+    NSeqMax = barrel_inference_server_models:resolve_n_seq_max(Manifest),
     %% barrel_inference 0.8.0 bounds each decode step at a per-step wall-clock
     %% budget (`context_opts.decode_budget_ms', engine default 30000,
     %% 0 disables) so a wedged decode aborts and the engine recovers in
@@ -405,12 +399,20 @@ manifest_to_config(Manifest) ->
         quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
         quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
         context_size => Ctx,
+        %% kv_unified: a single sequence may use the full n_ctx while
+        %% n_seq_max sequences share that buffer, instead of llama.cpp's
+        %% default of splitting n_ctx into n_ctx/n_seq_max per sequence.
+        %% This lets admission concurrency (n_seq_max > 1) coexist with the
+        %% large per-request context agent clients need, at the same total
+        %% KV memory.
         context_opts => maybe_put_embeddings(
             maybe_put_decode_budget_ms(
-                maybe_put_n_seq_max(
-                    #{n_ctx => Ctx, n_batch => NBatch},
-                    NSeqMax
-                ),
+                #{
+                    n_ctx => Ctx,
+                    n_batch => NBatch,
+                    n_seq_max => NSeqMax,
+                    kv_unified => true
+                },
                 DecodeBudget
             ),
             Embeddings
@@ -463,18 +465,11 @@ add_payload_markers(Base, #{<<"payload_start">> := PS, <<"payload_end">> := PE})
 add_payload_markers(Base, _) ->
     Base.
 
-%% Normalise an optional positive-integer manifest field. Anything
-%% else (null, missing, 0, non-integer) collapses to `undefined' so
-%% the caller can decide on the default.
-pos_int(N) when is_integer(N), N > 0 -> N;
-pos_int(_) -> undefined.
-
-%% Like pos_int/1 but 0 is valid (0 disables the decode budget).
+%% Normalise an optional non-negative-integer manifest field (0 is valid,
+%% e.g. it disables the decode budget); anything else collapses to
+%% `undefined' so the caller can decide on the default.
 non_neg_int(N) when is_integer(N), N >= 0 -> N;
 non_neg_int(_) -> undefined.
-
-maybe_put_n_seq_max(Opts, undefined) -> Opts;
-maybe_put_n_seq_max(Opts, N) -> Opts#{n_seq_max => N}.
 
 maybe_put_decode_budget_ms(Opts, undefined) -> Opts;
 maybe_put_decode_budget_ms(Opts, N) -> Opts#{decode_budget_ms => N}.

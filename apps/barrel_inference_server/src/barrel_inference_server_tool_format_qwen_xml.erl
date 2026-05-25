@@ -11,10 +11,31 @@
 -module(barrel_inference_server_tool_format_qwen_xml).
 -behaviour(barrel_inference_server_tool_format).
 
--export([parse/1, canonicalise/1]).
+-export([parse/1, canonicalise/1, render_prompt/2]).
 
 -define(START, <<"<tool_call>">>).
 -define(END, <<"</tool_call>">>).
+
+%% Native tool system block matching the Qwen2.5 / Qwen3 chat template:
+%% function signatures inside <tools></tools>, calls emitted as
+%% <tool_call>{json}</tool_call> (the markers the engine captures).
+-spec render_prompt([map()], binary() | undefined) -> binary().
+render_prompt(Tools, System) ->
+    Sigs = barrel_inference_server_tool_format:tool_signatures(Tools),
+    Block = [
+        <<"# Tools\n\n">>,
+        <<"You may call one or more functions to assist with the user query.\n\n">>,
+        <<"You are provided with function signatures within <tools></tools> XML tags:\n">>,
+        <<"<tools>\n">>,
+        [[json:encode(S), <<"\n">>] || S <- Sigs],
+        <<"</tools>\n\n">>,
+        <<"For each function call, return a json object with function name and ">>,
+        <<"arguments within <tool_call></tool_call> XML tags:\n">>,
+        ?START,
+        <<"\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n">>,
+        ?END
+    ],
+    barrel_inference_server_tool_format:append_system(System, iolist_to_binary(Block)).
 
 -spec parse(binary()) -> {ok, map()} | {error, term()}.
 parse(Bin) when is_binary(Bin) ->

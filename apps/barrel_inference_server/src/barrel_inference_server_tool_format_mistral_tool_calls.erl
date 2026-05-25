@@ -29,10 +29,28 @@
 -module(barrel_inference_server_tool_format_mistral_tool_calls).
 -behaviour(barrel_inference_server_tool_format).
 
--export([parse/1, canonicalise/1]).
+-export([parse/1, canonicalise/1, render_prompt/2]).
 
 -define(START, <<"[TOOL_CALLS]">>).
 -define(EOS, <<"</s>">>).
+
+%% Native tool system block matching the Mistral v3 tokenizer chat
+%% template: tools as a JSON array inside [AVAILABLE_TOOLS]...
+%% [/AVAILABLE_TOOLS], calls emitted as [TOOL_CALLS][{...}] (the marker
+%% the engine captures). Mistral carries multiple calls in one array.
+-spec render_prompt([map()], binary() | undefined) -> binary().
+render_prompt(Tools, System) ->
+    Sigs = barrel_inference_server_tool_format:tool_signatures(Tools),
+    Block = [
+        <<"[AVAILABLE_TOOLS]">>,
+        json:encode(Sigs),
+        <<"[/AVAILABLE_TOOLS]\n\n">>,
+        <<"To call functions, respond with a JSON array of calls after the ">>,
+        <<"[TOOL_CALLS] token in exactly this format:\n">>,
+        ?START,
+        <<"[{\"name\": <function-name>, \"arguments\": <args-json-object>}]">>
+    ],
+    barrel_inference_server_tool_format:append_system(System, iolist_to_binary(Block)).
 
 -spec parse(binary()) -> {ok, map()} | {error, term()}.
 parse(Bin) when is_binary(Bin) ->

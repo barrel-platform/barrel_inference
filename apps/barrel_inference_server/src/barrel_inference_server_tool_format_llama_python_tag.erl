@@ -22,10 +22,28 @@
 -module(barrel_inference_server_tool_format_llama_python_tag).
 -behaviour(barrel_inference_server_tool_format).
 
--export([parse/1, canonicalise/1]).
+-export([parse/1, canonicalise/1, render_prompt/2]).
 
 -define(START, <<"<|python_tag|>">>).
 -define(END, <<"<|eom_id|>">>).
+
+%% Native tool system block matching the Llama 3.1 JSON tool format.
+%% Llama uses `parameters' (not `arguments') as the args key and emits
+%% the call after the <|python_tag|> marker the engine captures.
+-spec render_prompt([map()], binary() | undefined) -> binary().
+render_prompt(Tools, System) ->
+    Sigs = barrel_inference_server_tool_format:tool_signatures(Tools),
+    Block = [
+        <<"# Tools\n\n">>,
+        <<"You have access to the following functions:\n">>,
+        [[json:encode(S), <<"\n">>] || S <- Sigs],
+        <<"\nTo call a function, respond with a JSON object after the ">>,
+        <<"<|python_tag|> token in exactly this format:\n">>,
+        ?START,
+        <<"{\"name\": <function-name>, \"parameters\": <args-json-object>}">>,
+        ?END
+    ],
+    barrel_inference_server_tool_format:append_system(System, iolist_to_binary(Block)).
 
 -spec parse(binary()) -> {ok, map()} | {error, term()}.
 parse(Bin) when is_binary(Bin) ->

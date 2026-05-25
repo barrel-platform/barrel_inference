@@ -110,27 +110,36 @@
     %% (non-streaming) or after the SSE emit (streaming, observability
     %% only).
     tool_format = undefined :: undefined | barrel_inference_server_tool_format:spec(),
-    captured_tool_use = undefined ::
-        undefined | #{id := binary(), name := binary(), input := map()},
+    %% barrel_inference 0.8 wire capture accumulates ALL tool calls the model
+    %% emits in one generation (it can emit several `<tool_call>' spans
+    %% on free decode). Dispatched once on barrel_inference_done: server-targeted
+    %% calls run concurrently and the turn continues; client calls are
+    %% surfaced as N tool_use blocks.
+    captured_calls = [] ::
+        [#{id := binary(), name := binary(), input := map(), full_bin := binary()}],
+    %% Streaming tool-call text scanner for the native `tool_mode' path
+    %% (model emits calls as text); undefined on the grammar path.
+    tool_scan = undefined :: undefined | barrel_inference_server_tool_scan:state(),
     %% Built-in tools the server executes in-process, keyed by the
     %% model-facing name. Empty unless an executor is registered.
     server_tools = #{} :: #{binary() => barrel_inference_server_tool_executor:spec()},
     %% Agentic continue-loop state (engages only on a server_tools hit):
-    %% run the executor server-side and re-invoke with the result
+    %% run the executors server-side and re-invoke with the results
     %% appended, until the model answers without a server tool or the
     %% cap is hit. Mirrors barrel_inference_server_h_responses / h_chat.
     tool_iter = 0 :: non_neg_integer(),
     max_tool_iter = 5 :: pos_integer(),
     loop_request = undefined :: undefined | #barrel_inference_request{},
     loop_messages = [] :: [map()],
+    %% One server-tool batch in flight: the coordinator's batch ref and
+    %% the calls it is running (so the result round can append an
+    %% assistant + tool message per call). exec_mon monitors the
+    %% coordinator; exec_tref bounds the whole batch.
     pending_exec = undefined ::
         undefined
         | #{
-            spec := barrel_inference_server_tool_executor:spec(),
-            name := binary(),
-            args := map(),
-            call_id := binary(),
-            full_bin := binary()
+            batch_ref := reference(),
+            calls := [barrel_inference_server_tool_batch:call()]
         },
     exec_mon = undefined :: undefined | reference(),
     exec_tref = undefined :: undefined | reference(),
@@ -332,7 +341,9 @@ init_state(R, Requested, Worker, Mon) ->
         buf_text = [],
         buf_reason = [],
         mode = text,
-        grammar_set = grammar_active(R),
+        grammar_set =
+            grammar_active(R) andalso
+                barrel_inference_server_tool_format:native_turn(R) =:= none,
         text_block_started = undefined,
         thinking_block_started = undefined,
         message_started = false,
@@ -341,11 +352,19 @@ init_state(R, Requested, Worker, Mon) ->
         user_id = R#barrel_inference_request.user_id,
         session_id = R#barrel_inference_request.session_id,
         tool_format = resolve_tool_format(R#barrel_inference_request.model_id),
+        tool_scan = init_tool_scan(R),
         server_tools = R#barrel_inference_request.server_tools,
         max_tool_iter = barrel_inference_server_config:max_tool_iterations(),
         loop_request = R,
         loop_messages = R#barrel_inference_request.messages
     }.
+
+%% Build the streaming text scanner iff this is the native tool path.
+init_tool_scan(R) ->
+    case barrel_inference_server_tool_format:scanner_for(R) of
+        {ok, Cfg} -> barrel_inference_server_tool_scan:new(Cfg);
+        none -> undefined
+    end.
 
 resolve_tool_format(ModelId) ->
     case barrel_inference_server_tool_format:lookup(ModelId) of
@@ -497,16 +516,16 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
     S1 = accumulate_stats(S, Stats),
     case S1#st.pending_exec of
         undefined ->
-            maybe_legacy_server_tool(Req, demonitor_engine(S1));
+            dispatch_done(Req, flush_scan(Req, demonitor_engine(S1)));
         _ ->
             {ok, Req, demonitor_engine(S1), hibernate}
     end;
-info({tool_exec_result, CallId, Result}, Req, S = #st{pending_exec = #{call_id := CallId}}) ->
-    continue_after_tool(Result, Req, S);
-info({tool_exec_result, _, _}, Req, S) ->
+info({tool_exec_batch_result, Ref, Results}, Req, S = #st{pending_exec = #{batch_ref := Ref}}) ->
+    continue_after_tools(Results, Req, S);
+info({tool_exec_batch_result, _, _}, Req, S) ->
     {ok, Req, S, hibernate};
-info({exec_timeout, CallId}, Req, S = #st{pending_exec = #{call_id := CallId}}) ->
-    continue_after_tool({error, executor_timeout}, Req, S);
+info({exec_timeout, Ref}, Req, S = #st{pending_exec = #{batch_ref := Ref}}) ->
+    continue_after_tools({error, executor_timeout}, Req, S);
 info({exec_timeout, _}, Req, S) ->
     {ok, Req, S, hibernate};
 info({'DOWN', Mon, process, _Pid, normal}, Req, S = #st{exec_mon = Mon}) ->
@@ -514,7 +533,7 @@ info({'DOWN', Mon, process, _Pid, normal}, Req, S = #st{exec_mon = Mon}) ->
 info({'DOWN', Mon, process, _Pid, Reason}, Req, S = #st{exec_mon = Mon, pending_exec = P}) when
     P =/= undefined
 ->
-    continue_after_tool({error, {executor_crashed, Reason}}, Req, S);
+    continue_after_tools({error, {executor_crashed, Reason}}, Req, S);
 info({barrel_inference_error, Ref, Reason}, Req0, S0) ->
     {S, Req} = learn_ref(S0, Req0, Ref),
     finish_err(Req, demonitor_engine(S#st{received_done = true}), Reason);
@@ -628,6 +647,14 @@ keepalive_release(#st{model = Model}) ->
 %% Token handling
 %%====================================================================
 
+%% Native tool path: route every token through the streaming scanner. It
+%% separates content (emitted as text deltas / buffered) from tool calls
+%% (accumulated into captured_calls); the engine emits no marker events
+%% here because the model writes its calls as ordinary text tokens.
+handle_token(Tok, Req, S0 = #st{tool_scan = Scan}) when Scan =/= undefined ->
+    {Emits, Scan1} = barrel_inference_server_tool_scan:feed(Scan, Tok),
+    S = first_token(S0#st{tool_scan = Scan1}),
+    apply_scan_emits(Emits, Req, S);
 handle_token(Tok, Req, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
     case is_tool_first_byte(Tok) of
         true ->
@@ -652,19 +679,46 @@ handle_token(Tok, Req, S = #st{mode = text, out_tokens = 0}) ->
 handle_token(Tok, Req, S = #st{mode = text}) ->
     emit_text(Tok, Req, S).
 
-emit_text(Tok, Req, S = #st{stream = true}) ->
+emit_text(Tok, Req, S) ->
+    {ok, Req, rearm_idle(stream_text(Tok, Req, S)), hibernate}.
+
+%% Emit one text fragment (streaming delta or buffered) and return the
+%% updated state - the reusable core of emit_text, also used to apply the
+%% scanner's {text,_} emits.
+stream_text(<<>>, _Req, S) ->
+    S;
+stream_text(Tok, Req, S = #st{stream = true}) ->
     S1 = ensure_text_block_started(Req, S),
     Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
         {text_delta, Tok, S1#st.text_block_started}, #{}, S#st.req_id, S#st.requested
     ),
     cowboy_req:stream_body(Iolist, nofin, Req),
-    {ok, Req, rearm_idle(S1#st{out_tokens = S1#st.out_tokens + 1}), hibernate};
-emit_text(Tok, Req, S = #st{stream = false}) ->
-    {ok, Req,
-        rearm_idle(S#st{
-            buf_text = [S#st.buf_text, Tok],
-            out_tokens = S#st.out_tokens + 1
-        }), hibernate}.
+    S1#st{out_tokens = S1#st.out_tokens + 1};
+stream_text(Tok, _Req, S = #st{stream = false}) ->
+    S#st{buf_text = [S#st.buf_text, Tok], out_tokens = S#st.out_tokens + 1}.
+
+%% Apply scanner emits: text -> the content path, tool -> captured_calls
+%% (parsed name/args + verbatim raw bytes for replay + the continue-loop).
+apply_scan_emits(Emits, Req, S0) ->
+    S = lists:foldl(fun(E, Sx) -> apply_scan_emit(E, Req, Sx) end, S0, Emits),
+    {ok, Req, rearm_idle(S), hibernate}.
+
+apply_scan_emit({text, Bin}, Req, S) ->
+    stream_text(Bin, Req, S);
+apply_scan_emit({tool, #{name := Name, arguments := Args, raw := Raw}}, _Req, S) ->
+    ToolId = make_tool_id(),
+    maybe_persist_replay(S#st.tool_format, ToolId, S#st.model, Raw, Name, Args),
+    Call = #{id => ToolId, name => Name, input => Args, full_bin => Raw},
+    S#st{captured_calls = S#st.captured_calls ++ [Call]}.
+
+%% At end-of-generation, flush the scanner's held tail (trailing content,
+%% or a completed call that hadn't been followed by more text). No-op off
+%% the native path.
+flush_scan(_Req, S = #st{tool_scan = undefined}) ->
+    S;
+flush_scan(Req, S = #st{tool_scan = Scan}) ->
+    {Emits, _} = barrel_inference_server_tool_scan:finish(Scan),
+    lists:foldl(fun(E, Sx) -> apply_scan_emit(E, Req, Sx) end, S#st{tool_scan = undefined}, Emits).
 
 %% `thinking_display = omitted` keeps the engine producing thinking
 %% but hides it on the wire: no thinking_delta SSE frames, no thinking
@@ -733,17 +787,17 @@ handle_thinking_end(Sig, Req, S) ->
 %% this model we fall back to the legacy `parse_tool_call/1' so a
 %% misconfigured operator still gets *something* back, just without
 %% replay-map persistence.
+%% Accumulate the call; the model may emit several `<tool_call>' spans
+%% on free decode. Dispatch (server-exec vs client tool_use) happens
+%% once on barrel_inference_done so we know the full batch and can honour
+%% parallel_tool_calls. Replay persistence is per-call (client blocks
+%% may be replayed from history next turn).
 handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) ->
     {Name, Input} = parse_full_bin(Spec, FullBin),
-    case maps:find(Name, S#st.server_tools) of
-        {ok, ExecSpec} ->
-            %% Server-executed built-in: run it and continue the turn.
-            begin_server_tool(FullBin, Name, Input, ExecSpec, Req, S);
-        error ->
-            ToolId = make_tool_id(),
-            maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Input),
-            emit_captured_tool_use(Req, S, ToolId, Name, Input)
-    end.
+    ToolId = make_tool_id(),
+    maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Input),
+    Call = #{id => ToolId, name => Name, input => Input, full_bin => FullBin},
+    {ok, Req, rearm_idle(S#st{captured_calls = S#st.captured_calls ++ [Call]}), hibernate}.
 
 parse_full_bin(undefined, FullBin) ->
     parse_tool_call(FullBin);
@@ -767,6 +821,33 @@ maybe_persist_replay(_Spec, ToolId, Model, FullBin, Name, Input) ->
 %% Agentic continue-loop (server-executed built-in tools)
 %%====================================================================
 
+%% Dispatch the model's captured tool calls once generation is done.
+%% No calls -> the legacy first-byte path / plain finish. Otherwise
+%% honour parallel_tool_calls, then split the batch: any server-targeted
+%% call makes the turn CONTINUE (run all server calls concurrently,
+%% re-infer once); a server-free batch FINISHES, surfacing every client
+%% call as a tool_use block. A turn never both continues and finishes.
+dispatch_done(Req, S = #st{captured_calls = []}) ->
+    maybe_legacy_server_tool(Req, S#st{received_done = true});
+dispatch_done(Req, S = #st{captured_calls = Calls0}) ->
+    Calls = cap_parallel(S, Calls0),
+    {ServerCalls, ClientCalls} = partition_calls(Calls, S#st.server_tools),
+    case ServerCalls of
+        [] -> finish_with_tool_uses(Req, S#st{received_done = true}, ClientCalls);
+        _ -> begin_server_tools(ServerCalls, Req, S)
+    end.
+
+%% parallel_tool_calls=false (or Anthropic disable_parallel_tool_use):
+%% surface only the first call. Grammar is skipped on the native path so
+%% the model is free to emit several; the cap is applied at capture.
+cap_parallel(#st{loop_request = #barrel_inference_request{parallel_tool_calls = false}}, Calls) ->
+    lists:sublist(Calls, 1);
+cap_parallel(_S, Calls) ->
+    Calls.
+
+partition_calls(Calls, ServerTools) ->
+    lists:partition(fun(#{name := N}) -> maps:is_key(N, ServerTools) end, Calls).
+
 %% Legacy first-byte path: the tool JSON is buffered and named only at
 %% done. If it names a server tool, run it and continue; else finish.
 maybe_legacy_server_tool(Req, S = #st{mode = tool_buffer, server_tools = ST}) when
@@ -775,56 +856,57 @@ maybe_legacy_server_tool(Req, S = #st{mode = tool_buffer, server_tools = ST}) wh
     Json = iolist_to_binary(S#st.buf_text),
     {Name, Input} = parse_tool_call(Json),
     case maps:find(Name, ST) of
-        {ok, ExecSpec} ->
-            begin_server_tool(Json, Name, Input, ExecSpec, Req, S);
+        {ok, _ExecSpec} ->
+            Call = #{id => make_tool_id(), name => Name, input => Input, full_bin => Json},
+            begin_server_tools([Call], Req, S);
         error ->
             finish_ok(Req, S#st{received_done = true}, S#st.agg_stats)
     end;
 maybe_legacy_server_tool(Req, S) ->
     finish_ok(Req, S#st{received_done = true}, S#st.agg_stats).
 
-%% Run the executor off the handler process; the result arrives as a
-%% {tool_exec_result, CallId, _} message. Close any open content block
-%% first so the next round's content gets a fresh block index.
-begin_server_tool(FullBin, Name, Input, ExecSpec, Req, S0) ->
+%% Run all server-targeted calls concurrently off the handler process
+%% via one coordinator; the aggregated results arrive as a single
+%% {tool_exec_batch_result, BatchRef, _}. Close any open content block
+%% first so the continuation round opens fresh blocks.
+begin_server_tools(ServerCalls, Req, S0) ->
     S = close_open_text_or_thinking(Req, S0),
-    CallId = barrel_inference_server_translate:make_id(<<"call_">>),
-    Self = self(),
     Ctx = #{
         model => S#st.model,
         request_id => S#st.req_id,
-        session_id => S#st.session_id,
-        config => maps:without([module, type], ExecSpec)
+        session_id => S#st.session_id
     },
-    {_Pid, Mon} = spawn_monitor(fun() ->
-        Self ! {tool_exec_result, CallId, run_executor(ExecSpec, Input, Ctx)}
-    end),
-    TRef = erlang:send_after(exec_timeout_ms(), self(), {exec_timeout, CallId}),
-    Pending = #{
-        spec => ExecSpec,
-        name => Name,
-        args => Input,
-        call_id => CallId,
-        full_bin => FullBin
-    },
+    Batch = [
+        #{
+            call_id => Id,
+            spec => maps:get(Name, S#st.server_tools),
+            name => Name,
+            args => Input,
+            full_bin => FullBin
+        }
+     || #{id := Id, name := Name, input := Input, full_bin := FullBin} <- ServerCalls
+    ],
+    {_Pid, Mon, BatchRef} = barrel_inference_server_tool_batch:spawn_batch(Batch, Ctx),
+    TRef = erlang:send_after(exec_timeout_ms(), self(), {exec_timeout, BatchRef}),
+    Pending = #{batch_ref => BatchRef, calls => Batch},
     cancel_timer(S#st.idle_tref),
-    {ok, Req, S#st{pending_exec = Pending, exec_mon = Mon, exec_tref = TRef, idle_tref = undefined},
+    {ok, Req,
+        S#st{
+            pending_exec = Pending,
+            exec_mon = Mon,
+            exec_tref = TRef,
+            idle_tref = undefined,
+            captured_calls = []
+        },
         hibernate}.
 
-run_executor(ExecSpec, Input, Ctx) ->
-    try
-        barrel_inference_server_tool_executor:execute(ExecSpec, Input, Ctx)
-    catch
-        Class:Reason -> {error, {Class, Reason}}
-    end.
-
-%% Fold the result into the conversation and re-invoke on the warm
-%% session path, streaming into the same message.
-continue_after_tool(Result, Req, S0) ->
-    #{name := _Name, call_id := CallId, full_bin := FullBin} = S0#st.pending_exec,
+%% All server-tool results are in (or the batch failed); fold every
+%% (assistant call, tool result) pair into the conversation and
+%% re-invoke ONCE on the warm session path.
+continue_after_tools(Outcome, Req, S0) ->
+    #{calls := Calls} = S0#st.pending_exec,
     S = clear_pending(S0),
     Iter = S#st.tool_iter + 1,
-    ResultJson = result_json(Result),
     case Iter >= S#st.max_tool_iter of
         true ->
             Stats = maps:put(finish_reason, length, S#st.agg_stats),
@@ -834,16 +916,7 @@ continue_after_tool(Result, Req, S0) ->
                 Stats
             );
         false ->
-            NewMessages =
-                S#st.loop_messages ++
-                    [
-                        #{role => <<"assistant">>, content => FullBin},
-                        #{
-                            role => <<"tool">>,
-                            content =>
-                                <<"[tool_result id=", CallId/binary, "]: ", ResultJson/binary>>
-                        }
-                    ],
+            NewMessages = S#st.loop_messages ++ tool_round_messages(Calls, Outcome),
             ContReq = (S#st.loop_request)#barrel_inference_request{messages = NewMessages},
             release_slot(S),
             {WorkerPid, Mon} = barrel_inference_server_pipeline:start_link(self(), ContReq),
@@ -857,13 +930,41 @@ continue_after_tool(Result, Req, S0) ->
                 slot = undefined,
                 mode = text,
                 buf_text = [],
-                %% Reset so the next round's first-byte detection fires.
                 out_tokens = 0,
-                captured_tool_use = undefined,
+                captured_calls = [],
                 first_token_at = undefined
             },
             {ok, Req, S2, hibernate}
     end.
+
+%% One assistant message (the verbatim tool-call bytes) + one tool
+%% message (the executor result) per call, in submit order. On a batch
+%% error (timeout / coordinator crash) every call gets the error as its
+%% result so the model can recover.
+tool_round_messages(_Calls, Results) when is_list(Results) ->
+    lists:flatmap(
+        fun(#{call_id := CallId, full_bin := FullBin, result := Result}) ->
+            round_pair(CallId, FullBin, result_json(Result))
+        end,
+        Results
+    );
+tool_round_messages(Calls, {error, _} = Err) ->
+    EJson = result_json(Err),
+    lists:flatmap(
+        fun(#{call_id := CallId, full_bin := FullBin}) ->
+            round_pair(CallId, FullBin, EJson)
+        end,
+        Calls
+    ).
+
+round_pair(CallId, FullBin, ResultJson) ->
+    [
+        #{role => <<"assistant">>, content => FullBin},
+        #{
+            role => <<"tool">>,
+            content => <<"[tool_result id=", CallId/binary, "]: ", ResultJson/binary>>
+        }
+    ].
 
 clear_pending(S) ->
     case S#st.exec_mon of
@@ -900,15 +1001,63 @@ merge_stats(A, B) ->
         generation_ms => Sum(generation_ms)
     }.
 
-emit_captured_tool_use(Req, S0 = #st{stream = true}, ToolId, Name, Input) ->
+%% Surface every client tool call as a tool_use block and finish the
+%% turn (stop_reason = tool_use). Streaming emits N content blocks with
+%% sequential indices after closing any open text/thinking block;
+%% non-streaming returns them in one response body.
+finish_with_tool_uses(Req, S0 = #st{stream = true}, Calls) ->
     S = close_open_text_or_thinking(Req, S0),
-    Idx = next_block_index(S),
+    Base = next_block_index(S),
+    Frames = tool_use_frames(S, Calls, Base),
+    StatsTC = maps:put(finish_reason, tool_call, S#st.agg_stats),
+    MsgDelta = barrel_inference_server_translate:internal_to_anthropic_event(
+        {message_delta, attach_cache_hints(StatsTC, S)}, #{}, S#st.req_id, S#st.requested
+    ),
+    MsgStop = barrel_inference_server_translate:internal_to_anthropic_event(
+        message_stop, #{}, S#st.req_id, S#st.requested
+    ),
+    cowboy_req:stream_body([Frames, MsgDelta, MsgStop], fin, Req),
+    record_success(S, StatsTC),
+    {stop, Req, S};
+finish_with_tool_uses(Req0, S = #st{stream = false}, Calls) ->
+    Blocks = [
+        #{
+            <<"type">> => <<"tool_use">>,
+            <<"id">> => Id,
+            <<"name">> => N,
+            <<"input">> => I
+        }
+     || #{id := Id, name := N, input := I} <- Calls
+    ],
+    Stats = maps:put(finish_reason, tool_call, S#st.agg_stats),
+    Body = barrel_inference_server_translate:internal_to_anthropic_messages_response(
+        Blocks, attach_cache_hints(Stats, S), S#st.requested
+    ),
+    Req1 = stamp_ratelimit(Req0, S#st.model),
+    Req2 = cowboy_req:reply(
+        200,
+        #{<<"content-type">> => <<"application/json">>},
+        json:encode(Body),
+        Req1
+    ),
+    record_success(S, Stats),
+    {stop, Req2, S}.
+
+tool_use_frames(S, Calls, Base) ->
+    {Frames, _} = lists:mapfoldl(
+        fun(Call, Idx) -> {tool_use_frame(S, Idx, Call), Idx + 1} end,
+        Base,
+        Calls
+    ),
+    Frames.
+
+tool_use_frame(S, Idx, #{id := Id, name := Name, input := Input}) ->
     Start = #{
         <<"type">> => <<"content_block_start">>,
         <<"index">> => Idx,
         <<"content_block">> => #{
             <<"type">> => <<"tool_use">>,
-            <<"id">> => ToolId,
+            <<"id">> => Id,
             <<"name">> => Name,
             <<"input">> => #{}
         }
@@ -918,29 +1067,21 @@ emit_captured_tool_use(Req, S0 = #st{stream = true}, ToolId, Name, Input) ->
         <<"index">> => Idx,
         <<"delta">> => #{
             <<"type">> => <<"input_json_delta">>,
-            <<"partial_json">> => json:encode(Input)
+            <<"partial_json">> => iolist_to_binary(json:encode(Input))
         }
     },
     Stop = barrel_inference_server_translate:internal_to_anthropic_event(
         {content_block_stop, Idx}, #{}, S#st.req_id, S#st.requested
     ),
-    cowboy_req:stream_body(
-        [
-            <<"event: content_block_start\ndata: ">>,
-            json:encode(Start),
-            <<"\n\n">>,
-            <<"event: content_block_delta\ndata: ">>,
-            json:encode(DeltaInput),
-            <<"\n\n">>,
-            Stop
-        ],
-        nofin,
-        Req
-    ),
-    {ok, Req, rearm_idle(S), hibernate};
-emit_captured_tool_use(Req, S = #st{stream = false}, ToolId, Name, Input) ->
-    Block = #{id => ToolId, name => Name, input => Input},
-    {ok, Req, rearm_idle(S#st{captured_tool_use = Block}), hibernate}.
+    [
+        <<"event: content_block_start\ndata: ">>,
+        json:encode(Start),
+        <<"\n\n">>,
+        <<"event: content_block_delta\ndata: ">>,
+        json:encode(DeltaInput),
+        <<"\n\n">>,
+        Stop
+    ].
 
 close_open_text_or_thinking(Req, S0) ->
     S1 = maybe_close_thinking(Req, S0),
@@ -1091,7 +1232,7 @@ finish_ok(Req0, S0 = #st{stream = true, mode = tool_buffer}, Stats) ->
         <<"index">> => Idx,
         <<"delta">> => #{
             <<"type">> => <<"input_json_delta">>,
-            <<"partial_json">> => json:encode(Input)
+            <<"partial_json">> => iolist_to_binary(json:encode(Input))
         }
     },
     Stop = barrel_inference_server_translate:internal_to_anthropic_event(
@@ -1137,17 +1278,8 @@ finish_ok(Req0, S = #st{stream = false}, Stats0) ->
 %% non-streaming path used to flatten everything into a single text
 %% block, which lost tool calls and thinking entirely. Return the
 %% (possibly amended) Stats so the stop_reason picks up `tool_use`.
-nonstream_content(#st{captured_tool_use = #{id := Id, name := N, input := I}}, Stats) ->
-    %% barrel_inference 0.5 wire-captured tool_use (preferred path when the
-    %% model has tool_call_markers configured). The captured block
-    %% includes a parsed input map; emit it directly.
-    ToolUse = #{
-        <<"type">> => <<"tool_use">>,
-        <<"id">> => Id,
-        <<"name">> => N,
-        <<"input">> => I
-    },
-    {[ToolUse], maps:put(finish_reason, tool_call, Stats)};
+%% (barrel_inference 0.8 wire-captured tool calls are surfaced by
+%% finish_with_tool_uses, not here.)
 nonstream_content(#st{mode = tool_buffer, buf_text = Buf}, Stats) ->
     Json = iolist_to_binary(Buf),
     {Name, Input} = parse_tool_call(Json),
@@ -1539,10 +1671,10 @@ parse_tool_call(JsonBin) ->
         _:_ -> {<<"unknown">>, JsonBin}
     end.
 
-%% When a v0.5 wire-captured tool_use is on `#st{}', the message's
-%% stop_reason flips to `tool_call' the same way the legacy
-%% tool_buffer path already amends it in `nonstream_content/2'.
-maybe_set_tool_call_finish_reason(#st{captured_tool_use = undefined}, Stats) ->
+%% Wire-captured tool calls are surfaced (and their stop_reason set)
+%% by finish_with_tool_uses, so by the time finish_ok runs the list is
+%% empty and this is a no-op; kept defensively for the text finish path.
+maybe_set_tool_call_finish_reason(#st{captured_calls = []}, Stats) ->
     Stats;
 maybe_set_tool_call_finish_reason(_, Stats) ->
     maps:put(finish_reason, tool_call, Stats).

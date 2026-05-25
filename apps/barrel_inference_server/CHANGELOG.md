@@ -6,8 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Tool/chat requests no longer hang 60-180 s or crash the model. The hang was the
+  sticky-seq admission *wedge*: with the engine's 1-sequence default a pinned
+  session blocks every other session. Fixed by enabling `admission_on_full = error`
+  (a full pool returns a fast retryable 503/529 instead of blocking) and by raising
+  the seq pool. Crucially, the loader now sets `context_opts.kv_unified = true`:
+  llama.cpp otherwise splits `n_ctx` into `n_ctx / n_seq_max` per sequence, so
+  raising `n_seq_max` (to 4 by default for concurrency) would have cut a 32768
+  context to ~8192 and made large agent prompts `decode_failed` (crash-loop). With
+  the unified KV cache a single request may use the full `n_ctx` while up to
+  `n_seq_max` sequences share that buffer - concurrency and large context at the
+  same KV memory. A shared `barrel_inference_server_models:resolve_n_seq_max/1`
+  (precedence `parameters.num_seq_max` > `loader.n_seq_max` > 4) drives both the
+  engine seq pool and admission concurrency (`pool_policy_for/1`) so they never
+  drift; existing models get the default without re-pulling.
+
 ### Added
 
+- Tool calling on `tool_choice = auto` uses native prompting + a tolerant
+  streaming text parser (Ollama-style); `required`/`named` and a per-model
+  `loader.tool_mode = grammar` opt-out use the GBNF grammar (forced,
+  schema-enforced). A model whose manifest declares `loader.tool_call_format` +
+  valid `loader.tool_call_markers`, implements the optional `render_prompt/2`
+  callback, and is not pinned to `tool_mode = grammar` renders tools in its own
+  format and free-decodes; `barrel_inference_server_tool_scan` then extracts tool
+  calls from the generated text (configured markers, a generic `<tag>` wrapper, or
+  bare JSON), validating the name against the request's tools and falling back to
+  content otherwise. `render_prompt/2` ships for `qwen-xml`, `dsml` (DeepSeek),
+  `llama-python-tag`, and `mistral-tool-calls`. The parser is bounded (capped
+  holdback + region buffer) and does not enforce argument schemas - use
+  `tool_mode = grammar` / `required` for that.
+- Parallel tool calls. The model can emit several tool calls in one generation;
+  all three handlers (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`)
+  accumulate them and surface N `tool_use` / `tool_calls` / function-call items
+  (streaming and non-streaming). `parallel_tool_calls = false` (and Anthropic
+  `tool_choice.disable_parallel_tool_use`) caps the turn to the first call.
+  Server-side executor calls in one turn run concurrently via a coordinator
+  (`barrel_inference_server_tool_batch`) and re-infer once; a mixed batch runs the
+  server calls and continues the turn (client calls deferred to that
+  continuation), so a turn never both continues and finishes.
 - Embeddings support for embedding GGUFs. The pull pipeline detects embedding
   models from GGUF metadata (`barrel_inference_server_gguf:is_embedding_model/1`:
   a declared `*.pooling_type`, or a bidirectional-encoder architecture like

@@ -41,6 +41,7 @@
     ollama_embeddings_legacy_to_internal/1,
     %% response: out
     internal_to_openai_chat_response/3,
+    internal_to_openai_chat_tool_calls_response/3,
     internal_to_openai_chat_chunk/3,
     internal_to_openai_reasoning_chunk/3,
     internal_to_openai_chat_final/3,
@@ -451,7 +452,8 @@ anthropic_messages_to_internal(Body) when is_map(Body) ->
             user_id = parse_metadata_user_id(Body),
             thinking_display = parse_anthropic_thinking_display(Body),
             thinking_budget = parse_anthropic_thinking_budget(Body),
-            server_tools = ServerTools
+            server_tools = ServerTools,
+            parallel_tool_calls = parse_anthropic_parallel(Body)
         }}
     catch
         throw:{error, _} = E -> E
@@ -559,6 +561,49 @@ internal_to_openai_chat_response(Text, Stats, Model) ->
                 <<"message">> => #{
                     <<"role">> => <<"assistant">>,
                     <<"content">> => Text
+                },
+                <<"finish_reason">> => finish_reason_atom(Stats)
+            }
+        ],
+        <<"usage">> => usage_map(Stats)
+    }.
+
+%% Non-streaming OpenAI chat response carrying N tool_calls (content
+%% null, finish_reason tool_calls). Calls is the handler's captured-call
+%% list (`#{id, name, input}'); each input map is JSON-encoded into the
+%% `arguments' string the OpenAI shape expects.
+-spec internal_to_openai_chat_tool_calls_response([map()], map(), binary()) -> map().
+internal_to_openai_chat_tool_calls_response(Calls, Stats, Model) ->
+    {ToolCalls, _} = lists:mapfoldl(
+        fun(#{id := Id, name := N, input := I}, Ix) ->
+            {
+                #{
+                    <<"index">> => Ix,
+                    <<"id">> => Id,
+                    <<"type">> => <<"function">>,
+                    <<"function">> => #{
+                        <<"name">> => N,
+                        <<"arguments">> => iolist_to_binary(json:encode(I))
+                    }
+                },
+                Ix + 1
+            }
+        end,
+        0,
+        Calls
+    ),
+    #{
+        <<"id">> => make_id(<<"chatcmpl-">>),
+        <<"object">> => <<"chat.completion">>,
+        <<"created">> => unix_seconds(),
+        <<"model">> => Model,
+        <<"choices">> => [
+            #{
+                <<"index">> => 0,
+                <<"message">> => #{
+                    <<"role">> => <<"assistant">>,
+                    <<"content">> => null,
+                    <<"tool_calls">> => ToolCalls
                 },
                 <<"finish_reason">> => finish_reason_atom(Stats)
             }
@@ -1817,6 +1862,16 @@ parse_anthropic_tool_choice(Body) ->
         %% no GBNF is installed for this request.
         #{<<"type">> := <<"none">>} -> none;
         _ -> auto
+    end.
+
+%% Anthropic carries the parallel-tool-call opt-out as
+%% `tool_choice.disable_parallel_tool_use'. Maps onto the same internal
+%% `parallel_tool_calls' boolean OpenAI sets, so one capture-side check
+%% serves both surfaces. Default true (parallel allowed).
+parse_anthropic_parallel(Body) ->
+    case maps:get(<<"tool_choice">>, Body, undefined) of
+        #{<<"disable_parallel_tool_use">> := true} -> false;
+        _ -> true
     end.
 
 %% Anthropic's optional `metadata.user_id` is a free-form opaque

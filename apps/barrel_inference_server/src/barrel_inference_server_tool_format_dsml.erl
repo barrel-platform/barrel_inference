@@ -29,7 +29,7 @@
 -module(barrel_inference_server_tool_format_dsml).
 -behaviour(barrel_inference_server_tool_format).
 
--export([parse/1, canonicalise/1]).
+-export([parse/1, canonicalise/1, render_prompt/2]).
 
 -define(CALLS_BEGIN, <<"<｜tool▁calls▁begin｜>"/utf8>>).
 -define(CALLS_END, <<"<｜tool▁calls▁end｜>"/utf8>>).
@@ -38,6 +38,30 @@
 -define(SEP, <<"<｜tool▁sep｜>"/utf8>>).
 -define(FENCE_OPEN, <<"```json">>).
 -define(FENCE_CLOSE, <<"```">>).
+
+%% Native tool system block matching the DeepSeek-V3 chat template:
+%% function signatures, then the exact call envelope built from the
+%% same special-token markers the engine captures.
+-spec render_prompt([map()], binary() | undefined) -> binary().
+render_prompt(Tools, System) ->
+    Sigs = barrel_inference_server_tool_format:tool_signatures(Tools),
+    Block = [
+        <<"## Tools\n\n">>,
+        <<"You have access to the following tools. Their function signatures are:\n">>,
+        [[json:encode(S), <<"\n">>] || S <- Sigs],
+        <<"\nWhen you call a tool, emit it in exactly this format:\n">>,
+        ?CALLS_BEGIN,
+        ?CALL_BEGIN,
+        <<"function">>,
+        ?SEP,
+        <<"<function-name>\n">>,
+        ?FENCE_OPEN,
+        <<"\n<args-json-object>\n">>,
+        ?FENCE_CLOSE,
+        ?CALL_END,
+        ?CALLS_END
+    ],
+    barrel_inference_server_tool_format:append_system(System, iolist_to_binary(Block)).
 
 -spec parse(binary()) -> {ok, map()} | {error, term()}.
 parse(Bin) when is_binary(Bin) ->
