@@ -596,7 +596,7 @@ complete(Model, Prompt, Opts) ->
 Decode a prompt into KV state and fire a finish save, without
 sampling any output tokens. Returns the `finish_key` so the caller
 can hand it as `parent_key` to a subsequent `complete/3` or
-`infer/4` for token-exact warm restore.
+`infer/4` for byte-exact warm restore.
 
 `PromptTokens` is the prompt as a list of token ids. Tokenisation
 is the caller's responsibility (use `tokenize/2` or apply a chat
@@ -3141,66 +3141,82 @@ flush_pending_text(_Req) ->
 
 %% Multi-seq variant: takes the #req that's being admitted so the
 %% fingerprint and kv_unpack/seq_rm calls target the correct seq.
+%%
+%% The cache is content-addressed by the rendered prompt BYTES
+%% (ds4-style): we detokenise once here and reuse the bytes for the
+%% exact-key probe and the byte-prefix scan. The exact-byte hit and
+%% the parent-key session path are optimisations; ANY of their
+%% failures falls through to the byte-prefix scan, and only a
+%% byte-prefix miss returns cold.
 lookup_or_resume(PromptTokens, ParentKey, Req, Data) ->
-    Key = make_key(PromptTokens, Req, Data),
+    PromptBytes = backend_call(Data, detokenize, [PromptTokens]),
+    Key = make_key_bytes(PromptBytes, Req, Data),
     case pin_and_load(Key, Req#req.seq_id, Data) of
         {ok, ContextTokens} ->
             barrel_inference_cache_counters:incr(?C_HITS_EXACT),
             {warm, ContextTokens, [], exact};
         miss when ParentKey =/= undefined ->
-            try_session_resume(PromptTokens, ParentKey, Req, Data);
+            try_session_resume(PromptBytes, ParentKey, Req, Data);
         miss ->
-            try_longest_prefix(PromptTokens, Req, Data)
+            try_longest_prefix(PromptBytes, Req, Data)
     end.
 
-%% Stateless callers (HTTP front-end, agent loops that resend the
-%% full conversation each turn) don't have a parent_key to thread.
-%% Walk back through the prompt by stride and pick the longest
-%% cached prefix; fall through to cold if nothing matches.
-try_longest_prefix(PromptTokens, Req, Data) ->
+%% Content-addressed byte-prefix lookup: find the longest stored
+%% rendered-byte prefix of PromptBytes and resume from it. Falls
+%% through to cold only when nothing matches.
+try_longest_prefix(PromptBytes, Req, Data) ->
     KeyMeta = #{
         fingerprint => request_fp(Req, Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash
     },
-    Stride = maps:get(boundary_align_tokens, Data#data.policy, 2048),
-    Min = maps:get(min_tokens, Data#data.policy, 512),
-    case
-        barrel_inference_cache_meta_srv:lookup_longest_prefix(KeyMeta, PromptTokens, Stride, Min)
-    of
-        {ok, PrefixLen, Row} ->
+    case barrel_inference_cache_meta_srv:lookup_longest_text_prefix(KeyMeta, PromptBytes) of
+        {ok, MatchBytes, Row} ->
             resume_at_prefix(
-                element(?POS_KEY, Row), PrefixLen, PromptTokens, Req, Data, partial
+                element(?POS_KEY, Row), MatchBytes, PromptBytes, Req, Data
             );
         miss ->
             barrel_inference_cache_counters:incr(?C_MISSES),
             cold
     end.
 
-%% Pin + load the row, then verify the tokens really are the first
-%% PrefixLen of PromptTokens. The key is sha256 of the tokens, so a
-%% hit implies equality, but we belt-and-braces it here.
-resume_at_prefix(Key, PrefixLen, PromptTokens, Req, Data, HitKind) ->
+%% Pin + load the matched row's exact tokens + KV, then build the
+%% suffix from the rendered bytes the checkpoint did not cover. The
+%% SHA-256 byte key is the whole verification (no token-prefix
+%% check): the matched row's stored bytes ARE the leading MatchBytes
+%% of PromptBytes. The effective prompt is
+%% `CheckpointTokens ++ tokenize(byte-suffix)`; its join may differ
+%% from a fresh full tokenisation but renders the identical byte
+%% stream (ds4's contract).
+resume_at_prefix(Key, MatchBytes, PromptBytes, Req, Data) ->
     case pin_and_load(Key, Req#req.seq_id, Data) of
-        {ok, ParentTokens} when length(ParentTokens) =:= PrefixLen ->
-            case is_strict_prefix(ParentTokens, PromptTokens) of
-                true ->
-                    Remaining = lists:nthtail(PrefixLen, PromptTokens),
-                    barrel_inference_cache_counters:incr(?C_HITS_LONGEST_PREFIX),
-                    {warm, ParentTokens, Remaining, HitKind};
-                false ->
-                    barrel_inference_cache_counters:incr(?C_MISSES),
-                    cold
-            end;
-        _ ->
+        {ok, CheckpointTokens} ->
+            barrel_inference_cache_counters:incr(?C_HITS_LONGEST_PREFIX),
+            {warm, CheckpointTokens, suffix_tokens(PromptBytes, MatchBytes, Data), partial};
+        miss ->
             barrel_inference_cache_counters:incr(?C_MISSES),
             cold
     end.
 
-%% Note: the resume hit counter is bumped inside `try_session_resume`
-%% only on a verified strict-prefix match.
+%% Tokenise the rendered bytes a checkpoint of MatchBytes length did
+%% not cover. An empty suffix (exact-length byte match) tokenises to
+%% [].
+suffix_tokens(PromptBytes, MatchBytes, Data) ->
+    case byte_size(PromptBytes) - MatchBytes of
+        0 ->
+            [];
+        SuffixLen ->
+            SuffixBytes = binary:part(PromptBytes, MatchBytes, SuffixLen),
+            backend_call(Data, tokenize, [SuffixBytes])
+    end.
 
-try_session_resume(PromptTokens, ParentKey, Req, Data) ->
+%% Session fast path: the previous turn threaded its finish key as
+%% ParentKey. If that checkpoint is cached and its rendered bytes are
+%% a byte-prefix of this turn's bytes, resume from it directly.
+%% Otherwise fall through to the general byte-prefix scan (NOT cold) -
+%% retokenisation across turns means a token-level check would
+%% needlessly miss.
+try_session_resume(PromptBytes, ParentKey, Req, Data) ->
     Wait = maps:get(session_resume_wait_ms, Data#data.policy, 500),
     %% First wait for the row to publish (the previous turn's
     %% finish-save may still be in flight), then pin via checkout.
@@ -3208,22 +3224,25 @@ try_session_resume(PromptTokens, ParentKey, Req, Data) ->
         {ok, _Row} ->
             case pin_and_load(ParentKey, Req#req.seq_id, Data) of
                 {ok, ParentTokens} ->
-                    case is_strict_prefix(ParentTokens, PromptTokens) of
-                        true ->
-                            Remaining = lists:nthtail(length(ParentTokens), PromptTokens),
-                            barrel_inference_cache_counters:incr(?C_HITS_RESUME),
-                            {warm, ParentTokens, Remaining, partial};
-                        false ->
-                            barrel_inference_cache_counters:incr(?C_MISSES),
-                            cold
-                    end;
+                    resume_session_or_fallthrough(
+                        PromptBytes, ParentTokens, Req, Data
+                    );
                 miss ->
-                    barrel_inference_cache_counters:incr(?C_MISSES),
-                    cold
+                    try_longest_prefix(PromptBytes, Req, Data)
             end;
         miss ->
-            barrel_inference_cache_counters:incr(?C_MISSES),
-            cold
+            try_longest_prefix(PromptBytes, Req, Data)
+    end.
+
+resume_session_or_fallthrough(PromptBytes, ParentTokens, Req, Data) ->
+    ParentBytes = backend_call(Data, detokenize, [ParentTokens]),
+    PLen = byte_size(ParentBytes),
+    case PromptBytes of
+        <<ParentBytes:PLen/binary, _/binary>> ->
+            barrel_inference_cache_counters:incr(?C_HITS_RESUME),
+            {warm, ParentTokens, suffix_tokens(PromptBytes, PLen, Data), partial};
+        _ ->
+            try_longest_prefix(PromptBytes, Req, Data)
     end.
 
 %% checkout the row, load + unpack the payload under the pin (into
@@ -3368,15 +3387,24 @@ build_meta_for(SaveReason, Tokens, Req, Data) ->
         ctx_params_hash => Data#data.ctx_params_hash,
         tokens => Tokens,
         context_size => Data#data.context_size,
-        prompt_text => <<>>
+        %% The rendered prompt bytes are the cache-key source (v2) and
+        %% are stored in the KVC prompt section. The token list stays
+        %% in the TLV for KV resume.
+        prompt_text => backend_call(Data, detokenize, [Tokens])
     }.
 
+%% Cache key over the rendered prompt BYTES. The token list is
+%% detokenised first so the same logical prompt still hits when it
+%% retokenises across turns.
 make_key(Tokens, Req, Data) ->
+    make_key_bytes(backend_call(Data, detokenize, [Tokens]), Req, Data).
+
+make_key_bytes(Bytes, Req, Data) ->
     barrel_inference_cache_key:make(#{
         fingerprint => request_fp(Req, Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash,
-        tokens => Tokens
+        text => Bytes
     }).
 
 %% Fingerprint to use for cache identity. Returns the per-request
@@ -3400,10 +3428,6 @@ backend_kv_unpack(Bin, SeqId, #data{backend = Mod, backend_state = S}) ->
         true -> Mod:kv_unpack(S, Bin, SeqId);
         false -> Mod:kv_unpack(S, Bin)
     end.
-
-is_strict_prefix([], _) -> true;
-is_strict_prefix([H | T1], [H | T2]) -> is_strict_prefix(T1, T2);
-is_strict_prefix(_, _) -> false.
 
 %% =============================================================================
 %% Internal: backend dispatch

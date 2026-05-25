@@ -1,7 +1,7 @@
 # Barrel Inference
 
 OTP-native LLM inference for the BEAM: dirty NIFs over `llama.cpp`, supervised
-per-model processes, and a token-exact tiered KV cache, with an
+per-model processes, and a byte-exact tiered KV cache, with an
 OpenAI/Anthropic/Ollama-compatible HTTP daemon on top.
 
 Inference as a first-class OTP citizen, not a Python sidecar. The wedge is
@@ -15,7 +15,7 @@ repo is versioned as a whole.
 
 | App | What it is |
 |-----|------------|
-| [`apps/barrel_inference`](apps/barrel_inference) | The runtime: dirty NIFs over llama.cpp, supervised model processes, token-exact tiered KV cache. |
+| [`apps/barrel_inference`](apps/barrel_inference) | The runtime: dirty NIFs over llama.cpp, supervised model processes, byte-exact tiered KV cache. |
 | [`apps/barrel_inference_server`](apps/barrel_inference_server) | The API daemon: OpenAI-, Anthropic-, and Ollama-compatible HTTP, model registry, per-model queues, keep-alive, metrics. |
 | [`apps/barrel_inference_cli`](apps/barrel_inference_cli) | The `barrel-inference` CLI: `serve` boots the daemon; `pull`/`run`/`ps`/`rm` drive a running one over HTTP. |
 

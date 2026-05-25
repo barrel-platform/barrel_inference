@@ -11,9 +11,13 @@
 
 %% Meta row position constants. Layout:
 %%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin, Location,
-%%    TokensRef, Hits}
+%%    TokensRef, Hits, TextBytes}
 %% Hits is a per-row count of warm reuses. Persisted at offset 12 of
 %% the on-disk KVC header so eviction scoring survives restarts.
+%% TextBytes is the byte length of the rendered prompt this row's key
+%% was computed over (ds4-style byte-prefix lookup): a row matches an
+%% incoming prompt when cache_key:make_text over the prompt's leading
+%% TextBytes bytes equals the row key.
 -define(POS_KEY, 1).
 -define(POS_TIER, 2).
 -define(POS_SIZE, 3).
@@ -24,6 +28,7 @@
 -define(POS_LOCATION, 8).
 -define(POS_TOKENS_REF, 9).
 -define(POS_HITS, 10).
+-define(POS_TEXT_BYTES, 11).
 
 %% Offset of the u32 hit_count inside the 48-byte KVC header.
 %% magic(3) + version(1) + quant(1) + reason(1) + reserved(2) +

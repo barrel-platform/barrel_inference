@@ -65,12 +65,15 @@ short_prompt() -> <<"hi">>.
 long_prompt() ->
     list_to_binary(string:join([integer_to_list(N) || N <- lists:seq(1, 12)], " ")).
 
+%% The cache key (v2) is over the rendered prompt bytes. The stub
+%% detokenises a token list to its space-joined decimals, so the key
+%% is computed over those bytes.
 key_for_tokens(Tokens, Cfg) ->
     barrel_inference_cache_key:make(#{
         fingerprint => maps:get(fingerprint, Cfg),
         quant_type => maps:get(quant_type, Cfg),
         ctx_params_hash => maps:get(ctx_params_hash, Cfg),
-        tokens => Tokens
+        text => list_to_binary(stub_detokenize_decimal(Tokens))
     }).
 
 prompt_tokens(Prompt) ->
@@ -286,6 +289,73 @@ parent_key_session_resume_test() ->
                 response_tokens => 2
             }),
         ?assertEqual(idle, barrel_inference_model:status(<<"test_model">>))
+    end).
+
+%% =============================================================================
+%% Byte-addressed reuse (ds4-style)
+%% =============================================================================
+
+byte_prefix_resumes_across_retokenisation_test() ->
+    %% The cache is content-addressed by rendered bytes. Turn 2's
+    %% tokens diverge from the stored checkpoint at the same position,
+    %% yet their rendered bytes share a prefix. The old token-prefix
+    %% walk would miss; the byte-prefix lookup resumes (partial, not
+    %% cold) with NO parent_key threaded.
+    with_model(#{}, fun(Cfg) ->
+        Stored = [10, 11, 12, 13],
+        {ok, #{finish_key := StoredKey, cache_hit_kind := cold}} =
+            barrel_inference_model:prefill_only(<<"test_model">>, Stored),
+        ?assertEqual(key_for_tokens(Stored, Cfg), StoredKey),
+        {ok, _} = wait_for_key(StoredKey, 1000),
+        %% "10 11 12 13" is a byte-prefix of "10 11 12 130 99", but
+        %% [10,11,12,13] is NOT a token-prefix of [10,11,12,130,99].
+        Turn2 = [10, 11, 12, 130, 99],
+        StoredBytes = list_to_binary(stub_detokenize_decimal(Stored)),
+        Turn2Bytes = list_to_binary(stub_detokenize_decimal(Turn2)),
+        ?assertEqual(StoredBytes, binary:part(Turn2Bytes, 0, byte_size(StoredBytes))),
+        ?assertNot(lists:prefix(Stored, Turn2)),
+        {ok, #{cache_hit_kind := Kind, cache_delta := #{read := Read}}} =
+            barrel_inference_model:prefill_only(<<"test_model">>, Turn2),
+        ?assertEqual(partial, Kind),
+        ?assertEqual(length(Stored), Read)
+    end).
+
+%% A turn that ends on a stop string saves a finish row whose
+%% prompt_text includes the stop-triggering token. That row simply
+%% will not byte-prefix-match a trimmed next turn (it is not corrupt:
+%% key, tokens and KV all describe the same with-stop prefix). The
+%% prompt-prefix cold checkpoint - saved before generation, without
+%% the stop bytes - is what serves next-turn reuse.
+stop_sequence_finish_save_does_not_block_prefix_reuse_test() ->
+    Digits = [
+        <<"0">>,
+        <<"1">>,
+        <<"2">>,
+        <<"3">>,
+        <<"4">>,
+        <<"5">>,
+        <<"6">>,
+        <<"7">>,
+        <<"8">>,
+        <<"9">>
+    ],
+    with_model(#{}, fun(Cfg) ->
+        {ok, R1} = barrel_inference_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 8, stop_sequences => Digits}
+        ),
+        ?assertEqual(stop, maps:get(finish_reason, R1)),
+        %% (a) The finish row is a valid, loadable checkpoint.
+        FinishKey = maps:get(finish_key, R1),
+        ?assertMatch({ok, _}, wait_for_key(FinishKey, 1000)),
+        %% (b) The prompt-prefix cold checkpoint (no stop bytes) exists
+        %% and a re-send of the same prompt warms from it (exact),
+        %% independent of the stop-including finish row.
+        PromptKey = key_for_tokens(prompt_tokens(long_prompt()), Cfg),
+        ?assertMatch({ok, _}, wait_for_key(PromptKey, 1000)),
+        {ok, R2} = barrel_inference_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        ?assertEqual(exact, maps:get(cache_hit_kind, R2))
     end).
 
 %% =============================================================================
@@ -573,10 +643,15 @@ prefill_only_returns_finish_key_and_warm_resumes_test() ->
 
 prefill_only_with_parent_key_chains_warm_contexts_test() ->
     %% Warm a prefix via prefill_only/2, then extend it via
-    %% prefill_only/3 with parent_key. The second call must take the
-    %% exact warm path (cache_hit_kind = exact), prefill only the
-    %% suffix tokens, and surface a fresh finish_key for the new
-    %% prefix-plus-suffix row.
+    %% prefill_only/3 with parent_key. The second call takes the
+    %% session-resume path (cache_hit_kind = partial): the checkpoint's
+    %% exact tokens are restored and the rendered-byte suffix the
+    %% checkpoint did not cover is RE-TOKENISED and prefilled. Because
+    %% the cache is byte-addressed (ds4-style), the rejoined effective
+    %% context is `checkpoint_tokens ++ tokenize(byte_suffix)`, which
+    %% may differ at the join from a fresh tokenisation of the whole
+    %% prompt - the byte stream is identical, the token boundaries at
+    %% the seam are not.
     with_model(#{}, fun(Cfg) ->
         Prefix = prompt_tokens(long_prompt()),
         Suffix = prompt_tokens(short_prompt()),
@@ -585,6 +660,15 @@ prefill_only_with_parent_key_chains_warm_contexts_test() ->
             barrel_inference_model:prefill_only(<<"test_model">>, Prefix),
         ?assertEqual(key_for_tokens(Prefix, Cfg), PrefixKey),
         {ok, _} = wait_for_key(PrefixKey, 1000),
+        %% The engine restores Prefix (the checkpoint tokens) and
+        %% re-tokenises the byte suffix beyond Prefix's rendered bytes.
+        ParentBytes = list_to_binary(stub_detokenize_decimal(Prefix)),
+        PromptBytes = list_to_binary(stub_detokenize_decimal(Extended)),
+        SuffixBytes = binary:part(
+            PromptBytes, byte_size(ParentBytes), byte_size(PromptBytes) - byte_size(ParentBytes)
+        ),
+        ExpectedSuffixTokens = prompt_tokens(SuffixBytes),
+        ExpectedCtx = Prefix ++ ExpectedSuffixTokens,
         {ok, #{
             cache_hit_kind := Kind,
             context_tokens := ExtCtx,
@@ -598,13 +682,13 @@ prefill_only_with_parent_key_chains_warm_contexts_test() ->
         %% (only a prefix of the prompt was in cache); only an
         %% identical prompt produces `exact`.
         ?assertEqual(partial, Kind),
-        ?assertEqual(Extended, ExtCtx),
-        ?assertEqual(length(Extended), ExtN),
-        ?assertEqual(key_for_tokens(Extended, Cfg), ExtendedKey),
-        %% Read = prefix length restored from cache; Created = the
-        %% suffix tokens added by this call.
+        ?assertEqual(ExpectedCtx, ExtCtx),
+        ?assertEqual(length(ExpectedCtx), ExtN),
+        ?assertEqual(key_for_tokens(ExpectedCtx, Cfg), ExtendedKey),
+        %% Read = checkpoint prefix length restored from cache;
+        %% Created = the re-tokenised suffix added by this call.
         ?assertEqual(length(Prefix), Read),
-        ?assertEqual(length(Suffix), Created)
+        ?assertEqual(length(ExpectedSuffixTokens), Created)
     end).
 
 %% =============================================================================
