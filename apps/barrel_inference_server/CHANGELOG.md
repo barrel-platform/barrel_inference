@@ -8,15 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
-- Tool requests no longer hang for 60-180 s. The real cause was the engine seq
-  pool defaulting to 1 (`n_seq_max`): a sticky session pins the only sequence and
-  every other session blocks on admission. A shared resolver
-  (`barrel_inference_server_models:resolve_n_seq_max/1`, precedence
-  `parameters.num_seq_max` > `loader.n_seq_max` > 4) now drives **both** the engine
-  seq pool and the server's admission concurrency (`pool_policy_for/1`), so they
-  stay coupled and existing models get a safe default without re-pulling.
-  `admission_on_full = error` is enabled so a genuinely full pool returns a
-  retryable 503/529 instead of blocking.
+- Tool/chat requests no longer hang 60-180 s or crash the model. The hang was the
+  sticky-seq admission *wedge*: with the engine's 1-sequence default a pinned
+  session blocks every other session. Fixed by enabling `admission_on_full = error`
+  (a full pool returns a fast retryable 503/529 instead of blocking) and by raising
+  the seq pool. Crucially, the loader now sets `context_opts.kv_unified = true`:
+  llama.cpp otherwise splits `n_ctx` into `n_ctx / n_seq_max` per sequence, so
+  raising `n_seq_max` (to 4 by default for concurrency) would have cut a 32768
+  context to ~8192 and made large agent prompts `decode_failed` (crash-loop). With
+  the unified KV cache a single request may use the full `n_ctx` while up to
+  `n_seq_max` sequences share that buffer - concurrency and large context at the
+  same KV memory. A shared `barrel_inference_server_models:resolve_n_seq_max/1`
+  (precedence `parameters.num_seq_max` > `loader.n_seq_max` > 4) drives both the
+  engine seq pool and admission concurrency (`pool_policy_for/1`) so they never
+  drift; existing models get the default without re-pulling.
 
 ### Added
 

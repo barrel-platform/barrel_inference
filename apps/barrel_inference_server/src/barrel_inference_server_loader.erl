@@ -399,9 +399,20 @@ manifest_to_config(Manifest) ->
         quant_type => quant_atom(maps:get(<<"quantization">>, Manifest, null)),
         quant_bits => default_int(maps:get(<<"quant_bits">>, Loader, undefined), 4),
         context_size => Ctx,
+        %% kv_unified: a single sequence may use the full n_ctx while
+        %% n_seq_max sequences share that buffer, instead of llama.cpp's
+        %% default of splitting n_ctx into n_ctx/n_seq_max per sequence.
+        %% This lets admission concurrency (n_seq_max > 1) coexist with the
+        %% large per-request context agent clients need, at the same total
+        %% KV memory.
         context_opts => maybe_put_embeddings(
             maybe_put_decode_budget_ms(
-                #{n_ctx => Ctx, n_batch => NBatch, n_seq_max => NSeqMax},
+                #{
+                    n_ctx => Ctx,
+                    n_batch => NBatch,
+                    n_seq_max => NSeqMax,
+                    kv_unified => true
+                },
                 DecodeBudget
             ),
             Embeddings

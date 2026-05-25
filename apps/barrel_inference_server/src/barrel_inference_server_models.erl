@@ -55,12 +55,16 @@ disk: `architecture`, `family`, `parameter_size`, `quantization`,
 %% server-wide max_context_size.
 -define(DEFAULT_PULL_MAX_CTX, 32768).
 
-%% Default engine seq-pool size when a manifest does not pin one. The
-%% engine's own default is 1, which deadlocks under sticky-seq pinning
-%% the moment a second session admits; 4 gives headroom. This drives
-%% BOTH the engine seq pool (loader) and the server's admission
-%% concurrency (barrel_inference_server_config:pool_policy_for/1) via the
-%% shared resolve_n_seq_max/1, so the two layers never drift.
+%% Default engine seq-pool size (and, coupled, the server's admission
+%% concurrency) when a manifest does not pin one. Safe at 4 ONLY because
+%% the loader sets `kv_unified => true': with the unified KV cache a
+%% single sequence may use the full `n_ctx' and the n_seq_max sequences
+%% share that buffer, instead of llama.cpp's default of splitting n_ctx
+%% into n_ctx/n_seq_max per sequence (which left ~8192 per request at
+%% n_seq_max=4 and decode-failed on large prompts). Drives BOTH the engine
+%% seq pool and admission concurrency (pool_policy_for/1) via
+%% resolve_n_seq_max/1, so the two never drift. `admission_on_full=error'
+%% turns a genuinely full pool into a fast retryable 503, not a wedge.
 -define(DEFAULT_N_SEQ_MAX, 4).
 
 -type manifest() :: barrel_inference_server_models_store:manifest().
@@ -365,7 +369,6 @@ loader_opts(Quant, Ctx, Tpl, IsEmbed) ->
         <<"n_gpu_layers">> => 0,
         <<"n_ctx">> => default_int(Ctx, 4096),
         <<"n_batch">> => 512,
-        <<"n_seq_max">> => ?DEFAULT_N_SEQ_MAX,
         <<"quant_type">> => or_null(Quant),
         <<"quant_bits">> => or_null(quant_bits(Quant))
     },

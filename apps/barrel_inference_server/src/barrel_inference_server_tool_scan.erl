@@ -93,36 +93,36 @@ loop(St = #st{buf = Buf}, Rev, Final) ->
             %% it is never streamed as content. Bounded by ?MAX_REGION.
             hold_region(Buf, RS, Rev, St);
         {RS, JsonStart, Kind} ->
-            Pre = binary:part(Buf, 0, RS),
-            case balanced(Buf, JsonStart) of
-                incomplete ->
-                    hold_region(Buf, RS, Rev, St);
-                JsonEnd ->
-                    RegionEnd = consume_end(Buf, JsonEnd, Kind, St),
-                    case settled(Kind, RS, JsonStart, JsonEnd, RegionEnd, St, Final) of
-                        false ->
-                            %% JSON is closed but the region's closing marker
-                            %% hasn't streamed in yet: hold so it is not leaked.
-                            hold_region(Buf, RS, Rev, St);
-                        true ->
-                            Region = binary:part(Buf, RS, RegionEnd - RS),
-                            Json = binary:part(Buf, JsonStart, JsonEnd - JsonStart),
-                            case classify(Kind, Region, Json, St) of
-                                {tool, Call} ->
-                                    Rev1 = [{tool, Call} | push_text(Pre, Rev)],
-                                    loop(St#st{buf = suffix_from(Buf, RegionEnd)}, Rev1, Final);
-                                not_tool ->
-                                    %% Not a tool call: this JSON is content.
-                                    %% Emit up to its close and keep scanning.
-                                    Upto = binary:part(Buf, 0, JsonEnd),
-                                    loop(
-                                        St#st{buf = suffix_from(Buf, JsonEnd)},
-                                        push_text(Upto, Rev),
-                                        Final
-                                    )
-                            end
-                    end
+            handle_region(Buf, RS, JsonStart, Kind, Rev, St, Final)
+    end.
+
+%% A JSON object start was found at JsonStart (region begins at RS). Hold
+%% while the object is incomplete, or while a marker region's closing
+%% marker hasn't arrived; otherwise emit it.
+handle_region(Buf, RS, JsonStart, Kind, Rev, St, Final) ->
+    case balanced(Buf, JsonStart) of
+        incomplete ->
+            hold_region(Buf, RS, Rev, St);
+        JsonEnd ->
+            RegionEnd = consume_end(Buf, JsonEnd, Kind, St),
+            case settled(Kind, RS, JsonStart, JsonEnd, RegionEnd, St, Final) of
+                false -> hold_region(Buf, RS, Rev, St);
+                true -> emit_region(Buf, RS, JsonStart, JsonEnd, RegionEnd, Kind, Rev, St, Final)
             end
+    end.
+
+emit_region(Buf, RS, JsonStart, JsonEnd, RegionEnd, Kind, Rev, St, Final) ->
+    Region = binary:part(Buf, RS, RegionEnd - RS),
+    Json = binary:part(Buf, JsonStart, JsonEnd - JsonStart),
+    case classify(Kind, Region, Json, St) of
+        {tool, Call} ->
+            Rev1 = [{tool, Call} | push_text(binary:part(Buf, 0, RS), Rev)],
+            loop(St#st{buf = suffix_from(Buf, RegionEnd)}, Rev1, Final);
+        not_tool ->
+            %% Not a tool call: this JSON is content. Emit up to its close
+            %% and keep scanning the remainder.
+            Upto = binary:part(Buf, 0, JsonEnd),
+            loop(St#st{buf = suffix_from(Buf, JsonEnd)}, push_text(Upto, Rev), Final)
     end.
 
 %% Hold from RS (emit text before it), bounded: a runaway candidate is

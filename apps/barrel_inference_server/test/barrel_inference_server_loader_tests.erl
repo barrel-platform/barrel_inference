@@ -293,6 +293,13 @@ manifest_to_config_propagates_n_seq_max_test() ->
     CtxOpts = maps:get(context_opts, Config),
     ?assertEqual(4, maps:get(n_seq_max, CtxOpts)).
 
+%% kv_unified must be on so n_seq_max > 1 does not divide the per-sequence
+%% context (llama.cpp's default splits n_ctx into n_ctx/n_seq_max).
+manifest_to_config_enables_kv_unified_test() ->
+    Manifest = manifest(<<"sha256:000c">>, <<"q4_k_m">>, 4096, 4),
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ?assertEqual(true, maps:get(kv_unified, maps:get(context_opts, Config))).
+
 manifest_to_config_defaults_n_seq_max_when_absent_test() ->
     %% A manifest that omits n_seq_max now resolves to the shared default
     %% (4), not the engine's deadlock-prone 1; the same resolver drives
