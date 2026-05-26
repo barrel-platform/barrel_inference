@@ -26,6 +26,7 @@
     pull_short_name_wraps_to_ollama/1,
     resolve_spec_for_known_schemes/1,
     pull_detects_qwen_xml_tool_call_format/1,
+    pull_detects_qwen3_coder_tool_call_format/1,
     pull_detects_dsml_tool_call_format/1,
     pull_detects_llama_python_tag_tool_call_format/1,
     pull_detects_mistral_tool_call_format/1,
@@ -60,6 +61,7 @@ all() ->
         pull_short_name_wraps_to_ollama,
         resolve_spec_for_known_schemes,
         pull_detects_qwen_xml_tool_call_format,
+        pull_detects_qwen3_coder_tool_call_format,
         pull_detects_dsml_tool_call_format,
         pull_detects_llama_python_tag_tool_call_format,
         pull_detects_mistral_tool_call_format,
@@ -184,6 +186,18 @@ pull_detects_qwen_xml_tool_call_format(Config) ->
     Template = <<"...<tool_call>{ name, args }</tool_call>...">>,
     Loader = pull_loader_with_template(Config, Template, <<"qwen-fake">>),
     ?assertEqual(<<"qwen-xml">>, maps:get(<<"tool_call_format">>, Loader)),
+    Markers = maps:get(<<"tool_call_markers">>, Loader),
+    ?assertEqual(<<"<tool_call>">>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"</tool_call>">>, maps:get(<<"end">>, Markers)).
+
+%% Qwen3-Coder shares the `<tool_call>' markers with Qwen2.5 but emits a
+%% nested `<function=...><parameter=...>' body. Detection must pick
+%% `qwen3-coder' (not `qwen-xml') when the template contains `<function='.
+pull_detects_qwen3_coder_tool_call_format(Config) ->
+    Template =
+        <<"...<tool_call>\n<function=foo>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"qwen3-coder-fake">>),
+    ?assertEqual(<<"qwen3-coder">>, maps:get(<<"tool_call_format">>, Loader)),
     Markers = maps:get(<<"tool_call_markers">>, Loader),
     ?assertEqual(<<"<tool_call>">>, maps:get(<<"start">>, Markers)),
     ?assertEqual(<<"</tool_call>">>, maps:get(<<"end">>, Markers)).

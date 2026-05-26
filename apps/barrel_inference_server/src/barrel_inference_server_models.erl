@@ -446,7 +446,19 @@ detect_tool_call_format(Template) when is_binary(Template) ->
         {<<"llama-python-tag">>, <<"<|python_tag|>">>, <<"<|eom_id|>">>},
         {<<"mistral-tool-calls">>, <<"[TOOL_CALLS]">>, <<"</s>">>}
     ],
-    first_match_marker(Template, Candidates).
+    %% Qwen3-Coder shares the `<tool_call>' markers with Qwen2.5 but emits a
+    %% nested `<function=...><parameter=...>' body, not JSON-in-tags. Both
+    %% templates contain `<tool_call>', so the generic scan would always pick
+    %% `qwen-xml'; the `<function=' literal is unique to the Qwen3-Coder call
+    %% format, so check it first.
+    case is_qwen3_coder_template(Template) of
+        true -> {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>};
+        false -> first_match_marker(Template, Candidates)
+    end.
+
+is_qwen3_coder_template(Template) ->
+    binary:match(Template, <<"<tool_call>">>) =/= nomatch andalso
+        binary:match(Template, <<"<function=">>) =/= nomatch.
 
 first_match_marker(_, []) ->
     undefined;
