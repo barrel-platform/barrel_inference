@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Qwen3-Coder tool-call format family (`qwen3-coder`). Qwen3-Coder (qwen3moe) emits
+  tool calls in a nested-XML shape (`<tool_call><function=NAME><parameter=P>val</parameter></function></tool_call>`),
+  not the Qwen2.5 JSON-in-tags shape the `qwen-xml` family handles, so its calls
+  previously failed to parse (no usable arguments). New
+  `barrel_inference_server_tool_format_qwen3_coder` renders the nested tool block and
+  parses the nested calls (parameter values JSON-decoded when they round-trip, kept as
+  raw strings otherwise). Pull-time detection (`detect_tool_call_format/1`) now picks
+  `qwen3-coder` over `qwen-xml` when the template contains `<function=` (both share the
+  `<tool_call>` markers), so future Qwen3-Coder pulls map correctly.
+
 - Memory-aware model loading (opt-in via `memory_aware_loading => true`). Before a
   model loads, the loader estimates its resident footprint (mmapped weights from the
   GGUF file size + the f16 KV cache at the configured context, sized on

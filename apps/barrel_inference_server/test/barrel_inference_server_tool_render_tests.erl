@@ -60,6 +60,18 @@ mistral_render_uses_available_and_tool_calls_tokens_test() ->
     assert_contains(Out, <<"[TOOL_CALLS]">>),
     assert_contains(Out, <<"get_weather">>).
 
+qwen3_coder_render_uses_nested_function_format_test() ->
+    Out = barrel_inference_server_tool_format_qwen3_coder:render_prompt(tools(), undefined),
+    assert_contains(Out, <<"<tools>">>),
+    assert_contains(Out, <<"</tools>">>),
+    %% The call-format instruction uses the nested function/parameter tags.
+    assert_contains(Out, <<"<function=">>),
+    assert_contains(Out, <<"<parameter=">>),
+    assert_contains(Out, <<"</tool_call>">>),
+    %% The function name + a property reach the prompt.
+    assert_contains(Out, <<"get_weather">>),
+    assert_contains(Out, <<"city">>).
+
 %% append_system/2: the family block is appended to an existing system
 %% prompt with a blank-line separator, and stands alone when there is none.
 append_system_preserves_existing_test() ->

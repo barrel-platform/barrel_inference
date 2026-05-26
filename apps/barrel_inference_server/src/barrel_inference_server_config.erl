@@ -184,6 +184,7 @@ tool_call_formats() ->
 default_tool_call_formats() ->
     #{
         <<"qwen-xml">> => #{module => barrel_inference_server_tool_format_qwen_xml},
+        <<"qwen3-coder">> => #{module => barrel_inference_server_tool_format_qwen3_coder},
         <<"dsml">> => #{module => barrel_inference_server_tool_format_dsml},
         <<"llama-python-tag">> => #{
             module => barrel_inference_server_tool_format_llama_python_tag
