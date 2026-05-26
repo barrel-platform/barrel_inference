@@ -32,6 +32,7 @@
     request_end/2,
     unload_now/1,
     unload_sync/1,
+    unload_idle_sync/1,
     status/0,
     status/1
 ]).
@@ -86,6 +87,16 @@ unload_now(ModelId) when is_binary(ModelId) ->
 unload_sync(ModelId) when is_binary(ModelId) ->
     gen_server:call(?SERVER, {unload_sync, ModelId}).
 
+%% Atomic idle unload: unload only if the model has no in-flight request,
+%% re-checking `active` inside the gen_server so the check and the unload
+%% are one serialized step. Returns `busy` (without unloading) if a
+%% request started since the caller's snapshot, or if the model is not
+%% tracked. Used by the proactive pressure evictor, which must never
+%% unload a model mid-request.
+-spec unload_idle_sync(binary()) -> ok | busy.
+unload_idle_sync(ModelId) when is_binary(ModelId) ->
+    gen_server:call(?SERVER, {unload_idle_sync, ModelId}).
+
 %% Returns a snapshot of the keepalive registry. Each entry carries
 %% the current active request count and either `infinity` (no timer)
 %% or the millisecond timestamp at which the unload timer will fire.
@@ -125,6 +136,12 @@ handle_call({status, Id}, _, S = #state{models = M}) ->
     {reply, snapshot_one(Id, M), S};
 handle_call({unload_sync, ModelId}, _, S = #state{models = M}) ->
     {reply, ok, S#state{models = drop_and_unload(ModelId, M)}};
+handle_call({unload_idle_sync, ModelId}, _, S = #state{models = M}) ->
+    case maps:find(ModelId, M) of
+        {ok, #entry{active = 0}} -> {reply, ok, S#state{models = drop_and_unload(ModelId, M)}};
+        {ok, _} -> {reply, busy, S};
+        error -> {reply, busy, S}
+    end;
 handle_call(_, _, S) ->
     {reply, {error, unknown_call}, S}.
 

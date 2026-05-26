@@ -49,10 +49,16 @@ policy is unit-testable without a live engine.
     kv_cache_b/1,
     available_b/0,
     plan_eviction/4,
-    make_room/3
+    make_room/3,
+    idle_models/0,
+    wait_unloaded/1
 ]).
 
 -export_type([world/0]).
+
+-ifdef(TEST).
+-export([idle_from_status/1]).
+-endif.
 
 -define(APP, barrel_inference_server).
 %% f16 KV cells (type_k / type_v default; KV quantisation is unwired).
@@ -60,6 +66,10 @@ policy is unit-testable without a live engine.
 -define(DEFAULT_MARGIN_B, 1073741824).
 %% Bound on unload rounds; a degenerate world can't spin forever.
 -define(MAX_ROUNDS, 16).
+%% Bounded poll waiting for an unloaded model's gen_statem to clear the
+%% registry before re-checking the fit (50 * 20 ms = 1 s).
+-define(UNLOAD_WAIT_ROUNDS, 50).
+-define(UNLOAD_WAIT_MS, 20).
 
 %% Side effects make_room/3 needs, injectable for tests.
 -type world() :: #{
@@ -279,6 +289,62 @@ make_room(ModelId, EstimateB, World, Unloaded, Rounds) ->
                     make_room(ModelId, EstimateB, World, [Victim | Unloaded], Rounds - 1)
             end
     end.
+
+%% =============================================================================
+%% Idle models (shared by the loader fit-check and the pressure evictor)
+%% =============================================================================
+
+%% Loaded models with no in-flight request, least-recently-active first,
+%% as `{ModelId, LastActiveMs}`. A zero-active entry is a snapshot; the
+%% caller must re-check atomically at unload time (the keepalive
+%% `unload_idle_sync/1` does this) to avoid unloading a model whose
+%% request began after the snapshot.
+-spec idle_models() -> [{binary(), non_neg_integer()}].
+idle_models() ->
+    Loaded = [E || E <- safe_keepalive_status(), loaded(maps:get(model, E, <<>>))],
+    idle_from_status(Loaded).
+
+%% Pure inner filter: keep zero-active entries, return them
+%% least-recently-active first. Split out so the active filter + ordering
+%% is unit-testable without keepalive/registry IO.
+-spec idle_from_status([map()]) -> [{binary(), non_neg_integer()}].
+idle_from_status(Status) ->
+    Idle = [{Id, maps:get(last_active_ms, E, 0)} || E = #{model := Id, active := 0} <- Status],
+    lists:keysort(2, Idle).
+
+%% Bounded poll until an unloaded model's gen_statem clears the registry.
+%% The *_sync unloads block on terminate_child, but the registry row is
+%% cleared by an async 'DOWN', so this defeats a unload/load memory race
+%% and lets `/api/ps` reflect the unload immediately.
+-spec wait_unloaded(binary()) -> ok | timeout.
+wait_unloaded(ModelId) ->
+    wait_unloaded(ModelId, ?UNLOAD_WAIT_ROUNDS).
+
+wait_unloaded(_Id, 0) ->
+    timeout;
+wait_unloaded(Id, N) ->
+    case barrel_inference_registry:whereis_name(Id) of
+        undefined ->
+            ok;
+        Pid ->
+            case is_process_alive(Pid) of
+                false ->
+                    ok;
+                true ->
+                    timer:sleep(?UNLOAD_WAIT_MS),
+                    wait_unloaded(Id, N - 1)
+            end
+    end.
+
+safe_keepalive_status() ->
+    try barrel_inference_server_keepalive:status() of
+        L when is_list(L) -> L
+    catch
+        _:_ -> []
+    end.
+
+loaded(Id) ->
+    barrel_inference_registry:whereis_name(Id) =/= undefined.
 
 %% =============================================================================
 %% Internal

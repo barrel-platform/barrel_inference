@@ -17,7 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   raw strings otherwise). Pull-time detection (`detect_tool_call_format/1`) now picks
   `qwen3-coder` over `qwen-xml` when the template contains `<function=` (both share the
   `<tool_call>` markers), so future Qwen3-Coder pulls map correctly.
-
+- Proactive idle-model eviction under memory pressure: `barrel_inference_server_model_evictor`
+  implements the engine's `barrel_inference_model_evictor` behaviour, so the engine
+  scheduler (with `unload_models_under_pressure => true`) can unload the
+  least-recently-active idle model when cache eviction cannot relieve sustained
+  pressure. Keepalive gains `unload_idle_sync/1`, which re-checks `active = 0` atomically
+  inside the gen_server and returns `busy` (without unloading) if a request started
+  since the candidate snapshot, so a model is never unloaded mid-request. The idle-model
+  listing + registry wait used by the loader fit-check are shared via
+  `barrel_inference_server_memory:idle_models/0` and `wait_unloaded/1`.
 - Memory-aware model loading (opt-in via `memory_aware_loading => true`). Before a
   model loads, the loader estimates its resident footprint (mmapped weights from the
   GGUF file size + the f16 KV cache at the configured context, sized on

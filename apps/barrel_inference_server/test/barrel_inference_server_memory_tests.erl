@@ -168,6 +168,31 @@ estimate_footprint_zero_without_path_test() ->
     ?assertEqual(0, barrel_inference_server_memory:estimate_footprint_b(#{})).
 
 %% =============================================================================
+%% idle_from_status/1 (pure active-filter + recency ordering)
+%% =============================================================================
+
+idle_from_status_excludes_busy_and_orders_by_recency_test() ->
+    Status = [
+        #{model => <<"a">>, active => 0, last_active_ms => 300},
+        #{model => <<"b">>, active => 1, last_active_ms => 50},
+        #{model => <<"c">>, active => 0, last_active_ms => 100}
+    ],
+    %% b is busy (excluded); remaining are least-recently-active first.
+    ?assertEqual(
+        [{<<"c">>, 100}, {<<"a">>, 300}],
+        barrel_inference_server_memory:idle_from_status(Status)
+    ).
+
+idle_from_status_empty_test() ->
+    ?assertEqual([], barrel_inference_server_memory:idle_from_status([])),
+    ?assertEqual(
+        [],
+        barrel_inference_server_memory:idle_from_status([
+            #{model => <<"x">>, active => 2, last_active_ms => 1}
+        ])
+    ).
+
+%% =============================================================================
 %% Helpers
 %% =============================================================================
 

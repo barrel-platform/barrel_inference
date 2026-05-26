@@ -49,7 +49,10 @@ keepalive_test_() ->
             ?_test(re_begin_cancels_pending_unload()),
             ?_test(unload_without_begin_is_safe()),
             ?_test(status_carries_last_active_ms()),
-            ?_test(unload_sync_drops_entry())
+            ?_test(unload_sync_drops_entry()),
+            ?_test(unload_idle_sync_drops_when_idle()),
+            ?_test(unload_idle_sync_busy_when_active()),
+            ?_test(unload_idle_sync_busy_when_untracked())
         ]
     end}.
 
@@ -104,3 +107,22 @@ unload_sync_drops_entry() ->
     ?assertMatch(#{model := Id}, barrel_inference_server_keepalive:status(Id)),
     ok = barrel_inference_server_keepalive:unload_sync(Id),
     ?assertEqual(not_tracked, barrel_inference_server_keepalive:status(Id)).
+
+unload_idle_sync_drops_when_idle() ->
+    Id = <<"unit-idle-sync-ok">>,
+    ok = barrel_inference_server_keepalive:request_begin(Id),
+    ok = barrel_inference_server_keepalive:request_end(Id, infinity),
+    ?assertMatch(#{model := Id, active := 0}, barrel_inference_server_keepalive:status(Id)),
+    ?assertEqual(ok, barrel_inference_server_keepalive:unload_idle_sync(Id)),
+    ?assertEqual(not_tracked, barrel_inference_server_keepalive:status(Id)).
+
+unload_idle_sync_busy_when_active() ->
+    Id = <<"unit-idle-sync-busy">>,
+    ok = barrel_inference_server_keepalive:request_begin(Id),
+    %% A request is in flight (active = 1): must not unload.
+    ?assertEqual(busy, barrel_inference_server_keepalive:unload_idle_sync(Id)),
+    ?assertMatch(#{active := 1}, barrel_inference_server_keepalive:status(Id)),
+    ok = barrel_inference_server_keepalive:request_end(Id, infinity).
+
+unload_idle_sync_busy_when_untracked() ->
+    ?assertEqual(busy, barrel_inference_server_keepalive:unload_idle_sync(<<"never-seen-idle">>)).
