@@ -188,6 +188,7 @@ code_for(not_found) -> 404;
 code_for(not_preloaded) -> 503;
 code_for(not_loaded) -> 503;
 code_for(load_failed) -> 503;
+code_for(model_would_oom) -> 503;
 code_for(load_timeout) -> 504;
 code_for(_) -> 500.
 

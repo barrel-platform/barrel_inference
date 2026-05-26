@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Memory-aware model loading (opt-in via `memory_aware_loading => true`). Before a
+  model loads, the loader estimates its resident footprint (mmapped weights from the
+  GGUF file size + the f16 KV cache at the configured context, sized on
+  `head_count_kv` so grouped-query attention is not overestimated) and compares it
+  against available memory (the most restrictive of the GPU VRAM probe and the system
+  memory probe). If it would not fit, the least-recently-active idle model is unloaded
+  synchronously (waiting until it clears the registry) and the fit is re-checked;
+  when nothing idle can be freed the load is rejected with 503 `model_would_oom`
+  instead of letting llama.cpp OOM the box. Keepalive now tracks `last_active_ms` per
+  model (exposed in `status/0`) to pick the unload victim. Off by default: the
+  footprint-vs-free-memory comparison is approximate, so it is enabled only on
+  memory-bound multi-model deployments. `model_load_memory_margin_b` (default 1 GiB)
+  sets the headroom kept free above the estimate.
 - Static system+tools prefix is checkpointed and pinned once per tool set. When a
   request carries tools, the pipeline computes the verified end-of-tools token offset
   (the longest common token prefix of a head-only render and the full render - no

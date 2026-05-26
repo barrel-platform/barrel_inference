@@ -34,6 +34,10 @@
 
 -define(APP, barrel_inference_server).
 -define(TICK_INTERVAL_MS, 2000).
+%% Bounded poll waiting for an unloaded model's gen_statem to clear the
+%% registry before re-checking the memory fit (50 * 20 ms = 1 s).
+-define(UNLOAD_WAIT_ROUNDS, 50).
+-define(UNLOAD_WAIT_MS, 20).
 
 -record(state, {
     model_id :: binary(),
@@ -199,6 +203,78 @@ spawn_load_worker(LoaderPid, ModelId, Opts) ->
     end).
 
 load_with_opts(ModelId, Opts) ->
+    case ensure_room(ModelId, Opts) of
+        ok -> do_load(ModelId, Opts);
+        {error, _} = E -> E
+    end.
+
+%% Memory-aware admission: estimate the model's footprint and, if it
+%% would not fit, unload the least-recently-active idle model(s) before
+%% loading. Rejects with `{error, model_would_oom}` (pipeline maps to
+%% 503) when nothing idle can be freed. Disabled (always `ok`) when the
+%% feature is off or no memory probe is available.
+ensure_room(ModelId, Opts) ->
+    case barrel_inference_server_memory:enabled() of
+        false ->
+            ok;
+        true ->
+            Est = barrel_inference_server_memory:estimate_footprint_b(Opts),
+            barrel_inference_server_memory:make_room(ModelId, Est, room_world(ModelId))
+    end.
+
+room_world(ModelId) ->
+    #{
+        available => fun barrel_inference_server_memory:available_b/0,
+        candidates => fun(Unloaded) -> idle_candidates(ModelId, Unloaded) end,
+        unload => fun(Victim) ->
+            _ = barrel_inference_server_keepalive:unload_sync(Victim),
+            _ = wait_unloaded(Victim, ?UNLOAD_WAIT_ROUNDS),
+            ok
+        end
+    }.
+
+%% Loaded models with no in-flight request, excluding the model being
+%% loaded and any already unloaded this round, as `{ModelId, LastActiveMs}`.
+idle_candidates(ModelId, Unloaded) ->
+    [
+        {Id, maps:get(last_active_ms, E, 0)}
+     || E = #{model := Id, active := 0} <- safe_keepalive_status(),
+        Id =/= ModelId,
+        not lists:member(Id, Unloaded),
+        loaded(Id)
+    ].
+
+safe_keepalive_status() ->
+    try barrel_inference_server_keepalive:status() of
+        L when is_list(L) -> L
+    catch
+        _:_ -> []
+    end.
+
+loaded(Id) ->
+    barrel_inference_registry:whereis_name(Id) =/= undefined.
+
+%% Poll the registry until the unloaded model's gen_statem is gone.
+%% unload_sync/1 already blocks on terminate_child, but the registry
+%% row is cleared by an async 'DOWN', so this defeats a unload/load
+%% memory race.
+wait_unloaded(_Id, 0) ->
+    timeout;
+wait_unloaded(Id, N) ->
+    case barrel_inference_registry:whereis_name(Id) of
+        undefined ->
+            ok;
+        Pid ->
+            case is_process_alive(Pid) of
+                false ->
+                    ok;
+                true ->
+                    timer:sleep(?UNLOAD_WAIT_MS),
+                    wait_unloaded(Id, N - 1)
+            end
+    end.
+
+do_load(ModelId, Opts) ->
     try barrel_inference:load_model(ModelId, Opts) of
         {ok, _ModelRef} ->
             ok;

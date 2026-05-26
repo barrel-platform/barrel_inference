@@ -30,6 +30,11 @@ quantization, chat_template, tokenizer_model.
     parameter_size_label/1,
     context_length/1,
     embedding_length/1,
+    block_count/1,
+    head_count/1,
+    head_count_kv/1,
+    key_length/1,
+    value_length/1,
     quantization/1,
     chat_template/1,
     tokenizer_model/1,
@@ -117,6 +122,36 @@ context_length(M) ->
 -spec embedding_length(gguf_metadata()) -> pos_integer() | undefined.
 embedding_length(M) ->
     arch_int(<<".embedding_length">>, M).
+
+%% Number of transformer blocks (layers). Drives the KV-cache size
+%% estimate (KV grows linearly with the layer count).
+-spec block_count(gguf_metadata()) -> pos_integer() | undefined.
+block_count(M) ->
+    arch_int(<<".block_count">>, M).
+
+%% Attention head count (n_head). Used to derive head_dim when the
+%% GGUF omits the explicit key/value length fields.
+-spec head_count(gguf_metadata()) -> pos_integer() | undefined.
+head_count(M) ->
+    arch_int(<<".attention.head_count">>, M).
+
+%% KV head count (n_head_kv). Smaller than head_count under
+%% grouped-query attention; the KV cache is sized on this, not the
+%% query head count, so it must be read to avoid an 8x overestimate.
+-spec head_count_kv(gguf_metadata()) -> pos_integer() | undefined.
+head_count_kv(M) ->
+    arch_int(<<".attention.head_count_kv">>, M).
+
+%% Per-head key dimension. Present on models whose head_dim is not
+%% embedding_length / head_count (e.g. some MoE / MLA variants).
+-spec key_length(gguf_metadata()) -> pos_integer() | undefined.
+key_length(M) ->
+    arch_int(<<".attention.key_length">>, M).
+
+%% Per-head value dimension. See key_length/1.
+-spec value_length(gguf_metadata()) -> pos_integer() | undefined.
+value_length(M) ->
+    arch_int(<<".attention.value_length">>, M).
 
 %% Pooling type for embedding models, as the GGUF uint enum
 %% (1=mean, 2=cls, 3=last). `arch_int/2` already drops 0 (none) and

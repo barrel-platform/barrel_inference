@@ -47,7 +47,9 @@ keepalive_test_() ->
             ?_test(timed_keepalive_unloads_after_delay()),
             ?_test(infinity_keepalive_never_unloads()),
             ?_test(re_begin_cancels_pending_unload()),
-            ?_test(unload_without_begin_is_safe())
+            ?_test(unload_without_begin_is_safe()),
+            ?_test(status_carries_last_active_ms()),
+            ?_test(unload_sync_drops_entry())
         ]
     end}.
 
@@ -85,3 +87,20 @@ unload_without_begin_is_safe() ->
     ok = barrel_inference_server_keepalive:request_end(<<"never-seen">>, 0),
     ok = barrel_inference_server_keepalive:unload_now(<<"never-seen">>),
     ?assertNotEqual(undefined, whereis(barrel_inference_server_keepalive)).
+
+status_carries_last_active_ms() ->
+    Id = <<"unit-recency">>,
+    Before = erlang:system_time(millisecond),
+    ok = barrel_inference_server_keepalive:request_begin(Id),
+    #{active := 1, last_active_ms := L} = barrel_inference_server_keepalive:status(Id),
+    ?assert(L >= Before),
+    %% Keep it loaded (infinity) so the entry stays for the assertion.
+    ok = barrel_inference_server_keepalive:request_end(Id, infinity).
+
+unload_sync_drops_entry() ->
+    Id = <<"unit-unload-sync">>,
+    ok = barrel_inference_server_keepalive:request_begin(Id),
+    ok = barrel_inference_server_keepalive:request_end(Id, infinity),
+    ?assertMatch(#{model := Id}, barrel_inference_server_keepalive:status(Id)),
+    ok = barrel_inference_server_keepalive:unload_sync(Id),
+    ?assertEqual(not_tracked, barrel_inference_server_keepalive:status(Id)).
