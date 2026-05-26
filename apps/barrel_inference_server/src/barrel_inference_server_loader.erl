@@ -34,10 +34,6 @@
 
 -define(APP, barrel_inference_server).
 -define(TICK_INTERVAL_MS, 2000).
-%% Bounded poll waiting for an unloaded model's gen_statem to clear the
-%% registry before re-checking the memory fit (50 * 20 ms = 1 s).
--define(UNLOAD_WAIT_ROUNDS, 50).
--define(UNLOAD_WAIT_MS, 20).
 
 -record(state, {
     model_id :: binary(),
@@ -228,51 +224,20 @@ room_world(ModelId) ->
         candidates => fun(Unloaded) -> idle_candidates(ModelId, Unloaded) end,
         unload => fun(Victim) ->
             _ = barrel_inference_server_keepalive:unload_sync(Victim),
-            _ = wait_unloaded(Victim, ?UNLOAD_WAIT_ROUNDS),
+            _ = barrel_inference_server_memory:wait_unloaded(Victim),
             ok
         end
     }.
 
-%% Loaded models with no in-flight request, excluding the model being
-%% loaded and any already unloaded this round, as `{ModelId, LastActiveMs}`.
+%% Idle loaded models (via the shared helper) minus the model being
+%% loaded and any already unloaded this round.
 idle_candidates(ModelId, Unloaded) ->
     [
-        {Id, maps:get(last_active_ms, E, 0)}
-     || E = #{model := Id, active := 0} <- safe_keepalive_status(),
+        {Id, Ms}
+     || {Id, Ms} <- barrel_inference_server_memory:idle_models(),
         Id =/= ModelId,
-        not lists:member(Id, Unloaded),
-        loaded(Id)
+        not lists:member(Id, Unloaded)
     ].
-
-safe_keepalive_status() ->
-    try barrel_inference_server_keepalive:status() of
-        L when is_list(L) -> L
-    catch
-        _:_ -> []
-    end.
-
-loaded(Id) ->
-    barrel_inference_registry:whereis_name(Id) =/= undefined.
-
-%% Poll the registry until the unloaded model's gen_statem is gone.
-%% unload_sync/1 already blocks on terminate_child, but the registry
-%% row is cleared by an async 'DOWN', so this defeats a unload/load
-%% memory race.
-wait_unloaded(_Id, 0) ->
-    timeout;
-wait_unloaded(Id, N) ->
-    case barrel_inference_registry:whereis_name(Id) of
-        undefined ->
-            ok;
-        Pid ->
-            case is_process_alive(Pid) of
-                false ->
-                    ok;
-                true ->
-                    timer:sleep(?UNLOAD_WAIT_MS),
-                    wait_unloaded(Id, N - 1)
-            end
-    end.
 
 do_load(ModelId, Opts) ->
     try barrel_inference:load_model(ModelId, Opts) of
