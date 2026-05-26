@@ -125,6 +125,34 @@ extractors_test() ->
     ?assertEqual(undefined, barrel_inference_server_gguf:pooling_type(M)),
     ?assertNot(barrel_inference_server_gguf:is_embedding_model(M)).
 
+%% KV-footprint dimension extractors, including grouped-query
+%% attention (head_count_kv < head_count).
+kv_dimension_extractors_test() ->
+    KVs = [
+        {<<"general.architecture">>, ?T_STRING, <<"qwen3">>},
+        {<<"qwen3.embedding_length">>, ?T_UINT32, 5120},
+        {<<"qwen3.block_count">>, ?T_UINT32, 64},
+        {<<"qwen3.attention.head_count">>, ?T_UINT32, 40},
+        {<<"qwen3.attention.head_count_kv">>, ?T_UINT32, 8},
+        {<<"qwen3.attention.key_length">>, ?T_UINT32, 128},
+        {<<"qwen3.attention.value_length">>, ?T_UINT32, 128}
+    ],
+    {ok, M} = with_synthetic_gguf(3, KVs, fun barrel_inference_server_gguf:read_metadata/1),
+    ?assertEqual(64, barrel_inference_server_gguf:block_count(M)),
+    ?assertEqual(40, barrel_inference_server_gguf:head_count(M)),
+    ?assertEqual(8, barrel_inference_server_gguf:head_count_kv(M)),
+    ?assertEqual(128, barrel_inference_server_gguf:key_length(M)),
+    ?assertEqual(128, barrel_inference_server_gguf:value_length(M)).
+
+kv_dimension_extractors_absent_test() ->
+    KVs = [{<<"general.architecture">>, ?T_STRING, <<"llama">>}],
+    {ok, M} = with_synthetic_gguf(3, KVs, fun barrel_inference_server_gguf:read_metadata/1),
+    ?assertEqual(undefined, barrel_inference_server_gguf:block_count(M)),
+    ?assertEqual(undefined, barrel_inference_server_gguf:head_count(M)),
+    ?assertEqual(undefined, barrel_inference_server_gguf:head_count_kv(M)),
+    ?assertEqual(undefined, barrel_inference_server_gguf:key_length(M)),
+    ?assertEqual(undefined, barrel_inference_server_gguf:value_length(M)).
+
 %% A declared pooling type marks the GGUF as an embedding model.
 is_embedding_model_via_pooling_type_test() ->
     KVs = [

@@ -10,7 +10,9 @@
 %%%
 %%%   request_begin(ModelId)           - increment active count; cancel timer
 %%%   request_end(ModelId, KeepAlive)  - decrement; if last and KA > 0, arm
-%%%   unload_now(ModelId)              - force immediate unload
+%%%   unload_now(ModelId)              - force immediate unload (cast)
+%%%   unload_sync(ModelId)             - force immediate unload (call;
+%%%                                      blocks until the model is torn down)
 %%%
 %%% `KeepAlive` accepts:
 %%%
@@ -24,7 +26,15 @@
 -module(barrel_inference_server_keepalive).
 -behaviour(gen_server).
 
--export([start_link/0, request_begin/1, request_end/2, unload_now/1, status/0, status/1]).
+-export([
+    start_link/0,
+    request_begin/1,
+    request_end/2,
+    unload_now/1,
+    unload_sync/1,
+    status/0,
+    status/1
+]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SERVER, ?MODULE).
@@ -34,7 +44,11 @@
     timer :: undefined | reference(),
     %% Unix-time millisecond when the unload timer will fire. `infinity`
     %% if no timer is armed (active count > 0 OR keep_alive = infinity).
-    expires_at_ms = infinity :: infinity | non_neg_integer()
+    expires_at_ms = infinity :: infinity | non_neg_integer(),
+    %% Unix-time millisecond of the most recent request_begin /
+    %% request_end. Memory-aware loading picks the least-recently-active
+    %% idle model as the unload victim, so this is the recency key.
+    last_active_ms = 0 :: non_neg_integer()
 }).
 
 -record(state, {
@@ -64,6 +78,14 @@ request_end(ModelId, KeepAlive) when is_binary(ModelId) ->
 unload_now(ModelId) when is_binary(ModelId) ->
     gen_server:cast(?SERVER, {unload_now, ModelId}).
 
+%% Synchronous unload: cancel the timer, drop the entry, and unload
+%% the model, replying only once the gen_statem has been torn down.
+%% Used by memory-aware loading so a unload-then-load sequence does
+%% not race the freed memory.
+-spec unload_sync(binary()) -> ok.
+unload_sync(ModelId) when is_binary(ModelId) ->
+    gen_server:call(?SERVER, {unload_sync, ModelId}).
+
 %% Returns a snapshot of the keepalive registry. Each entry carries
 %% the current active request count and either `infinity` (no timer)
 %% or the millisecond timestamp at which the unload timer will fire.
@@ -72,7 +94,8 @@ unload_now(ModelId) when is_binary(ModelId) ->
         #{
             model := binary(),
             active := non_neg_integer(),
-            expires_at_ms := infinity | non_neg_integer()
+            expires_at_ms := infinity | non_neg_integer(),
+            last_active_ms := non_neg_integer()
         }
     ].
 status() ->
@@ -82,7 +105,8 @@ status() ->
     #{
         model := binary(),
         active := non_neg_integer(),
-        expires_at_ms := infinity | non_neg_integer()
+        expires_at_ms := infinity | non_neg_integer(),
+        last_active_ms := non_neg_integer()
     }
     | not_tracked.
 status(ModelId) when is_binary(ModelId) ->
@@ -99,18 +123,24 @@ handle_call(status, _, S = #state{models = M}) ->
     {reply, snapshot_all(M), S};
 handle_call({status, Id}, _, S = #state{models = M}) ->
     {reply, snapshot_one(Id, M), S};
+handle_call({unload_sync, ModelId}, _, S = #state{models = M}) ->
+    {reply, ok, S#state{models = drop_and_unload(ModelId, M)}};
 handle_call(_, _, S) ->
     {reply, {error, unknown_call}, S}.
 
 handle_cast({request_begin, ModelId}, S = #state{models = M}) ->
     E0 = maps:get(ModelId, M, #entry{}),
-    E1 = E0#entry{active = E0#entry.active + 1, timer = cancel_timer(E0#entry.timer)},
+    E1 = E0#entry{
+        active = E0#entry.active + 1,
+        timer = cancel_timer(E0#entry.timer),
+        last_active_ms = now_ms()
+    },
     {noreply, S#state{models = M#{ModelId => E1}}};
 handle_cast({request_end, ModelId, KeepAlive}, S = #state{models = M}) ->
     case maps:find(ModelId, M) of
         {ok, E0} ->
             Active = max(0, E0#entry.active - 1),
-            E1 = E0#entry{active = Active},
+            E1 = E0#entry{active = Active, last_active_ms = now_ms()},
             case Active of
                 0 -> {noreply, S#state{models = M#{ModelId => arm(ModelId, E1, KeepAlive)}}};
                 _ -> {noreply, S#state{models = M#{ModelId => E1}}}
@@ -120,12 +150,7 @@ handle_cast({request_end, ModelId, KeepAlive}, S = #state{models = M}) ->
             {noreply, S}
     end;
 handle_cast({unload_now, ModelId}, S = #state{models = M}) ->
-    case maps:find(ModelId, M) of
-        {ok, E} -> _ = cancel_timer(E#entry.timer);
-        error -> ok
-    end,
-    _ = unload(ModelId),
-    {noreply, S#state{models = maps:remove(ModelId, M)}};
+    {noreply, S#state{models = drop_and_unload(ModelId, M)}};
 handle_cast(_, S) ->
     {noreply, S}.
 
@@ -169,6 +194,16 @@ cancel_timer(Ref) when is_reference(Ref) ->
     _ = erlang:cancel_timer(Ref),
     undefined.
 
+%% Cancel any pending timer, unload the model, and drop its entry.
+%% Shared by the cast (`unload_now`) and call (`unload_sync`) paths.
+drop_and_unload(ModelId, M) ->
+    case maps:find(ModelId, M) of
+        {ok, E} -> _ = cancel_timer(E#entry.timer);
+        error -> ok
+    end,
+    _ = unload(ModelId),
+    maps:remove(ModelId, M).
+
 unload(ModelId) ->
     try barrel_inference:unload(ModelId) of
         _ -> ok
@@ -185,5 +220,8 @@ snapshot_one(Id, M) ->
         error -> not_tracked
     end.
 
-snapshot_entry(Id, #entry{active = N, expires_at_ms = X}) ->
-    #{model => Id, active => N, expires_at_ms => X}.
+snapshot_entry(Id, #entry{active = N, expires_at_ms = X, last_active_ms = L}) ->
+    #{model => Id, active => N, expires_at_ms => X, last_active_ms => L}.
+
+now_ms() ->
+    erlang:system_time(millisecond).
