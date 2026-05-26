@@ -43,6 +43,8 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(APP, barrel_inference_server).
+%% Public ETS memo for the static-prefix head render (see init/1).
+-define(PREFIX_HEAD_TBL, barrel_inference_server_prefix_head).
 
 -record(state, {
     aliases :: #{binary() => binary()},
@@ -416,6 +418,13 @@ init([]) ->
         {?MODULE, responses_store_gc_interval_ms},
         app_env(responses_store_gc_interval_ms, 10 * 60 * 1000)
     ),
+    %% Public memo for the static-prefix (end-of-tools) head render,
+    %% keyed by sha256(term_to_binary({ModelId, System2, Tools2})) ->
+    %% head-only token list. Owned here (lives for the app's life);
+    %% pipeline workers read/write directly. In-RAM only, never
+    %% persisted. ETS (not persistent_term: it grows per distinct
+    %% transformed head).
+    _ = ets:new(?PREFIX_HEAD_TBL, [named_table, public, set, {read_concurrency, true}]),
     {ok, #state{
         aliases = Aliases,
         load_policy = LoadPolicy,

@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Static system+tools prefix is checkpointed and pinned once per tool set. When a
+  request carries tools, the pipeline computes the verified end-of-tools token offset
+  (the longest common token prefix of a head-only render and the full render - no
+  template-specific marker stripping needed) and forwards it as
+  `Params.prefix_checkpoint_len`, so the engine writes + pins an `agent_prefix` KV
+  checkpoint there. The big static prefix is then prefilled once and reused warm across
+  turns and even fresh sessions, and survives cache eviction. The head render is
+  memoized per transformed-head identity in a public ETS table. Verified live: a
+  fresh-session second request reused 5552/5566 prompt tokens via the pinned prefix
+  after a full GC dropped every unpinned row.
+
 ### Fixed
 
 - Tool/chat requests no longer hang 60-180 s or crash the model. The hang was the

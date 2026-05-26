@@ -37,6 +37,10 @@
 
 -include("barrel_inference_server.hrl").
 
+%% Public ETS memo for the static-prefix head render, owned by
+%% barrel_inference_server_config (created in its init/1).
+-define(PREFIX_HEAD_TBL, barrel_inference_server_prefix_head).
+
 -export([start_link/2, abort/1]).
 %% Exported for unit tests (pure).
 -export([build_params/1]).
@@ -65,6 +69,12 @@
     %% The stored committed token-id list this continuation extends;
     %% forwarded to `barrel_inference:continue/3' as `expect_committed'.
     expect_committed :: [non_neg_integer()] | undefined,
+    %% Verified end-of-tools token offset for the static-prefix
+    %% checkpoint (see compute_prefix_boundary/2). Forwarded to the
+    %% engine as `Params.prefix_checkpoint_len'. `undefined' when the
+    %% request has no tools, the head render is unavailable, or the
+    %% boundary is degenerate.
+    prefix_checkpoint_len :: non_neg_integer() | undefined,
     slot :: barrel_inference_server_queue:slot() | undefined,
     infer_ref :: reference() | undefined
 }).
@@ -278,13 +288,7 @@ render_template(W, System0, Tools0, Messages) ->
     %% the model alone) guarantees Tools0 is a non-empty list and
     %% tool_choice = auto here. Same decision as build_grammar/1, so the
     %% skip and the render stay in lockstep.
-    {System, Tools} =
-        case barrel_inference_server_tool_format:native_turn(W#work.request) of
-            {ok, Mod} ->
-                {barrel_inference_server_tool_format:render(Mod, Tools0, System0), undefined};
-            none ->
-                {System0, Tools0}
-        end,
+    {System, Tools} = transform_native_tools(W, System0, Tools0),
     Req = #{messages => Messages, system => System, tools => Tools},
     Call = fun() -> barrel_inference:apply_chat_template(ModelId, Req) end,
     case call_engine_with_recovery(W, Call, apply_chat_template) of
@@ -460,8 +464,78 @@ escalate_unload(ModelId, Op) ->
 accept_tokens(W, Tokens) ->
     W1 = put_tokens(W, Tokens),
     W2 = maybe_arm_continuation(W1, Tokens),
+    W3 = compute_prefix_boundary(W2, Tokens),
     W#work.handler ! {pipeline, templated, Tokens},
-    {ok, W2}.
+    {ok, W3}.
+
+%% Verify the static-prefix (end-of-tools) boundary for the static
+%% system+tools head and stamp its token offset on the work record so
+%% the engine writes + pins an `agent_prefix` checkpoint there. Only
+%% when the request carries tools (the bulk of the static head). The
+%% boundary is the longest common token prefix of the head-only render
+%% (empty messages) and the full render: the two agree exactly up to
+%% where the messages begin, so no template-specific marker stripping
+%% is needed and the result is always a true prefix of `Tokens`.
+compute_prefix_boundary(W, Tokens) ->
+    R = W#work.request,
+    case R#barrel_inference_request.tools of
+        Tools when is_list(Tools), Tools =/= [] ->
+            case head_tokens(W, R#barrel_inference_request.system, Tools) of
+                {ok, HeadTokens} ->
+                    N = lcp_len(HeadTokens, Tokens),
+                    case N > 0 andalso N < length(Tokens) of
+                        true -> W#work{prefix_checkpoint_len = N};
+                        false -> W
+                    end;
+                none ->
+                    W
+            end;
+        _ ->
+            W
+    end.
+
+%% Head-only render of the transformed system+tools (same native-tool
+%% fold render_template/4 applies), memoized per transformed-head
+%% identity in the public ETS table. Returns `none` on any render
+%% failure (skip the boundary; never guess).
+head_tokens(W, System0, Tools0) ->
+    ModelId = model_id(W),
+    {System2, Tools2} = transform_native_tools(W, System0, Tools0),
+    MemoKey = crypto:hash(sha256, term_to_binary({ModelId, System2, Tools2})),
+    case ets:lookup(?PREFIX_HEAD_TBL, MemoKey) of
+        [{_, HeadTokens}] ->
+            {ok, HeadTokens};
+        [] ->
+            Req = #{messages => [], system => System2, tools => Tools2},
+            Call = fun() -> barrel_inference:apply_chat_template(ModelId, Req) end,
+            case call_engine_with_recovery(W, Call, apply_chat_template) of
+                {ok, {ok, HeadTokens}} ->
+                    ets:insert(?PREFIX_HEAD_TBL, {MemoKey, HeadTokens}),
+                    {ok, HeadTokens};
+                _ ->
+                    none
+            end
+    end.
+
+%% On the native-tool path, fold the model's own tool block (with
+%% schemas) into the system prompt and stop passing `tools' to the NIF
+%% so it doesn't also append its prose list. Shared by render_template/4
+%% and head_tokens/3 so the full render and the head render transform
+%% identically.
+transform_native_tools(W, System0, Tools0) ->
+    case barrel_inference_server_tool_format:native_turn(W#work.request) of
+        {ok, Mod} ->
+            {barrel_inference_server_tool_format:render(Mod, Tools0, System0), undefined};
+        none ->
+            {System0, Tools0}
+    end.
+
+%% Longest common prefix length of two token lists (tail-recursive;
+%% prompts can be tens of thousands of tokens).
+lcp_len(As, Bs) -> lcp_len(As, Bs, 0).
+
+lcp_len([X | As], [X | Bs], N) -> lcp_len(As, Bs, N + 1);
+lcp_len(_, _, N) -> N.
 
 %% When the request's session has a prior committed token-id list on
 %% file AND that list is a strict prefix of the freshly rendered
@@ -643,7 +717,10 @@ step_queue(W) ->
     end.
 
 step_infer(W) ->
-    Params = clamp_response_tokens(W, build_params(W#work.request)),
+    Params0 = maybe_put(
+        build_params(W#work.request), prefix_checkpoint_len, W#work.prefix_checkpoint_len
+    ),
+    Params = clamp_response_tokens(W, Params0),
     Call = fun() -> do_infer(W, Params) end,
     %% do_infer picks infer/4 vs continue/3 from W#work.continuation; label
     %% the admission metric the same way so the two paths are distinguishable.
