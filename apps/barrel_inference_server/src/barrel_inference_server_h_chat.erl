@@ -363,7 +363,7 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
         undefined ->
             %% Captured tool calls (if any) may name server tools; if so,
             %% run them and continue the turn instead of finishing.
-            S2 = maybe_post_parse_pythonic(
+            S2 = maybe_post_parse(
                 flush_scan(Req, demonitor_engine(S1))
             ),
             dispatch_done(Req, S2);
@@ -1053,20 +1053,22 @@ handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) -
             {ok, Req, rearm_idle(S#st{captured_calls = S#st.captured_calls ++ [Call]}), hibernate}
     end.
 
-%% Post-parse for marker-less families (currently `llama-pythonic'): the
-%% model emits the tool-call list as plain text terminated at the end
-%% of the turn (e.g. Llama 3.2 / 3.3's `[func(args), ...]<|eot_id|>'),
-%% so the engine's native marker capture never fires and
-%% `captured_calls' stays empty. If the family declares a post-parse
-%% mode, run the family's `parse_all/1' on the buffered response text
-%% and inject the parsed calls as captured_calls. Reset `buf_text' to
+%% Post-parse for marker-less families (`llama-pythonic',
+%% `phi4-functools', ...): the model emits the tool-call list as plain
+%% text at the end of the turn, so the engine's native marker capture
+%% never fires and `captured_calls' stays empty. Any family whose
+%% `post_parse_mode/1' returns a non-`none' atom opts in; the handler
+%% runs the family's `parse_all/1' on the buffered response text and
+%% injects the parsed calls as captured_calls. Reset `buf_text' to
 %% keep `dispatch_done' from also emitting the raw call list as
 %% content.
-maybe_post_parse_pythonic(
+maybe_post_parse(
     S = #st{captured_calls = [], tool_format = Spec, model = Model, buf_text = BufText}
 ) when Spec =/= undefined ->
     case barrel_inference_server_tool_format:post_parse_mode(Spec) of
-        pythonic ->
+        none ->
+            S;
+        _Mode ->
             BufBin = iolist_to_binary(BufText),
             case barrel_inference_server_tool_format:parse_all(Spec, BufBin) of
                 {ok, Calls} when Calls =/= [] ->
@@ -1074,11 +1076,9 @@ maybe_post_parse_pythonic(
                     S#st{captured_calls = Captured, buf_text = []};
                 _ ->
                     S
-            end;
-        _ ->
-            S
+            end
     end;
-maybe_post_parse_pythonic(S) ->
+maybe_post_parse(S) ->
     S.
 
 post_parse_call(Spec, Model, #{name := Name, arguments := Args}) ->

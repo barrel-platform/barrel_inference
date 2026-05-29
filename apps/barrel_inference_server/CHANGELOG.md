@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- New `phi4-functools` tool-call format family. Covers Microsoft
+  Phi-4-mini-instruct and Phi-4-multimodal-instruct, which emit calls as
+  `functools[{"name":...,"arguments":...}, ...]` — literal ASCII markers
+  (not control tokens), JSON array body. The end marker `]` is a single
+  common token, so the engine's `map_marker/2` would prematurely close
+  the span on any nested `]` in an argument value; the family therefore
+  uses the marker-less post-parse path (PR #22's mechanism) with a
+  string-aware bracket-depth walker that finds the OUTER `]` matching
+  the leading `[`, ignoring `]` inside JSON strings and inside nested
+  arrays. The parser tolerates surrounding prose, accepts both
+  `arguments` and `parameters` keys (some fine-tunes use the latter),
+  and defaults missing arguments to `#{}`. The handlers'
+  `maybe_post_parse_pythonic/1` is generalised to `maybe_post_parse/1`
+  with a catch-all `_Mode` clause so it dispatches on ANY non-`none`
+  post-parse mode (`pythonic`, `functools`, ...); the shipped
+  `llama-pythonic` family is behaviour-unchanged. Auto-detection at
+  pull time keys on the presence of `functools[` AND the `<|tool|>`
+  declaration-block marker — both are required to avoid false-positiving
+  on prose templates that mention the `functools` Python library.
+  (The larger Phi-4 14B model does NOT support tool calling per
+  Microsoft; this family covers `Phi-4-mini-instruct` and
+  `Phi-4-multimodal-instruct` only.)
 - New `llama-pythonic` tool-call format family. Covers the Llama 3.2 Instruct
   (1B, 3B) and Llama 3.3 70B Instruct zero-shot wire shape, which is a Python
   call-list `[func1(arg1='val1', arg2=True), func2(...)]` terminated by
