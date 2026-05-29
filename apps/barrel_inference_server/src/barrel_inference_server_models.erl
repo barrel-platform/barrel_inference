@@ -496,10 +496,8 @@ detect_tool_call_format(Template) when is_binary(Template) ->
     %% match wins. Generic scan falls through when no special-case
     %% predicate matches.
     SpecialCases = [
-        {fun is_qwen3_coder_template/1,
-            {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>}},
-        {fun is_mistral_args_template/1,
-            {<<"mistral-args">>, <<"[TOOL_CALLS]">>, <<"</s>">>}},
+        {fun is_qwen3_coder_template/1, {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>}},
+        {fun is_mistral_args_template/1, {<<"mistral-args">>, <<"[TOOL_CALLS]">>, <<"</s>">>}},
         {fun is_llama_pythonic_template/1, {<<"llama-pythonic">>, undefined, undefined}},
         {fun is_phi4_functools_template/1, {<<"phi4-functools">>, undefined, undefined}}
     ],
