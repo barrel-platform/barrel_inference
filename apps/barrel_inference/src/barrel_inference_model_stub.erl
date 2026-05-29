@@ -97,7 +97,15 @@
     %% `decode_token/2`. Lets tests exercise the engine's span
     %% boundaries (e.g. repeated start with one final end for the
     %% Mistral-tekken parallel-call shape) from one harness.
-    tool_call_script = undefined :: undefined | [start | body | end_tok]
+    tool_call_script = undefined :: undefined | [start | body | end_tok],
+    %% Opt-in: hold each `step/2' call for N ms via timer:sleep/1
+    %% before returning results. Lets server-side concurrency tests
+    %% deterministically keep a holder request in-flight while other
+    %% requests race for the queue (e.g. chat_busy_returns_429).
+    %% Default 0 disables the hold, so the cache / integration tests
+    %% that use the stub pay no `timer:sleep(0)' syscall in their hot
+    %% path.
+    step_delay_ms = 0 :: non_neg_integer()
 }).
 
 init(Config) ->
@@ -105,7 +113,8 @@ init(Config) ->
         thinking_capable = bool_opt(thinking_capable, Config),
         tool_call_capable = bool_opt(tool_call_capable, Config),
         tool_call_payload_capable = bool_opt(tool_call_payload_capable, Config),
-        tool_call_script = script_opt(tool_call_script, Config)
+        tool_call_script = script_opt(tool_call_script, Config),
+        step_delay_ms = step_delay_opt(step_delay_ms, Config)
     }}.
 
 script_opt(Key, Config) ->
@@ -118,6 +127,12 @@ bool_opt(Key, Config) ->
     case maps:get(Key, Config, false) of
         true -> true;
         _ -> false
+    end.
+
+step_delay_opt(Key, Config) ->
+    case maps:get(Key, Config, 0) of
+        N when is_integer(N), N >= 0 -> N;
+        _ -> 0
     end.
 
 terminate(_S) ->
@@ -183,6 +198,14 @@ reset_seq_rm_last_calls() ->
 %% different prompts produce different streams and the same seq fed
 %% the same sampler keeps producing the same token (matching the
 %% prior single-seq stub semantics for cache-integration tests).
+%% Outer clause peels off the step_delay_ms hold (when configured),
+%% sleeps once, then recurses into the no-delay clause to keep the
+%% inner wedge dispatch unchanged. step_delay_ms = 0 (the default)
+%% short-circuits straight to the no-delay clause - no `timer:sleep(0)'
+%% in the cache/integration hot path.
+step(#stub{step_delay_ms = D} = S, Ops) when D > 0 ->
+    timer:sleep(D),
+    step(S#stub{step_delay_ms = 0}, Ops);
 step(S, Ops) ->
     case persistent_term:get({?MODULE, wedge}, undefined) of
         undefined ->
