@@ -54,22 +54,18 @@ render_prompt(Tools, System) ->
 
 -spec parse(binary()) -> {ok, map()} | {error, term()}.
 parse(Bin) when is_binary(Bin) ->
-    case extract_array(string:trim(Bin)) of
-        {ok, ArrayBin} -> decode_first_call(string:trim(ArrayBin));
-        error -> {error, no_markers}
-    end.
-
-extract_array(Bin) ->
-    case binary:split(Bin, ?START) of
-        [_, AfterStart] ->
-            %% EOS is optional - strip it if present.
-            case binary:split(AfterStart, ?EOS) of
-                [Body, _] -> {ok, Body};
-                _ -> {ok, AfterStart}
-            end;
-        _ ->
-            error
-    end.
+    %% Tolerant of the marker-stripped real-backend shape: the NIF
+    %% detokenizer's `special=false' drops `[TOOL_CALLS]' and `</s>'
+    %% (both control tokens) from the captured FullBin, so the parser
+    %% accepts both `[TOOL_CALLS][...]</s>' AND a bare `[...]' (the
+    %% JSON array, possibly with an `</s>' trailer).
+    Body = barrel_inference_server_tool_format:strip_suffix(
+        barrel_inference_server_tool_format:strip_prefix(
+            string:trim(Bin), ?START
+        ),
+        ?EOS
+    ),
+    decode_first_call(string:trim(Body)).
 
 decode_first_call(JsonBin) ->
     try json:decode(JsonBin) of

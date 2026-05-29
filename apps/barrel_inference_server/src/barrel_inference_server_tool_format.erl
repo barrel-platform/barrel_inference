@@ -17,6 +17,14 @@
 -export([native_turn/1, native_render/1, render/3, markers/1, scanner_for/1]).
 %% Shared rendering helpers for the per-family render_prompt/2 callbacks.
 -export([tool_signatures/1, append_system/2]).
+%% Shared parse-side tolerance helpers used by the per-family parse/1
+%% callbacks. Control-token markers (e.g. `[TOOL_CALLS]', `<|python_tag|>',
+%% `<｜tool▁sep｜>') are dropped from the captured FullBin by the NIF's
+%% `special=false' detokenization, so each family's parser must accept
+%% both the canonical marker-present shape AND the marker-stripped
+%% real-backend shape. These helpers factor out the common pieces of
+%% that tolerance so each family is a few lines.
+-export([strip_prefix/2, strip_suffix/2, split_at_first_brace/1]).
 
 -callback parse(binary()) -> {ok, map()} | {error, term()}.
 -callback canonicalise(map()) -> binary().
@@ -222,3 +230,47 @@ tool_signatures(Tools) ->
 append_system(undefined, Block) -> Block;
 append_system(<<>>, Block) -> Block;
 append_system(Sys, Block) when is_binary(Sys) -> <<Sys/binary, "\n\n", Block/binary>>.
+
+%% =============================================================================
+%% Shared parse-side tolerance helpers
+%% =============================================================================
+
+%% Tolerant prefix strip: returns the input unchanged if Prefix is not
+%% present. Used by families whose start marker is a control token
+%% (`special=false' detok drops control tokens from the captured FullBin,
+%% so the parser must accept both shapes).
+-spec strip_prefix(binary(), binary()) -> binary().
+strip_prefix(Bin, Prefix) ->
+    PSz = byte_size(Prefix),
+    case Bin of
+        <<P:PSz/binary, Rest/binary>> when P =:= Prefix -> Rest;
+        _ -> Bin
+    end.
+
+%% Tolerant suffix strip: returns the trimmed input with Suffix removed
+%% when present, otherwise the trimmed input. Mirrors `strip_prefix/2'
+%% for the end marker.
+-spec strip_suffix(binary(), binary()) -> binary().
+strip_suffix(Bin, Suffix) ->
+    Trimmed = string:trim(Bin),
+    SSz = byte_size(Suffix),
+    TSz = byte_size(Trimmed),
+    case TSz >= SSz andalso binary:part(Trimmed, TSz - SSz, SSz) =:= Suffix of
+        true -> string:trim(binary:part(Trimmed, 0, TSz - SSz));
+        false -> Trimmed
+    end.
+
+%% Find the first JSON open-brace or open-bracket and split the binary
+%% there: everything before is the name, everything from the brace
+%% onward is the JSON region. Used by the marker-stripped path of
+%% `mistral-args' and (for the value-region fallback) other families.
+-spec split_at_first_brace(binary()) -> {binary(), binary()}.
+split_at_first_brace(Bin) ->
+    case binary:match(Bin, [<<"{">>, <<"[">>]) of
+        nomatch ->
+            {string:trim(Bin), <<>>};
+        {Pos, _Len} ->
+            Name = string:trim(binary:part(Bin, 0, Pos)),
+            Json = binary:part(Bin, Pos, byte_size(Bin) - Pos),
+            {Name, Json}
+    end.

@@ -55,29 +55,17 @@ render_prompt(Tools, System) ->
 
 -spec parse(binary()) -> {ok, map()} | {error, term()}.
 parse(Bin) when is_binary(Bin) ->
-    Body = strip_prefix(string:trim(Bin), ?START),
+    Body = barrel_inference_server_tool_format:strip_prefix(
+        string:trim(Bin), ?START
+    ),
     {Name, JsonBin} =
         case binary:split(Body, ?ARGS) of
             [N, J] -> {string:trim(N), J};
-            _ -> split_at_first_brace(Body)
+            _ -> barrel_inference_server_tool_format:split_at_first_brace(Body)
         end,
     case Name of
         <<>> -> {error, no_name};
         _ -> decode_args(Name, string:trim(JsonBin))
-    end.
-
-%% Real-backend (control-token detok drops markers) shape: the body
-%% looks like `name{json}` with no `[ARGS]` separator. Find the first
-%% JSON open-brace / open-bracket, take everything before as the name,
-%% the rest as the args region.
-split_at_first_brace(Bin) ->
-    case binary:match(Bin, [<<"{">>, <<"[">>]) of
-        nomatch ->
-            {string:trim(Bin), <<>>};
-        {Pos, _Len} ->
-            Name = string:trim(binary:part(Bin, 0, Pos)),
-            Json = binary:part(Bin, Pos, byte_size(Bin) - Pos),
-            {Name, Json}
     end.
 
 %% The tekken template always renders `[ARGS]` followed by an arguments
@@ -87,34 +75,12 @@ split_at_first_brace(Bin) ->
 decode_args(_Name, <<>>) ->
     {error, empty_args};
 decode_args(Name, Json0) ->
-    Json = strip_eos(Json0),
+    Json = barrel_inference_server_tool_format:strip_suffix(Json0, ?EOS),
     try json:decode(Json) of
         Args when is_map(Args) -> {ok, #{name => Name, arguments => Args}};
         _ -> {error, args_not_object}
     catch
         _:_ -> {error, invalid_json}
-    end.
-
-%% The wire ends at `</s>` (eos). On the native-capture path the engine
-%% omits the end token from the body, but the captured FullBin (or a
-%% raw scanner region) may still trail it - strip defensively,
-%% mirroring `mistral_tool_calls`.
-strip_eos(B) ->
-    Trimmed = string:trim(B),
-    Sz = byte_size(Trimmed),
-    case Sz >= 4 andalso binary:part(Trimmed, Sz - 4, 4) =:= ?EOS of
-        true -> string:trim(binary:part(Trimmed, 0, Sz - 4));
-        false -> Trimmed
-    end.
-
-%% Tolerant prefix strip: returns the input unchanged if Prefix is not
-%% present, so the real `name{json}` capture path (control-token markers
-%% dropped) is NOT accidentally required to carry `[TOOL_CALLS]`.
-strip_prefix(Bin, Prefix) ->
-    PSz = byte_size(Prefix),
-    case Bin of
-        <<P:PSz/binary, Rest/binary>> when P =:= Prefix -> Rest;
-        _ -> Bin
     end.
 
 -spec canonicalise(map()) -> binary().

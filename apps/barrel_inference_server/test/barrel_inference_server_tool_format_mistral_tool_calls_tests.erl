@@ -55,11 +55,43 @@ mistral_defaults_missing_arguments_to_empty_map_test() ->
     ).
 
 %% =============================================================================
-%% parse: rejections
+%% parse: marker-stripped real-backend shape
+%%
+%% The NIF detokenizer runs with `special=false', which drops control-
+%% token markers (`[TOOL_CALLS]', `</s>') from the captured FullBin, so
+%% the body the parser actually sees on a real backend is a bare JSON
+%% array. The parser must accept both shapes.
 %% =============================================================================
 
-mistral_rejects_missing_marker_test() ->
-    ?assertEqual({error, no_markers}, ?MISTRAL:parse(<<"[{\"name\":\"f\"}]">>)).
+mistral_parses_stripped_markers_test() ->
+    ?assertEqual(
+        {ok, #{name => <<"f">>, arguments => #{}}},
+        ?MISTRAL:parse(<<"[{\"name\":\"f\"}]">>)
+    ).
+
+mistral_parses_stripped_markers_with_eos_test() ->
+    ?assertEqual(
+        {ok, #{name => <<"f">>, arguments => #{<<"x">> => 1}}},
+        ?MISTRAL:parse(<<"[{\"name\":\"f\",\"arguments\":{\"x\":1}}]</s>">>)
+    ).
+
+mistral_parses_stripped_markers_with_surrounding_whitespace_test() ->
+    Bin = <<"\n  [{\"name\":\"f\",\"arguments\":{}}]  \n">>,
+    ?assertEqual(
+        {ok, #{name => <<"f">>, arguments => #{}}},
+        ?MISTRAL:parse(Bin)
+    ).
+
+mistral_parses_stripped_markers_multi_call_returns_first_test() ->
+    Bin = <<"[{\"name\":\"a\",\"arguments\":{}},{\"name\":\"b\",\"arguments\":{\"k\":2}}]">>,
+    ?assertEqual(
+        {ok, #{name => <<"a">>, arguments => #{}}},
+        ?MISTRAL:parse(Bin)
+    ).
+
+%% =============================================================================
+%% parse: rejections
+%% =============================================================================
 
 mistral_rejects_invalid_json_test() ->
     ?assertMatch({error, _}, ?MISTRAL:parse(<<"[TOOL_CALLS][garbage</s>">>)).

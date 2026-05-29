@@ -92,13 +92,33 @@ strip_call_markers(Bin) ->
     end.
 
 decode_call_body(Body) ->
-    %% Strip optional leading `function<｜tool▁sep｜>' type prefix.
-    Rest =
-        case binary:split(Body, ?SEP) of
-            [_, R] -> R;
-            _ -> Body
-        end,
-    extract_name_and_args(string:trim(Rest)).
+    case binary:split(Body, ?SEP) of
+        [_, R] ->
+            %% Canonical: `function<｜tool▁sep｜>NAME\n...' with the sep
+            %% present. Drop the type prefix and parse the rest.
+            extract_name_and_args(string:trim(R));
+        _ ->
+            %% Tolerance for the marker-stripped real-backend shape: the
+            %% NIF detokenizer's `special=false' drops `<｜tool▁sep｜>'
+            %% from the captured FullBin, leaving the literal `function'
+            %% type-prefix text fused to the name (`functionNAME\n...').
+            %% Strip the leading `function' text when present.
+            %%
+            %% Trade-off: a user-defined function whose name LITERALLY
+            %% starts with `function' (e.g. `functionGetData') is
+            %% indistinguishable on the wire from the canonical
+            %% `function<sep>GetData' shape with markers stripped, and
+            %% loses its prefix. DeepSeek's canonical tool-call wire
+            %% protocol reserves the literal `function' as a type
+            %% prefix, so real tool definitions should not start with
+            %% it; the trade-off favours the common case.
+            Rest =
+                case Body of
+                    <<"function", R2/binary>> -> R2;
+                    _ -> Body
+                end,
+            extract_name_and_args(string:trim(Rest))
+    end.
 
 extract_name_and_args(<<>>) ->
     {error, empty_body};
