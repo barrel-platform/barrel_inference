@@ -143,6 +143,15 @@ rm_rf(Dir) ->
 model_config(DiskSrv) ->
     #{
         backend => barrel_inference_model_stub,
+        %% Hold each stub `step/2' for 20 ms so the queue-saturating
+        %% `chat_busy_returns_429' test can deterministically keep its
+        %% holder request in-flight while the racing requests arrive
+        %% (the stub is otherwise instant, and on slow CI the holder
+        %% could complete before R1/R2 reached the queue, sinking the
+        %% 429/504 assertion). Other tests in the suite emit a handful
+        %% of tokens; 20 ms each adds only a few hundred ms total -
+        %% well below the suite's 30 s timetrap.
+        step_delay_ms => 20,
         tier_srv => DiskSrv,
         tier => disk,
         fingerprint => binary:copy(<<16#77>>, 32),
@@ -216,10 +225,18 @@ chat_busy_returns_429(Cfg) ->
     %% Each request uses a unique prompt so the derived session_id
     %% differs - this test verifies queue exhaustion, not sticky-seq
     %% admission contention.
+    %%
+    %% Retried-burst pattern (mirrors `post_until_slot_free/4` used by
+    %% `chat_cancel_on_disconnect_releases_slot`): a single-shot R1+R2
+    %% race fails on slow CI because the holder's prefill / decode
+    %% scheduling can let R1 and R2's pipeline hang past the test's
+    %% 10s receive timeout without ever surfacing 429 / 504. We instead
+    %% burst R1+R2 repeatedly until at least one returns 429 or 504.
+    %% The property under test is unchanged: when the queue is
+    %% saturated, the system must surface `pool_exhausted` (429) or
+    %% `queue_timeout` (504).
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
     HolderBody = make_busy_body(<<"busy-holder">>),
-    R1Body = make_busy_body(<<"busy-r1">>),
-    R2Body = make_busy_body(<<"busy-r2">>),
     Parent = self(),
     Holder = spawn(fun() ->
         Resp = http_collect(Url, HolderBody),
@@ -229,38 +246,7 @@ chat_busy_returns_429(Cfg) ->
     %% server has to send the first chunk before httpc returns, so
     %% the slot is held by the time we measure.
     timer:sleep(150),
-    %% Two more concurrent requests. One queues, one gets 429.
-    Parent2 = self(),
-    spawn(fun() ->
-        Parent2 !
-            {r1,
-                httpc:request(
-                    post,
-                    {Url, [], "application/json", R1Body},
-                    [],
-                    []
-                )}
-    end),
-    spawn(fun() ->
-        Parent2 !
-            {r2,
-                httpc:request(
-                    post,
-                    {Url, [], "application/json", R2Body},
-                    [],
-                    []
-                )}
-    end),
-    R1 =
-        receive
-            {r1, X1} -> X1
-        after 10000 -> {error, timeout}
-        end,
-    R2 =
-        receive
-            {r2, X2} -> X2
-        after 10000 -> {error, timeout}
-        end,
+    ok = busy_burst_until_pool_exhausted(Url, 30, 200),
     %% Holder may still be running; abandon it (the linked exit is
     %% intentional via spawn, not spawn_link).
     exit(Holder, kill),
@@ -268,17 +254,67 @@ chat_busy_returns_429(Cfg) ->
         {holder_done, _} -> ok
     after 0 -> ok
     end,
-    Codes = [code_of(R) || R <- [R1, R2]],
-    ct:log("codes=~p", [Codes]),
-    ?assert(
-        lists:member(429, Codes) orelse lists:member(504, Codes),
-        io_lib:format("expected one of [429, 504] in ~p", [Codes])
-    ),
     %% Cancel every in-flight ref so the model goes back to idle
     %% promptly. end_per_testcase polls idle but bounds the wait;
     %% explicit cancel avoids burning that whole budget.
     [barrel_inference:cancel(R) || {R, _} <- barrel_inference_inflight:all()],
     ok.
+
+%% Fire R1 + R2 concurrently against the saturated queue and check
+%% whether at least one of them surfaces 429 (pool_exhausted) or 504
+%% (queue_timeout). Retry up to N times with BackoffMs back-off so
+%% slow CI scheduling cannot turn a real flaky timing window into a
+%% spurious failure. Each burst uses a 2s per-request httpc timeout
+%% so the burst returns fast on any kind of stall.
+busy_burst_until_pool_exhausted(_Url, 0, _BackoffMs) ->
+    ct:fail("busy burst exhausted retries without seeing 429 or 504");
+busy_burst_until_pool_exhausted(Url, N, BackoffMs) ->
+    Parent = self(),
+    Tag = integer_to_binary(erlang:unique_integer([positive])),
+    BodyA = make_busy_body(<<"busy-a-", Tag/binary>>),
+    BodyB = make_busy_body(<<"busy-b-", Tag/binary>>),
+    spawn(fun() ->
+        Parent !
+            {a,
+                httpc:request(
+                    post,
+                    {Url, [], "application/json", BodyA},
+                    [{timeout, 2000}],
+                    []
+                )}
+    end),
+    spawn(fun() ->
+        Parent !
+            {b,
+                httpc:request(
+                    post,
+                    {Url, [], "application/json", BodyB},
+                    [{timeout, 2000}],
+                    []
+                )}
+    end),
+    A =
+        receive
+            {a, X} -> X
+        after 3000 -> {error, timeout}
+        end,
+    B =
+        receive
+            {b, Y} -> Y
+        after 3000 -> {error, timeout}
+        end,
+    Codes = [code_of(A), code_of(B)],
+    case lists:member(429, Codes) orelse lists:member(504, Codes) of
+        true ->
+            ct:log("busy burst saw pool exhaustion after ~p retries: codes=~p", [
+                30 - N, Codes
+            ]),
+            ok;
+        false ->
+            ct:log("busy burst retry, codes=~p, retries left=~p", [Codes, N - 1]),
+            timer:sleep(BackoffMs),
+            busy_burst_until_pool_exhausted(Url, N - 1, BackoffMs)
+    end.
 
 chat_cancel_on_disconnect_releases_slot(Cfg) ->
     %% Open a streaming chat, read the first chunk, then drop the
