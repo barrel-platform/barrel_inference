@@ -793,18 +793,31 @@ handle_thinking_end(Sig, Req, S) ->
 %% parallel_tool_calls. Replay persistence is per-call (client blocks
 %% may be replayed from history next turn).
 handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) ->
-    {Name, Input} = parse_full_bin(Spec, FullBin),
-    ToolId = make_tool_id(),
-    maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Input),
-    Call = #{id => ToolId, name => Name, input => Input, full_bin => FullBin},
-    {ok, Req, rearm_idle(S#st{captured_calls = S#st.captured_calls ++ [Call]}), hibernate}.
+    case parse_full_bin(Spec, FullBin) of
+        skip ->
+            %% Truncated capture (e.g. an empty inter-call span the model
+            %% emitted by spamming the start marker). Drop, never surface
+            %% to the caller as a fake `unknown({})' tool_use block.
+            {ok, Req, rearm_idle(S), hibernate};
+        {ok, Name, Input} ->
+            ToolId = make_tool_id(),
+            maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Input),
+            Call = #{id => ToolId, name => Name, input => Input, full_bin => FullBin},
+            {ok, Req, rearm_idle(S#st{captured_calls = S#st.captured_calls ++ [Call]}), hibernate}
+    end.
 
 parse_full_bin(undefined, FullBin) ->
-    parse_tool_call(FullBin);
+    {Name, Args} = parse_tool_call(FullBin),
+    {ok, Name, Args};
 parse_full_bin(Spec, FullBin) ->
     case barrel_inference_server_tool_format:parse(Spec, FullBin) of
-        {ok, #{name := Name, arguments := Args}} -> {Name, Args};
-        {error, _} -> parse_tool_call(FullBin)
+        {ok, #{name := Name, arguments := Args}} ->
+            {ok, Name, Args};
+        {error, empty_args} ->
+            skip;
+        {error, _} ->
+            {Name, Args} = parse_tool_call(FullBin),
+            {ok, Name, Args}
     end.
 
 maybe_persist_replay(undefined, _ToolId, _Model, _FullBin, _Name, _Input) ->

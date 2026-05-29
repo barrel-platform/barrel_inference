@@ -413,11 +413,25 @@ maybe_merge_tool_call(Base, undefined) ->
 maybe_merge_tool_call(Base, {Name, Start, End}) ->
     Base#{
         <<"tool_call_format">> => Name,
-        <<"tool_call_markers">> => #{
-            <<"start">> => Start,
-            <<"end">> => End
-        }
+        <<"tool_call_markers">> => maybe_add_payload_markers(
+            #{
+                <<"start">> => Start,
+                <<"end">> => End
+            },
+            Name
+        )
     }.
+
+%% Per-family payload markers: `mistral-args` uses `[ARGS]` as the inner
+%% separator between the function name and the JSON arguments. The
+%% engine treats `[ARGS]` as `payload_start`, which flips sampling from
+%% the greedy syntax sampler to the request's normal sampler for the
+%% rest of the span - without this the greedy sampler tends to lock
+%% onto `[TOOL_CALLS]` after the args close and spam empty calls.
+maybe_add_payload_markers(M, <<"mistral-args">>) ->
+    M#{<<"payload_start">> => <<"[ARGS]">>};
+maybe_add_payload_markers(M, _) ->
+    M.
 
 maybe_merge_thinking(Base, undefined) ->
     Base;
@@ -451,14 +465,41 @@ detect_tool_call_format(Template) when is_binary(Template) ->
     %% templates contain `<tool_call>', so the generic scan would always pick
     %% `qwen-xml'; the `<function=' literal is unique to the Qwen3-Coder call
     %% format, so check it first.
+    %%
+    %% Mistral's tekken-tokenizer families (Devstral-2-2512,
+    %% Mistral-Small-3.x, Magistral, Ministral, recent Codestral) emit
+    %% `[TOOL_CALLS]<name>[ARGS]<json>' per call (with `</s>' only at the
+    %% very end). The old `mistral-tool-calls' family parses the v3 JSON-
+    %% array shape; both contain `[TOOL_CALLS]', so disambiguate by the
+    %% `[ARGS]' marker, checked BEFORE the generic candidate scan.
     case is_qwen3_coder_template(Template) of
-        true -> {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>};
-        false -> first_match_marker(Template, Candidates)
+        true ->
+            {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>};
+        false ->
+            case is_mistral_args_template(Template) of
+                true ->
+                    {<<"mistral-args">>, <<"[TOOL_CALLS]">>, <<"</s>">>};
+                false ->
+                    first_match_marker(Template, Candidates)
+            end
     end.
 
 is_qwen3_coder_template(Template) ->
     binary:match(Template, <<"<tool_call>">>) =/= nomatch andalso
         binary:match(Template, <<"<function=">>) =/= nomatch.
+
+%% Require `[ARGS]' to appear AFTER `[TOOL_CALLS]' in the template (not
+%% just anywhere), so an old-Mistral template that mentions `[ARGS]' in
+%% surrounding instructions or documentation cannot get misclassified
+%% as the new format.
+is_mistral_args_template(Template) ->
+    case binary:match(Template, <<"[TOOL_CALLS]">>) of
+        nomatch ->
+            false;
+        {P, L} ->
+            After = binary:part(Template, P + L, byte_size(Template) - (P + L)),
+            binary:match(After, <<"[ARGS]">>) =/= nomatch
+    end.
 
 first_match_marker(_, []) ->
     undefined;
