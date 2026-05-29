@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- New `mistral-args` tool-call format family. Covers the Mistral tekken-tokenizer wire
+  shape (`[TOOL_CALLS]<name>[ARGS]<json-args>`, repeated per call, terminated by `</s>`)
+  used by Devstral-Small-2 (2507, 2512), Mistral-Small-3.1 / 3.2, Magistral, Ministral,
+  and recent Codestral. The shipped `mistral-tool-calls` family parses the older
+  JSON-array shape (`[TOOL_CALLS][{...}]`) and produced garbled `unknown {}` calls for
+  these models. Auto-detection at pull time disambiguates the two shapes by requiring
+  `[ARGS]` to appear AFTER `[TOOL_CALLS]` in the `chat_template` (mirroring the
+  `is_qwen3_coder_template/1` disambiguation pattern); a classic Mistral template, or a
+  template that documents `[ARGS]` only in an instructions block before `[TOOL_CALLS]`,
+  still detects as `mistral-tool-calls`. The parser is tolerant of both the canonical
+  wire shape and the real-backend captured shape (control-token markers are dropped by
+  the engine's `special=false` detokenization, so `parse/1` sees `name{json}` with no
+  marker bytes) and rejects truncated captures (empty args region) so a fake `({})`
+  tool use can never reach the caller. Detection also auto-sets `payload_start=[ARGS]`
+  for `mistral-args` so the args region uses the request's normal sampler instead of
+  the greedy syntax sampler (without it the model tends to lock onto `[TOOL_CALLS]`
+  after the args close and spam empty calls). Parallel tool calls round-trip via the
+  engine's span-split on repeated start markers.
+
+### Changed
+
+- `parse_full_bin/2` in both `barrel_inference_server_h_chat` and
+  `barrel_inference_server_h_messages` now drops a tool call when the family parser
+  returns `{error, empty_args}` (a clearly-truncated capture). The previous fallback
+  to `parse_tool_call_to_map/1` would coerce an empty body into a fake
+  `unknown({})` tool use surfaced to the caller. Real parse errors (invalid JSON,
+  non-object args, etc.) still fall through to the legacy heuristic.
 - Qwen3-Coder tool-call format family (`qwen3-coder`). Qwen3-Coder (qwen3moe) emits
   tool calls in a nested-XML shape (`<tool_call><function=NAME><parameter=P>val</parameter></function></tool_call>`),
   not the Qwen2.5 JSON-in-tags shape the `qwen-xml` family handles, so its calls

@@ -30,6 +30,9 @@
     pull_detects_dsml_tool_call_format/1,
     pull_detects_llama_python_tag_tool_call_format/1,
     pull_detects_mistral_tool_call_format/1,
+    pull_detects_mistral_args_tool_call_format/1,
+    pull_does_not_misclassify_old_mistral_as_args/1,
+    pull_does_not_misclassify_args_before_tool_calls_as_args/1,
     pull_leaves_loader_untouched_when_no_markers/1,
     pull_detects_think_tag_thinking_markers/1,
     pull_detects_thinking_tag_thinking_markers/1,
@@ -65,6 +68,9 @@ all() ->
         pull_detects_dsml_tool_call_format,
         pull_detects_llama_python_tag_tool_call_format,
         pull_detects_mistral_tool_call_format,
+        pull_detects_mistral_args_tool_call_format,
+        pull_does_not_misclassify_old_mistral_as_args,
+        pull_does_not_misclassify_args_before_tool_calls_as_args,
         pull_leaves_loader_untouched_when_no_markers,
         pull_detects_think_tag_thinking_markers,
         pull_detects_thinking_tag_thinking_markers,
@@ -225,6 +231,35 @@ pull_detects_mistral_tool_call_format(Config) ->
     Markers = maps:get(<<"tool_call_markers">>, Loader),
     ?assertEqual(<<"[TOOL_CALLS]">>, maps:get(<<"start">>, Markers)),
     ?assertEqual(<<"</s>">>, maps:get(<<"end">>, Markers)).
+
+%% Mistral tekken-tokenizer shape (Devstral-2512, Mistral-Small-3.x,
+%% Magistral, Ministral, recent Codestral): `[TOOL_CALLS]<name>[ARGS]<json>'
+%% per call. Disambiguated from the old JSON-array `mistral-tool-calls'
+%% by the presence of `[ARGS]' AFTER `[TOOL_CALLS]'.
+pull_detects_mistral_args_tool_call_format(Config) ->
+    Template = <<"... [TOOL_CALLS]foo[ARGS]{\"x\":1} ...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"devstral-fake">>),
+    ?assertEqual(<<"mistral-args">>, maps:get(<<"tool_call_format">>, Loader)),
+    Markers = maps:get(<<"tool_call_markers">>, Loader),
+    ?assertEqual(<<"[TOOL_CALLS]">>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"</s>">>, maps:get(<<"end">>, Markers)).
+
+%% Classic Mistral template (no `[ARGS]' marker anywhere) must still
+%% detect as `mistral-tool-calls', NOT `mistral-args' - the ordered
+%% check in `is_mistral_args_template/1' should fall through.
+pull_does_not_misclassify_old_mistral_as_args(Config) ->
+    Template = <<"... [TOOL_CALLS][{\"name\":\"f\",\"arguments\":{}}] ...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"classic-mistral-fake">>),
+    ?assertEqual(<<"mistral-tool-calls">>, maps:get(<<"tool_call_format">>, Loader)).
+
+%% A template that mentions `[ARGS]' BEFORE `[TOOL_CALLS]' (e.g. an
+%% instructions / documentation block earlier in the template) must
+%% NOT misclassify as `mistral-args': the ordered check requires
+%% `[ARGS]' to appear AFTER `[TOOL_CALLS]'.
+pull_does_not_misclassify_args_before_tool_calls_as_args(Config) ->
+    Template = <<"Instructions: use [ARGS] after the name. [TOOL_CALLS][{...}]">>,
+    Loader = pull_loader_with_template(Config, Template, <<"args-before-fake">>),
+    ?assertEqual(<<"mistral-tool-calls">>, maps:get(<<"tool_call_format">>, Loader)).
 
 pull_leaves_loader_untouched_when_no_markers(Config) ->
     %% Generic template that doesn't contain any known marker

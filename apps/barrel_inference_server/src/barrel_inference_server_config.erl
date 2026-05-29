@@ -192,6 +192,9 @@ default_tool_call_formats() ->
         <<"mistral-tool-calls">> => #{
             module => barrel_inference_server_tool_format_mistral_tool_calls
         },
+        <<"mistral-args">> => #{
+            module => barrel_inference_server_tool_format_mistral_args
+        },
         <<"bare-json">> => #{module => barrel_inference_server_tool_format_bare_json}
     }.
 
