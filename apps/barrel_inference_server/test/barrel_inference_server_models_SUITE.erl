@@ -33,6 +33,8 @@
     pull_detects_mistral_args_tool_call_format/1,
     pull_does_not_misclassify_old_mistral_as_args/1,
     pull_does_not_misclassify_args_before_tool_calls_as_args/1,
+    pull_detects_llama_pythonic_tool_call_format/1,
+    pull_does_not_misclassify_llama_3_1_as_pythonic/1,
     pull_leaves_loader_untouched_when_no_markers/1,
     pull_detects_think_tag_thinking_markers/1,
     pull_detects_thinking_tag_thinking_markers/1,
@@ -71,6 +73,8 @@ all() ->
         pull_detects_mistral_args_tool_call_format,
         pull_does_not_misclassify_old_mistral_as_args,
         pull_does_not_misclassify_args_before_tool_calls_as_args,
+        pull_detects_llama_pythonic_tool_call_format,
+        pull_does_not_misclassify_llama_3_1_as_pythonic,
         pull_leaves_loader_untouched_when_no_markers,
         pull_detects_think_tag_thinking_markers,
         pull_detects_thinking_tag_thinking_markers,
@@ -260,6 +264,34 @@ pull_does_not_misclassify_args_before_tool_calls_as_args(Config) ->
     Template = <<"Instructions: use [ARGS] after the name. [TOOL_CALLS][{...}]">>,
     Loader = pull_loader_with_template(Config, Template, <<"args-before-fake">>),
     ?assertEqual(<<"mistral-tool-calls">>, maps:get(<<"tool_call_format">>, Loader)).
+
+%% Llama 3.2 / 3.3 Instruct zero-shot pythonic shape. The chat template
+%% mentions `pythonic' instructions and ends turns at `<|eot_id|>', but
+%% does NOT carry the Llama 3.1 `<|python_tag|>' marker. The new family
+%% is marker-less, so the loader carries the format name but NOT a
+%% `tool_call_markers' key (the handler post-parse path on `buf_text'
+%% is what captures calls at `barrel_inference_done').
+pull_detects_llama_pythonic_tool_call_format(Config) ->
+    Template = <<
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+        "When the user asks for a tool, respond in pythonic format: "
+        "[func_name(arg=value)]<|eot_id|>"
+    >>,
+    Loader = pull_loader_with_template(Config, Template, <<"llama-pythonic-fake">>),
+    ?assertEqual(<<"llama-pythonic">>, maps:get(<<"tool_call_format">>, Loader)),
+    ?assertNot(maps:is_key(<<"tool_call_markers">>, Loader)).
+
+%% A Llama 3.1 template (which carries `<|python_tag|>') must keep
+%% detecting as `llama-python-tag', NOT as the new pythonic family.
+%% The 3.1 template has `<|eot_id|>' too (every Llama template does),
+%% so the disambiguation rule is the presence of `<|python_tag|>'.
+pull_does_not_misclassify_llama_3_1_as_pythonic(Config) ->
+    Template = <<
+        "Use <|python_tag|>{\"name\":...,\"parameters\":...}<|eom_id|> "
+        "to call a function. <|eot_id|>"
+    >>,
+    Loader = pull_loader_with_template(Config, Template, <<"llama-3-1-fake">>),
+    ?assertEqual(<<"llama-python-tag">>, maps:get(<<"tool_call_format">>, Loader)).
 
 pull_leaves_loader_untouched_when_no_markers(Config) ->
     %% Generic template that doesn't contain any known marker

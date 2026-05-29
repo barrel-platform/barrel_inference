@@ -189,6 +189,9 @@ default_tool_call_formats() ->
         <<"llama-python-tag">> => #{
             module => barrel_inference_server_tool_format_llama_python_tag
         },
+        <<"llama-pythonic">> => #{
+            module => barrel_inference_server_tool_format_llama_pythonic
+        },
         <<"mistral-tool-calls">> => #{
             module => barrel_inference_server_tool_format_mistral_tool_calls
         },

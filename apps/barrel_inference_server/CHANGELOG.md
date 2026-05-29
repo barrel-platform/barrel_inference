@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- New `llama-pythonic` tool-call format family. Covers the Llama 3.2 Instruct
+  (1B, 3B) and Llama 3.3 70B Instruct zero-shot wire shape, which is a Python
+  call-list `[func1(arg1='val1', arg2=True), func2(...)]` terminated by
+  `<|eot_id|>` - NOT the Llama 3.1 `<|python_tag|>{json}<|eom_id|>` envelope.
+  The existing `llama-python-tag` family stays valid for Llama 3.1 and for
+  3.3's built-in-tools sub-mode; the new family is the zero-shot path for
+  3.2 and 3.3. The parser is tolerant of single AND double quoted strings,
+  Python literals (`True` / `False` / `None`) AND JSON equivalents
+  (`true` / `false` / `null`), nested lists and dicts (string OR identifier
+  keys), integers and floats including negatives and scientific notation,
+  and an optional trailing `<|eot_id|>` literal. `canonicalise/1` round-trips
+  through Python literals so a captured + replayed call is byte-stable.
+  The family is **marker-less**: there is no single-token start marker
+  suitable for the engine's `map_marker/2` (a bare `[` would false-positive
+  on prose and code blocks), so it opts into a new **post-parse capture
+  path** in the chat / messages handlers via a `post_parse_mode() ->
+  pythonic` callback. At `barrel_inference_done` the handler runs the
+  family's `parse_all/1` on the accumulated `buf_text` and injects the
+  parsed calls as captured_calls; `buf_text` is reset so the response does
+  NOT also emit the raw bracket list as content. Auto-detection at pull
+  time picks `llama-pythonic` for chat templates that mention pythonic
+  format AND carry `<|eot_id|>` but NOT `<|python_tag|>` (the 3.1
+  signature). Two CT cases pin both directions. Streaming per-call SSE
+  deltas are NOT in scope for this family - pythonic does not allow
+  reliable partial-call boundaries; the handler emits one `tool_calls`
+  block at done, with intermediate text deltas streaming normally while
+  the model is generating.
+
 ### Fixed
 
 - `mistral-tool-calls`, `llama-python-tag`, and `dsml` parse the marker-stripped

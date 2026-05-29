@@ -410,6 +410,15 @@ cap_ctx(N) when is_integer(N) -> min(N, ?DEFAULT_PULL_MAX_CTX).
 
 maybe_merge_tool_call(Base, undefined) ->
     Base;
+maybe_merge_tool_call(Base, {Name, undefined, undefined}) ->
+    %% Marker-less family (e.g. `llama-pythonic'): the family opts into
+    %% the handlers' post-parse path on `buf_text' rather than the
+    %% engine's native marker capture, so the manifest carries only
+    %% the format name. No `tool_call_markers' is set, which keeps
+    %% `barrel_inference_server_tool_format:native_turn/1' returning
+    %% `none' for the request - the request still streams normally and
+    %% the handler post-parses on done.
+    Base#{<<"tool_call_format">> => Name};
 maybe_merge_tool_call(Base, {Name, Start, End}) ->
     Base#{
         <<"tool_call_format">> => Name,
@@ -472,6 +481,15 @@ detect_tool_call_format(Template) when is_binary(Template) ->
     %% very end). The old `mistral-tool-calls' family parses the v3 JSON-
     %% array shape; both contain `[TOOL_CALLS]', so disambiguate by the
     %% `[ARGS]' marker, checked BEFORE the generic candidate scan.
+    %% Llama 3.2 (1B, 3B) and Llama 3.3 70B Instruct emit zero-shot tool
+    %% calls as a pythonic call list `[func(args), ...]<|eot_id|>',
+    %% without the Llama 3.1 `<|python_tag|>...<|eom_id|>' envelope. The
+    %% chat templates for these models mention `pythonic' or `python
+    %% list' in their tool instructions and do NOT carry `<|python_tag|>'.
+    %% Disambiguate from 3.1 by the absence of `<|python_tag|>'. The
+    %% family is marker-less (no engine-side capture); the return tuple
+    %% carries `undefined' marker fields and `maybe_merge_tool_call/2'
+    %% emits `tool_call_format' WITHOUT `tool_call_markers'.
     case is_qwen3_coder_template(Template) of
         true ->
             {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>};
@@ -480,13 +498,30 @@ detect_tool_call_format(Template) when is_binary(Template) ->
                 true ->
                     {<<"mistral-args">>, <<"[TOOL_CALLS]">>, <<"</s>">>};
                 false ->
-                    first_match_marker(Template, Candidates)
+                    case is_llama_pythonic_template(Template) of
+                        true ->
+                            {<<"llama-pythonic">>, undefined, undefined};
+                        false ->
+                            first_match_marker(Template, Candidates)
+                    end
             end
     end.
 
 is_qwen3_coder_template(Template) ->
     binary:match(Template, <<"<tool_call>">>) =/= nomatch andalso
         binary:match(Template, <<"<function=">>) =/= nomatch.
+
+%% Llama 3.2 / 3.3 zero-shot pythonic detection. Templates that have
+%% `<|python_tag|>' (Llama 3.1's signature marker) continue to detect
+%% as `llama-python-tag'. Templates that do NOT have `<|python_tag|>'
+%% AND mention pythonic format detect as the new `llama-pythonic'
+%% family. `<|eot_id|>' is present in every Llama 3.x template and is
+%% used here as a Llama-family anchor.
+is_llama_pythonic_template(Template) ->
+    Has = fun(M) -> binary:match(Template, M) =/= nomatch end,
+    Has(<<"<|eot_id|>">>) andalso
+        not Has(<<"<|python_tag|>">>) andalso
+        (Has(<<"pythonic">>) orelse Has(<<"python list">>)).
 
 %% Require `[ARGS]' to appear AFTER `[TOOL_CALLS]' in the template (not
 %% just anywhere), so an old-Mistral template that mentions `[ARGS]' in

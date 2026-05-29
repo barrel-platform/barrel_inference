@@ -13,7 +13,7 @@
 
 -include("barrel_inference_server.hrl").
 
--export([lookup/1, parse/2, canonicalise/2]).
+-export([lookup/1, parse/2, parse_all/2, canonicalise/2]).
 -export([native_turn/1, native_render/1, render/3, markers/1, scanner_for/1]).
 %% Shared rendering helpers for the per-family render_prompt/2 callbacks.
 -export([tool_signatures/1, append_system/2]).
@@ -25,6 +25,14 @@
 %% real-backend shape. These helpers factor out the common pieces of
 %% that tolerance so each family is a few lines.
 -export([strip_prefix/2, strip_suffix/2, split_at_first_brace/1]).
+%% Shared dispatch helpers for the handlers' post-parse path. Marker-
+%% less families (e.g. `llama-pythonic') opt into a post-parse on the
+%% buffered response text at `barrel_inference_done' instead of the
+%% engine's native-marker capture. `post_parse_mode/1' returns `none'
+%% (the default - every marker-based family) or a family-declared
+%% atom like `pythonic'. `module_of/1' surfaces the family module so
+%% the handler can call `Mod:parse_all/1' on the buffered text.
+-export([post_parse_mode/1, module_of/1]).
 
 -callback parse(binary()) -> {ok, map()} | {error, term()}.
 -callback canonicalise(map()) -> binary().
@@ -75,6 +83,14 @@ lookup_format(FormatName) ->
 -spec parse(spec(), binary()) -> {ok, map()} | {error, term()}.
 parse(#{module := Mod}, Bin) when is_binary(Bin) ->
     Mod:parse(Bin).
+
+%% Dispatch a marker-less family's `parse_all/1' (returns ALL calls in
+%% one capture). Optional callback - the handler's post-parse path
+%% calls this only after `post_parse_mode/1' returns a mode (currently
+%% just `pythonic'), so the family is guaranteed to export it.
+-spec parse_all(spec(), binary()) -> {ok, [map()]} | {error, term()}.
+parse_all(#{module := Mod}, Bin) when is_binary(Bin) ->
+    Mod:parse_all(Bin).
 
 %% Dispatch the canonicalise to the format module.
 -spec canonicalise(spec(), map()) -> binary().
@@ -274,3 +290,26 @@ split_at_first_brace(Bin) ->
             Json = binary:part(Bin, Pos, byte_size(Bin) - Pos),
             {Name, Json}
     end.
+
+%% =============================================================================
+%% Shared dispatch helpers for marker-less families
+%% =============================================================================
+
+%% Family-declared post-parse mode. Families that opt into the
+%% handler's `barrel_inference_done' post-parse on `buf_text' (e.g.
+%% `llama-pythonic') export a zero-arity `post_parse_mode/0' returning
+%% an atom like `pythonic'. Families that use the native marker
+%% capture path do NOT export it; this helper returns `none' for them
+%% (the default).
+-spec post_parse_mode(spec()) -> atom().
+post_parse_mode(#{module := Mod}) ->
+    case erlang:function_exported(Mod, post_parse_mode, 0) of
+        true -> Mod:post_parse_mode();
+        false -> none
+    end.
+
+%% Surface the family module from a resolved Spec. Used by the
+%% handler's post-parse path to call `Mod:parse_all/1' on the
+%% buffered response text once the marker-less family is selected.
+-spec module_of(spec()) -> module().
+module_of(#{module := Mod}) -> Mod.

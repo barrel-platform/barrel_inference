@@ -363,7 +363,10 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
         undefined ->
             %% Captured tool calls (if any) may name server tools; if so,
             %% run them and continue the turn instead of finishing.
-            dispatch_done(Req, flush_scan(Req, demonitor_engine(S1)));
+            S2 = maybe_post_parse_pythonic(
+                flush_scan(Req, demonitor_engine(S1))
+            ),
+            dispatch_done(Req, S2);
         _ ->
             {ok, Req, demonitor_engine(S1), hibernate}
     end;
@@ -1049,6 +1052,42 @@ handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) -
             Call = #{id => ToolId, name => Name, input => Input, full_bin => FullBin},
             {ok, Req, rearm_idle(S#st{captured_calls = S#st.captured_calls ++ [Call]}), hibernate}
     end.
+
+%% Post-parse for marker-less families (currently `llama-pythonic'): the
+%% model emits the tool-call list as plain text terminated at the end
+%% of the turn (e.g. Llama 3.2 / 3.3's `[func(args), ...]<|eot_id|>'),
+%% so the engine's native marker capture never fires and
+%% `captured_calls' stays empty. If the family declares a post-parse
+%% mode, run the family's `parse_all/1' on the buffered response text
+%% and inject the parsed calls as captured_calls. Reset `buf_text' to
+%% keep `dispatch_done' from also emitting the raw call list as
+%% content.
+maybe_post_parse_pythonic(
+    S = #st{captured_calls = [], tool_format = Spec, model = Model, buf_text = BufText}
+) when Spec =/= undefined ->
+    case barrel_inference_server_tool_format:post_parse_mode(Spec) of
+        pythonic ->
+            BufBin = iolist_to_binary(BufText),
+            case barrel_inference_server_tool_format:parse_all(Spec, BufBin) of
+                {ok, Calls} when Calls =/= [] ->
+                    Captured = [post_parse_call(Spec, Model, C) || C <- Calls],
+                    S#st{captured_calls = Captured, buf_text = []};
+                _ ->
+                    S
+            end;
+        _ ->
+            S
+    end;
+maybe_post_parse_pythonic(S) ->
+    S.
+
+post_parse_call(Spec, Model, #{name := Name, arguments := Args}) ->
+    ToolId = make_tool_id_toolu(),
+    FullBin = barrel_inference_server_tool_format:canonicalise(
+        Spec, #{name => Name, arguments => Args}
+    ),
+    maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Args),
+    #{id => ToolId, name => Name, input => Args, full_bin => FullBin}.
 
 %% Parses FullBin to a `{ok, Name, ArgsMap}' tuple via the format module,
 %% with a fall-back to the in-line `parse_tool_call/1'. Returns `skip'
