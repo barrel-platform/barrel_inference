@@ -516,7 +516,10 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
     S1 = accumulate_stats(S, Stats),
     case S1#st.pending_exec of
         undefined ->
-            dispatch_done(Req, flush_scan(Req, demonitor_engine(S1)));
+            S2 = maybe_post_parse_pythonic(
+                flush_scan(Req, demonitor_engine(S1))
+            ),
+            dispatch_done(Req, S2);
         _ ->
             {ok, Req, demonitor_engine(S1), hibernate}
     end;
@@ -805,6 +808,39 @@ handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) -
             Call = #{id => ToolId, name => Name, input => Input, full_bin => FullBin},
             {ok, Req, rearm_idle(S#st{captured_calls = S#st.captured_calls ++ [Call]}), hibernate}
     end.
+
+%% Post-parse for marker-less families (`llama-pythonic'): mirrors the
+%% h_chat handler. If the family declares `pythonic' post-parse mode
+%% and no native captures were produced, parse the buffered text as a
+%% pythonic call list and inject the results so `dispatch_done' sends
+%% them through the normal Anthropic tool_use path. Reset `buf_text'
+%% to keep the raw call list from being emitted as content.
+maybe_post_parse_pythonic(
+    S = #st{captured_calls = [], tool_format = Spec, model = Model, buf_text = BufText}
+) when Spec =/= undefined ->
+    case barrel_inference_server_tool_format:post_parse_mode(Spec) of
+        pythonic ->
+            BufBin = iolist_to_binary(BufText),
+            case barrel_inference_server_tool_format:parse_all(Spec, BufBin) of
+                {ok, Calls} when Calls =/= [] ->
+                    Captured = [post_parse_call(Spec, Model, C) || C <- Calls],
+                    S#st{captured_calls = Captured, buf_text = []};
+                _ ->
+                    S
+            end;
+        _ ->
+            S
+    end;
+maybe_post_parse_pythonic(S) ->
+    S.
+
+post_parse_call(Spec, Model, #{name := Name, arguments := Args}) ->
+    ToolId = make_tool_id(),
+    FullBin = barrel_inference_server_tool_format:canonicalise(
+        Spec, #{name => Name, arguments => Args}
+    ),
+    maybe_persist_replay(Spec, ToolId, Model, FullBin, Name, Args),
+    #{id => ToolId, name => Name, input => Args, full_bin => FullBin}.
 
 parse_full_bin(undefined, FullBin) ->
     {Name, Args} = parse_tool_call(FullBin),
