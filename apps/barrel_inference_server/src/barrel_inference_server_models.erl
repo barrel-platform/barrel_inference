@@ -497,6 +497,7 @@ detect_tool_call_format(Template) when is_binary(Template) ->
     %% predicate matches.
     SpecialCases = [
         {fun is_qwen3_coder_template/1, {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>}},
+        {fun is_glm45_template/1, {<<"glm45">>, <<"<tool_call>">>, <<"</tool_call>">>}},
         {fun is_mistral_args_template/1, {<<"mistral-args">>, <<"[TOOL_CALLS]">>, <<"</s>">>}},
         {fun is_llama_pythonic_template/1, {<<"llama-pythonic">>, undefined, undefined}},
         {fun is_phi4_functools_template/1, {<<"phi4-functools">>, undefined, undefined}}
@@ -517,6 +518,16 @@ first_matching_special([{Pred, Result} | Rest], Template) ->
 is_qwen3_coder_template(Template) ->
     binary:match(Template, <<"<tool_call>">>) =/= nomatch andalso
         binary:match(Template, <<"<function=">>) =/= nomatch.
+
+%% GLM-4.5 / 4.5-Air / 4.6 (wire-identical). The chat template emits
+%% the literal `<tool_call>NAME\n<arg_key>...</arg_key>\n
+%% <arg_value>...</arg_value>...</tool_call>' shape. Both `<tool_call>'
+%% and `<arg_key>' together uniquely identify GLM-4.x: qwen3-coder
+%% shares `<tool_call>' but uses `<function=...>' for the body, not
+%% `<arg_key>'. GLM-4.7 diverges; future `glm47' family.
+is_glm45_template(Template) ->
+    binary:match(Template, <<"<tool_call>">>) =/= nomatch andalso
+        binary:match(Template, <<"<arg_key>">>) =/= nomatch.
 
 %% Llama 3.2 / 3.3 zero-shot pythonic detection. Templates that have
 %% `<|python_tag|>' (Llama 3.1's signature marker) continue to detect

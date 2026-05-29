@@ -37,6 +37,8 @@
     pull_does_not_misclassify_llama_3_1_as_pythonic/1,
     pull_detects_phi4_functools_tool_call_format/1,
     pull_does_not_misclassify_non_phi4_template_with_functools/1,
+    pull_detects_glm45_tool_call_format/1,
+    pull_does_not_misclassify_qwen3_coder_as_glm45/1,
     pull_leaves_loader_untouched_when_no_markers/1,
     pull_detects_think_tag_thinking_markers/1,
     pull_detects_thinking_tag_thinking_markers/1,
@@ -79,6 +81,8 @@ all() ->
         pull_does_not_misclassify_llama_3_1_as_pythonic,
         pull_detects_phi4_functools_tool_call_format,
         pull_does_not_misclassify_non_phi4_template_with_functools,
+        pull_detects_glm45_tool_call_format,
+        pull_does_not_misclassify_qwen3_coder_as_glm45,
         pull_leaves_loader_untouched_when_no_markers,
         pull_detects_think_tag_thinking_markers,
         pull_detects_thinking_tag_thinking_markers,
@@ -322,6 +326,30 @@ pull_does_not_misclassify_non_phi4_template_with_functools(Config) ->
     >>,
     Loader = pull_loader_with_template(Config, Template, <<"non-phi4-fake">>),
     ?assertNot(maps:is_key(<<"tool_call_format">>, Loader)).
+
+%% GLM-4.5 / 4.5-Air / 4.6: the chat template emits the literal
+%% `<tool_call>NAME\n<arg_key>...</arg_key>\n<arg_value>...</arg_value>
+%% ...</tool_call>' shape. Native marker capture: the loader carries
+%% the format name AND the `<tool_call>' / `</tool_call>' marker pair.
+pull_detects_glm45_tool_call_format(Config) ->
+    Template = <<
+        "...<tool_call>{function-name}\n<arg_key>{key}</arg_key>\n"
+        "<arg_value>{value}</arg_value>\n</tool_call>..."
+    >>,
+    Loader = pull_loader_with_template(Config, Template, <<"glm45-fake">>),
+    ?assertEqual(<<"glm45">>, maps:get(<<"tool_call_format">>, Loader)),
+    Markers = maps:get(<<"tool_call_markers">>, Loader),
+    ?assertEqual(<<"<tool_call>">>, maps:get(<<"start">>, Markers)),
+    ?assertEqual(<<"</tool_call>">>, maps:get(<<"end">>, Markers)).
+
+%% A qwen3-coder template carries `<tool_call>' AND `<function=' but
+%% NOT `<arg_key>'; it must keep detecting as `qwen3-coder', not
+%% as `glm45'.
+pull_does_not_misclassify_qwen3_coder_as_glm45(Config) ->
+    Template =
+        <<"...<tool_call>\n<function=foo>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>...">>,
+    Loader = pull_loader_with_template(Config, Template, <<"qwen3-coder-vs-glm45">>),
+    ?assertEqual(<<"qwen3-coder">>, maps:get(<<"tool_call_format">>, Loader)).
 
 pull_leaves_loader_untouched_when_no_markers(Config) ->
     %% Generic template that doesn't contain any known marker
