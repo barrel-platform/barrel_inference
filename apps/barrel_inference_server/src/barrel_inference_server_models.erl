@@ -490,21 +490,30 @@ detect_tool_call_format(Template) when is_binary(Template) ->
     %% family is marker-less (no engine-side capture); the return tuple
     %% carries `undefined' marker fields and `maybe_merge_tool_call/2'
     %% emits `tool_call_format' WITHOUT `tool_call_markers'.
-    case is_qwen3_coder_template(Template) of
-        true ->
-            {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>};
-        false ->
-            case is_mistral_args_template(Template) of
-                true ->
-                    {<<"mistral-args">>, <<"[TOOL_CALLS]">>, <<"</s>">>};
-                false ->
-                    case is_llama_pythonic_template(Template) of
-                        true ->
-                            {<<"llama-pythonic">>, undefined, undefined};
-                        false ->
-                            first_match_marker(Template, Candidates)
-                    end
-            end
+    %%
+    %% Special-case detectors run BEFORE the generic candidate scan;
+    %% each is a `{Predicate, ReturnTuple}' pair walked in order, first
+    %% match wins. Generic scan falls through when no special-case
+    %% predicate matches.
+    SpecialCases = [
+        {fun is_qwen3_coder_template/1,
+            {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>}},
+        {fun is_mistral_args_template/1,
+            {<<"mistral-args">>, <<"[TOOL_CALLS]">>, <<"</s>">>}},
+        {fun is_llama_pythonic_template/1, {<<"llama-pythonic">>, undefined, undefined}},
+        {fun is_phi4_functools_template/1, {<<"phi4-functools">>, undefined, undefined}}
+    ],
+    case first_matching_special(SpecialCases, Template) of
+        {ok, Result} -> Result;
+        none -> first_match_marker(Template, Candidates)
+    end.
+
+first_matching_special([], _Template) ->
+    none;
+first_matching_special([{Pred, Result} | Rest], Template) ->
+    case Pred(Template) of
+        true -> {ok, Result};
+        false -> first_matching_special(Rest, Template)
     end.
 
 is_qwen3_coder_template(Template) ->
@@ -522,6 +531,16 @@ is_llama_pythonic_template(Template) ->
     Has(<<"<|eot_id|>">>) andalso
         not Has(<<"<|python_tag|>">>) andalso
         (Has(<<"pythonic">>) orelse Has(<<"python list">>)).
+
+%% Phi-4-mini-instruct / Phi-4-multimodal-instruct. The chat template
+%% renders the literal `functools[' prefix for tool-call output AND
+%% wraps the SYSTEM-block tool declarations in `<|tool|>...<|/tool|>'
+%% (vocab IDs 200023 / 200024). Both markers together uniquely
+%% identify Phi-4 with tool calling - matching just `functools[' would
+%% false-positive on prose templates that mention the token.
+is_phi4_functools_template(Template) ->
+    binary:match(Template, <<"functools[">>) =/= nomatch andalso
+        binary:match(Template, <<"<|tool|>">>) =/= nomatch.
 
 %% Require `[ARGS]' to appear AFTER `[TOOL_CALLS]' in the template (not
 %% just anywhere), so an old-Mistral template that mentions `[ARGS]' in

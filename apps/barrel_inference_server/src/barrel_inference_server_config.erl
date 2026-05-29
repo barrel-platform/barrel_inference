@@ -192,6 +192,9 @@ default_tool_call_formats() ->
         <<"llama-pythonic">> => #{
             module => barrel_inference_server_tool_format_llama_pythonic
         },
+        <<"phi4-functools">> => #{
+            module => barrel_inference_server_tool_format_phi4_functools
+        },
         <<"mistral-tool-calls">> => #{
             module => barrel_inference_server_tool_format_mistral_tool_calls
         },

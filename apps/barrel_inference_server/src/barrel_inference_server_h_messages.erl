@@ -516,7 +516,7 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
     S1 = accumulate_stats(S, Stats),
     case S1#st.pending_exec of
         undefined ->
-            S2 = maybe_post_parse_pythonic(
+            S2 = maybe_post_parse(
                 flush_scan(Req, demonitor_engine(S1))
             ),
             dispatch_done(Req, S2);
@@ -809,17 +809,20 @@ handle_tool_call_end(FullBin, Req, S = #st{tool_format = Spec, model = Model}) -
             {ok, Req, rearm_idle(S#st{captured_calls = S#st.captured_calls ++ [Call]}), hibernate}
     end.
 
-%% Post-parse for marker-less families (`llama-pythonic'): mirrors the
-%% h_chat handler. If the family declares `pythonic' post-parse mode
-%% and no native captures were produced, parse the buffered text as a
-%% pythonic call list and inject the results so `dispatch_done' sends
-%% them through the normal Anthropic tool_use path. Reset `buf_text'
-%% to keep the raw call list from being emitted as content.
-maybe_post_parse_pythonic(
+%% Post-parse for marker-less families (`llama-pythonic',
+%% `phi4-functools', ...): mirrors the h_chat handler. Any family whose
+%% `post_parse_mode/1' returns a non-`none' atom opts in; the handler
+%% runs the family's `parse_all/1' on the buffered text and injects the
+%% parsed calls so `dispatch_done' sends them through the normal
+%% Anthropic tool_use path. Reset `buf_text' to keep the raw call list
+%% from being emitted as content.
+maybe_post_parse(
     S = #st{captured_calls = [], tool_format = Spec, model = Model, buf_text = BufText}
 ) when Spec =/= undefined ->
     case barrel_inference_server_tool_format:post_parse_mode(Spec) of
-        pythonic ->
+        none ->
+            S;
+        _Mode ->
             BufBin = iolist_to_binary(BufText),
             case barrel_inference_server_tool_format:parse_all(Spec, BufBin) of
                 {ok, Calls} when Calls =/= [] ->
@@ -827,11 +830,9 @@ maybe_post_parse_pythonic(
                     S#st{captured_calls = Captured, buf_text = []};
                 _ ->
                     S
-            end;
-        _ ->
-            S
+            end
     end;
-maybe_post_parse_pythonic(S) ->
+maybe_post_parse(S) ->
     S.
 
 post_parse_call(Spec, Model, #{name := Name, arguments := Args}) ->

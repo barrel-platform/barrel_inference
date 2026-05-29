@@ -35,6 +35,8 @@
     pull_does_not_misclassify_args_before_tool_calls_as_args/1,
     pull_detects_llama_pythonic_tool_call_format/1,
     pull_does_not_misclassify_llama_3_1_as_pythonic/1,
+    pull_detects_phi4_functools_tool_call_format/1,
+    pull_does_not_misclassify_non_phi4_template_with_functools/1,
     pull_leaves_loader_untouched_when_no_markers/1,
     pull_detects_think_tag_thinking_markers/1,
     pull_detects_thinking_tag_thinking_markers/1,
@@ -75,6 +77,8 @@ all() ->
         pull_does_not_misclassify_args_before_tool_calls_as_args,
         pull_detects_llama_pythonic_tool_call_format,
         pull_does_not_misclassify_llama_3_1_as_pythonic,
+        pull_detects_phi4_functools_tool_call_format,
+        pull_does_not_misclassify_non_phi4_template_with_functools,
         pull_leaves_loader_untouched_when_no_markers,
         pull_detects_think_tag_thinking_markers,
         pull_detects_thinking_tag_thinking_markers,
@@ -292,6 +296,32 @@ pull_does_not_misclassify_llama_3_1_as_pythonic(Config) ->
     >>,
     Loader = pull_loader_with_template(Config, Template, <<"llama-3-1-fake">>),
     ?assertEqual(<<"llama-python-tag">>, maps:get(<<"tool_call_format">>, Loader)).
+
+%% Phi-4-mini-instruct / Phi-4-multimodal-instruct: the chat template
+%% renders the SYSTEM-block tool declarations in `<|tool|>...<|/tool|>'
+%% and instructs the model to emit calls as `functools[{...}]'. The
+%% family is marker-less (the post-parse path on `buf_text' captures
+%% the call), so the loader carries the format name but NOT a
+%% `tool_call_markers' key.
+pull_detects_phi4_functools_tool_call_format(Config) ->
+    Template = <<
+        "<|system|>You are an assistant.<|tool|>[{\"name\":\"f\"}]<|/tool|><|end|>"
+        "<|user|>...<|end|><|assistant|>To call a tool, emit "
+        "functools[{\"name\": <function>, \"arguments\": <args>}]<|end|>"
+    >>,
+    Loader = pull_loader_with_template(Config, Template, <<"phi4-fake">>),
+    ?assertEqual(<<"phi4-functools">>, maps:get(<<"tool_call_format">>, Loader)),
+    ?assertNot(maps:is_key(<<"tool_call_markers">>, Loader)).
+
+%% A template that mentions `functools[' as prose only (no `<|tool|>'
+%% declaration block) must NOT detect as `phi4-functools'.
+pull_does_not_misclassify_non_phi4_template_with_functools(Config) ->
+    Template = <<
+        "Random documentation mentioning functools[1,2,3] as a Python "
+        "library example. <|eot_id|>"
+    >>,
+    Loader = pull_loader_with_template(Config, Template, <<"non-phi4-fake">>),
+    ?assertNot(maps:is_key(<<"tool_call_format">>, Loader)).
 
 pull_leaves_loader_untouched_when_no_markers(Config) ->
     %% Generic template that doesn't contain any known marker
