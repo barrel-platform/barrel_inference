@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- New `glm45` tool-call format family. Covers zai-org / THUDM GLM-4.5,
+  GLM-4.5-Air, and GLM-4.6 (wire-identical across the three; same
+  tokenizer IDs 151352..151359 for the eight tool / arg markers, same
+  chat-template emission block). The wire shape is the XML body
+  `<tool_call>NAME\n<arg_key>K</arg_key>\n<arg_value>V</arg_value>...
+  </tool_call>` where the function name lives on the first line and
+  each argument is a `<arg_key>` / `<arg_value>` pair. All eight markers
+  are SINGLE tokens in the tokenizer, so the family uses the engine's
+  native marker capture path (qwen3-coder lineage) without any handler
+  change: the engine emits `barrel_inference_tool_call_end` with the
+  captured body and `parse/1` extracts the name and arg map. Values are
+  JSON-decoded when they round-trip (numbers, booleans, arrays, objects,
+  quoted strings) and kept as raw binaries for bare unquoted strings,
+  mirroring qwen3-coder's `coerce/1`, since the GLM template renders
+  non-string values via `tojson(ensure_ascii=False)` but bare strings
+  unquoted. `canonicalise/1` round-trips message history bit-exact.
+  Auto-detection at pull time keys on `<tool_call>` AND `<arg_key>`;
+  qwen3-coder shares `<tool_call>` but uses `<function=`, so the two
+  predicates are mutually exclusive on real templates. GLM-4.7 ships
+  a different first-line layout and is intentionally NOT covered;
+  future `glm47` family.
 - New `phi4-functools` tool-call format family. Covers Microsoft
   Phi-4-mini-instruct and Phi-4-multimodal-instruct, which emit calls as
   `functools[{"name":...,"arguments":...}, ...]` — literal ASCII markers
