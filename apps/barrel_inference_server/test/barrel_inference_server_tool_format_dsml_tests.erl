@@ -83,6 +83,49 @@ dsml_parses_with_leading_whitespace_test() ->
     ).
 
 %% =============================================================================
+%% parse: marker-stripped real-backend shape
+%%
+%% The NIF detokenizer runs with `special=false', which drops control-
+%% token markers from the captured FullBin. For dsml that includes the
+%% inner `<｜tool▁sep｜>' separator, so the body the parser sees is
+%% typically `functionNAME\n```json\n{ARGS}\n```' (literal `function'
+%% text fused to the name, no sep, the outer call-markers gone too).
+%% =============================================================================
+
+dsml_parses_stripped_markers_test() ->
+    %% Canonical with all special tokens dropped: `function' prefix
+    %% remains as literal text fused to the name.
+    Bin = <<"functiondo_it\n```json\n{\"x\":1}\n```">>,
+    ?assertEqual(
+        {ok, #{name => <<"do_it">>, arguments => #{<<"x">> => 1}}},
+        ?DSML:parse(Bin)
+    ).
+
+dsml_parses_stripped_markers_without_function_prefix_test() ->
+    %% Some configurations / fine-tunes omit the `function' type prefix
+    %% in the canonical template; with markers stripped the body is then
+    %% just `NAME\n```json\n{ARGS}\n```'.
+    Bin = <<"do_it\n```json\n{}\n```">>,
+    ?assertEqual(
+        {ok, #{name => <<"do_it">>, arguments => #{}}},
+        ?DSML:parse(Bin)
+    ).
+
+dsml_parses_stripped_markers_strips_function_prefix_always_test() ->
+    %% Documented trade-off: in the marker-stripped path the literal
+    %% `function' text is indistinguishable from the canonical type
+    %% prefix and is always stripped. DeepSeek's canonical wire
+    %% protocol reserves `function' as a type prefix, so user-defined
+    %% tools should not name a function starting with `function' - if
+    %% one does (e.g. `functionGetData'), the marker-stripped capture
+    %% parses as `GetData' here.
+    Bin = <<"functionGetData\n```json\n{}\n```">>,
+    ?assertEqual(
+        {ok, #{name => <<"GetData">>, arguments => #{}}},
+        ?DSML:parse(Bin)
+    ).
+
+%% =============================================================================
 %% parse: rejections
 %% =============================================================================
 

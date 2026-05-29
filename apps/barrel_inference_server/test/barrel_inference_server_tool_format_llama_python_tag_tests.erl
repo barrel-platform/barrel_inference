@@ -49,12 +49,46 @@ llama_defaults_missing_parameters_to_empty_map_test() ->
     ).
 
 %% =============================================================================
-%% parse: rejections
+%% parse: marker-stripped real-backend shape
+%%
+%% The NIF detokenizer runs with `special=false', which drops control-
+%% token markers (`<|python_tag|>', `<|eom_id|>') from the captured
+%% FullBin, so the body the parser actually sees on a real backend is a
+%% bare JSON object. The parser must accept both shapes.
 %% =============================================================================
 
-llama_rejects_missing_python_tag_test() ->
-    Bin = <<"{\"name\":\"f\",\"parameters\":{}}<|eom_id|>">>,
-    ?assertEqual({error, no_markers}, ?LLAMA:parse(Bin)).
+llama_parses_stripped_markers_test() ->
+    ?assertEqual(
+        {ok, #{name => <<"f">>, arguments => #{}}},
+        ?LLAMA:parse(<<"{\"name\":\"f\",\"parameters\":{}}">>)
+    ).
+
+llama_parses_stripped_markers_with_arguments_key_test() ->
+    %% Some Llama 3.x fine-tunes emit `arguments' instead of `parameters'.
+    ?assertEqual(
+        {ok, #{name => <<"f">>, arguments => #{<<"x">> => 1}}},
+        ?LLAMA:parse(<<"{\"name\":\"f\",\"arguments\":{\"x\":1}}">>)
+    ).
+
+llama_parses_stripped_markers_with_eom_id_only_test() ->
+    %% Edge case: the start marker drops but the end marker is preserved
+    %% by some loader configs (or arrives as plain text). Both tolerances
+    %% must compose.
+    ?assertEqual(
+        {ok, #{name => <<"f">>, arguments => #{}}},
+        ?LLAMA:parse(<<"{\"name\":\"f\",\"parameters\":{}}<|eom_id|>">>)
+    ).
+
+llama_parses_stripped_markers_with_surrounding_whitespace_test() ->
+    Bin = <<"\n  {\"name\":\"f\",\"parameters\":{}}  \n">>,
+    ?assertEqual(
+        {ok, #{name => <<"f">>, arguments => #{}}},
+        ?LLAMA:parse(Bin)
+    ).
+
+%% =============================================================================
+%% parse: rejections
+%% =============================================================================
 
 llama_rejects_invalid_json_test() ->
     Bin = <<"<|python_tag|>{garbage<|eom_id|>">>,

@@ -47,22 +47,18 @@ render_prompt(Tools, System) ->
 
 -spec parse(binary()) -> {ok, map()} | {error, term()}.
 parse(Bin) when is_binary(Bin) ->
-    case extract_body(string:trim(Bin)) of
-        {ok, JsonBin} -> decode_payload(string:trim(JsonBin));
-        error -> {error, no_markers}
-    end.
-
-extract_body(Bin) ->
-    case binary:split(Bin, ?START) of
-        [_, AfterStart] ->
-            %% End marker is optional - some configs stop at EOS.
-            case binary:split(AfterStart, ?END) of
-                [Body, _] -> {ok, Body};
-                _ -> {ok, AfterStart}
-            end;
-        _ ->
-            error
-    end.
+    %% Tolerant of the marker-stripped real-backend shape: the NIF
+    %% detokenizer's `special=false' drops `<|python_tag|>' and
+    %% `<|eom_id|>' (both control tokens) from the captured FullBin, so
+    %% the parser accepts both the canonical
+    %% `<|python_tag|>{json}<|eom_id|>' AND a bare `{json}'.
+    Body = barrel_inference_server_tool_format:strip_suffix(
+        barrel_inference_server_tool_format:strip_prefix(
+            string:trim(Bin), ?START
+        ),
+        ?END
+    ),
+    decode_payload(string:trim(Body)).
 
 decode_payload(JsonBin) ->
     try json:decode(JsonBin) of

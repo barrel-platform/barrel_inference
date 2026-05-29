@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- `mistral-tool-calls`, `llama-python-tag`, and `dsml` parse the marker-stripped
+  shape that real backends produce. The NIF detokenizer runs with
+  `llama_token_to_piece(..., /*special*/ false)`, which drops control-token markers
+  from the captured `FullBin`; the three families above all split on a marker that
+  is itself a control token (`[TOOL_CALLS]`, `<|python_tag|>`, `<｜tool▁sep｜>`) and
+  so were silently broken on a real backend, returning `{error, no_markers}` for
+  `mistral-tool-calls` and `llama-python-tag`, and parsing `functionNAME` as the
+  function name for `dsml`. Each family's `parse/1` now accepts both the canonical
+  marker-present shape AND the marker-stripped shape, mirroring the tolerance
+  pattern shipped with the `mistral-args` family. Three small shared helpers
+  (`strip_prefix/2`, `strip_suffix/2`, `split_at_first_brace/1`) are lifted into
+  `barrel_inference_server_tool_format` so families don't reinvent them.
+  Behavioural note for `dsml`: in the marker-stripped path the literal `function'
+  type-prefix text is always stripped (the canonical wire reserves it), so a
+  user-defined function whose name literally starts with `function' (e.g.
+  `functionGetData`) loses that prefix on the marker-stripped path; this is
+  documented and pinned by an eunit test.
+
 ### Added
 
 - New `mistral-args` tool-call format family. Covers the Mistral tekken-tokenizer wire
