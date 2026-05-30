@@ -30,6 +30,25 @@
 -behaviour(barrel_inference_server_tool_format).
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
+-export([family_name/0, detect/1]).
+
+family_name() -> <<"dsml">>.
+
+%% DeepSeek-V3 lineage: the `<｜tool▁call▁begin｜>' marker is
+%% globally unique to this family (no other open-weights model uses
+%% the same FULLWIDTH BAR + KOREAN angle-bracket framing).
+-spec detect(binary()) ->
+    {detected, #{start := binary(), 'end' := binary()}} | not_detected.
+detect(T) when is_binary(T) ->
+    case binary:match(T, <<"<｜tool▁call▁begin｜>"/utf8>>) of
+        nomatch ->
+            not_detected;
+        _ ->
+            {detected, #{
+                start => <<"<｜tool▁call▁begin｜>"/utf8>>,
+                'end' => <<"<｜tool▁call▁end｜>"/utf8>>
+            }}
+    end.
 
 -define(CALLS_BEGIN, <<"<｜tool▁calls▁begin｜>"/utf8>>).
 -define(CALLS_END, <<"<｜tool▁calls▁end｜>"/utf8>>).

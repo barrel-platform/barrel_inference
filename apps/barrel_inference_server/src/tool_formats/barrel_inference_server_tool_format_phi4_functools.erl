@@ -30,10 +30,27 @@
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
 -export([parse_all/1, post_parse_mode/0]).
+-export([family_name/0, detect/1]).
 
 -define(START, <<"functools[">>).
 -define(SYS_TOOL_OPEN, <<"<|tool|>">>).
 -define(SYS_TOOL_CLOSE, <<"<|/tool|>">>).
+
+family_name() -> <<"phi4-functools">>.
+
+%% Marker-less family: requires BOTH the `functools[' literal AND
+%% the `<|tool|>' declaration-block marker. Either alone would
+%% false-positive on prose templates that mention the `functools'
+%% Python library or that use `<|tool|>' for unrelated purposes.
+-spec detect(binary()) -> {detected, undefined} | not_detected.
+detect(T) when is_binary(T) ->
+    case
+        binary:match(T, ?START) =/= nomatch andalso
+            binary:match(T, ?SYS_TOOL_OPEN) =/= nomatch
+    of
+        true -> {detected, undefined};
+        false -> not_detected
+    end.
 
 %% =============================================================================
 %% Behaviour callbacks

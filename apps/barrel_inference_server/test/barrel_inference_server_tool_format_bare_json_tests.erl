@@ -99,3 +99,17 @@ bare_json_registry_dispatch_test() ->
         {ok, #{name => <<"a">>, arguments => #{}}},
         barrel_inference_server_tool_format:parse(Spec, Bin)
     ).
+
+%% =============================================================================
+%% family_name/0 + detect/1
+%% =============================================================================
+
+bare_json_family_name_test() ->
+    ?assertEqual(<<"bare-json">>, ?BARE:family_name()).
+
+%% Runtime-configured catch-all: `detect/1' returns `not_detected'
+%% for every template. No positive detection test by design.
+bare_json_detect_returns_not_detected_test() ->
+    ?assertEqual(not_detected, ?BARE:detect(<<"{\"any\":\"template\"}">>)),
+    ?assertEqual(not_detected, ?BARE:detect(<<"<tool_call>foo</tool_call>">>)),
+    ?assertEqual(not_detected, ?BARE:detect(<<"">>)).

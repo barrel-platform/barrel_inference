@@ -151,3 +151,31 @@ mistral_args_registry_dispatch_test() ->
         {ok, #{name => <<"a">>, arguments => #{}}},
         barrel_inference_server_tool_format:parse(Spec, Bin)
     ).
+
+%% =============================================================================
+%% family_name/0 + detect/1 + payload_markers/0
+%% =============================================================================
+
+mistral_args_family_name_test() ->
+    ?assertEqual(<<"mistral-args">>, ?M:family_name()).
+
+mistral_args_payload_markers_test() ->
+    ?assertEqual(#{<<"payload_start">> => <<"[ARGS]">>}, ?M:payload_markers()).
+
+mistral_args_detect_positive_test() ->
+    Template = <<"... [TOOL_CALLS]foo[ARGS]{\"x\":1} ...">>,
+    ?assertEqual(
+        {detected, #{start => <<"[TOOL_CALLS]">>, 'end' => <<"</s>">>}},
+        ?M:detect(Template)
+    ).
+
+mistral_args_detect_negative_without_args_marker_test() ->
+    %% Classic Mistral template - no `[ARGS]' marker.
+    Template = <<"... [TOOL_CALLS][{\"name\":\"f\",\"arguments\":{}}] ...">>,
+    ?assertEqual(not_detected, ?M:detect(Template)).
+
+mistral_args_detect_negative_args_before_tool_calls_test() ->
+    %% Instructions mention `[ARGS]' BEFORE `[TOOL_CALLS]'. The
+    %% order-aware predicate must not misclassify as mistral-args.
+    Template = <<"Instructions: use [ARGS] after the name. [TOOL_CALLS][{...}]">>,
+    ?assertEqual(not_detected, ?M:detect(Template)).

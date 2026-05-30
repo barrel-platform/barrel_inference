@@ -24,9 +24,27 @@
 -behaviour(barrel_inference_server_tool_format).
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
+-export([family_name/0, detect/1]).
 
 -define(START, <<"<tool_call>">>).
 -define(END, <<"</tool_call>">>).
+
+family_name() -> <<"qwen3-coder">>.
+
+%% qwen3-coder shares the `<tool_call>' marker with qwen-xml and
+%% glm45 but emits a nested `<function=NAME>...<parameter=...>...
+%% </function>' body, so the disambiguator is the `<function='
+%% substring inside the template.
+-spec detect(binary()) ->
+    {detected, #{start := binary(), 'end' := binary()}} | not_detected.
+detect(T) when is_binary(T) ->
+    case
+        binary:match(T, ?START) =/= nomatch andalso
+            binary:match(T, <<"<function=">>) =/= nomatch
+    of
+        true -> {detected, #{start => ?START, 'end' => ?END}};
+        false -> not_detected
+    end.
 
 %% =============================================================================
 %% parse

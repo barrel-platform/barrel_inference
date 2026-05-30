@@ -408,39 +408,33 @@ loader_opts(Quant, Ctx, Tpl, IsEmbed) ->
 cap_ctx(undefined) -> undefined;
 cap_ctx(N) when is_integer(N) -> min(N, ?DEFAULT_PULL_MAX_CTX).
 
-maybe_merge_tool_call(Base, undefined) ->
+maybe_merge_tool_call(Base, not_detected) ->
     Base;
-maybe_merge_tool_call(Base, {Name, undefined, undefined}) ->
-    %% Marker-less family (e.g. `llama-pythonic'): the family opts into
-    %% the handlers' post-parse path on `buf_text' rather than the
-    %% engine's native marker capture, so the manifest carries only
-    %% the format name. No `tool_call_markers' is set, which keeps
+maybe_merge_tool_call(Base, {ok, Name, undefined}) ->
+    %% Marker-less family (e.g. `llama-pythonic', `phi4-functools'):
+    %% the family opts into the handlers' post-parse path on
+    %% `buf_text' rather than the engine's native marker capture,
+    %% so the manifest carries only the format name. No
+    %% `tool_call_markers' is set, which keeps
     %% `barrel_inference_server_tool_format:native_turn/1' returning
-    %% `none' for the request - the request still streams normally and
-    %% the handler post-parses on done.
+    %% `none' for the request - the request still streams normally
+    %% and the handler post-parses on done.
     Base#{<<"tool_call_format">> => Name};
-maybe_merge_tool_call(Base, {Name, Start, End}) ->
+maybe_merge_tool_call(Base, {ok, Name, #{start := Start, 'end' := End}}) ->
+    Markers0 = #{<<"start">> => Start, <<"end">> => End},
+    %% Optional family-supplied extras (currently only
+    %% `mistral-args' returns `#{<<"payload_start">> => <<"[ARGS]">>}',
+    %% which flips the engine's greedy syntax sampler to the
+    %% request's normal sampler for the args span).
+    Markers =
+        case barrel_inference_server_tool_format:payload_markers(Name) of
+            undefined -> Markers0;
+            Extra -> maps:merge(Markers0, Extra)
+        end,
     Base#{
         <<"tool_call_format">> => Name,
-        <<"tool_call_markers">> => maybe_add_payload_markers(
-            #{
-                <<"start">> => Start,
-                <<"end">> => End
-            },
-            Name
-        )
+        <<"tool_call_markers">> => Markers
     }.
-
-%% Per-family payload markers: `mistral-args` uses `[ARGS]` as the inner
-%% separator between the function name and the JSON arguments. The
-%% engine treats `[ARGS]` as `payload_start`, which flips sampling from
-%% the greedy syntax sampler to the request's normal sampler for the
-%% rest of the span - without this the greedy sampler tends to lock
-%% onto `[TOOL_CALLS]` after the args close and spam empty calls.
-maybe_add_payload_markers(M, <<"mistral-args">>) ->
-    M#{<<"payload_start">> => <<"[ARGS]">>};
-maybe_add_payload_markers(M, _) ->
-    M.
 
 maybe_merge_thinking(Base, undefined) ->
     Base;
@@ -452,125 +446,22 @@ maybe_merge_thinking(Base, {Start, End}) ->
         }
     }.
 
-%% Scan the GGUF chat_template for the wire-format markers each
-%% known family uses. First hit wins (none of the four overlap in
-%% practice). Templates that match none fall through, leaving the
-%% loader without `tool_call_markers' / `tool_call_format' so the
-%% engine uses the legacy GBNF `text-response | tool-N' grammar.
-%% Mirrors Ollama's auto-detect-at-pull-time pattern.
+%% Chat-template detection dispatch. Each format family declares
+%% its own `detect/1' callback in
+%% `apps/barrel_inference_server/src/tool_formats/'; the
+%% `barrel_inference_server_tool_format' behaviour walks the
+%% include-file family list top to bottom and returns the first
+%% `{detected, _}' match. Templates that match none fall through,
+%% leaving the loader without `tool_call_markers' /
+%% `tool_call_format' so the engine uses the legacy GBNF
+%% `text-response | tool-N' grammar. Mirrors Ollama's
+%% auto-detect-at-pull-time pattern.
 detect_tool_call_format(undefined) ->
-    undefined;
+    not_detected;
 detect_tool_call_format(<<>>) ->
-    undefined;
+    not_detected;
 detect_tool_call_format(Template) when is_binary(Template) ->
-    Candidates = [
-        {<<"qwen-xml">>, <<"<tool_call>">>, <<"</tool_call>">>},
-        {<<"dsml">>, <<"<｜tool▁call▁begin｜>"/utf8>>, <<"<｜tool▁call▁end｜>"/utf8>>},
-        {<<"llama-python-tag">>, <<"<|python_tag|>">>, <<"<|eom_id|>">>},
-        {<<"mistral-tool-calls">>, <<"[TOOL_CALLS]">>, <<"</s>">>}
-    ],
-    %% Qwen3-Coder shares the `<tool_call>' markers with Qwen2.5 but emits a
-    %% nested `<function=...><parameter=...>' body, not JSON-in-tags. Both
-    %% templates contain `<tool_call>', so the generic scan would always pick
-    %% `qwen-xml'; the `<function=' literal is unique to the Qwen3-Coder call
-    %% format, so check it first.
-    %%
-    %% Mistral's tekken-tokenizer families (Devstral-2-2512,
-    %% Mistral-Small-3.x, Magistral, Ministral, recent Codestral) emit
-    %% `[TOOL_CALLS]<name>[ARGS]<json>' per call (with `</s>' only at the
-    %% very end). The old `mistral-tool-calls' family parses the v3 JSON-
-    %% array shape; both contain `[TOOL_CALLS]', so disambiguate by the
-    %% `[ARGS]' marker, checked BEFORE the generic candidate scan.
-    %% Llama 3.2 (1B, 3B) and Llama 3.3 70B Instruct emit zero-shot tool
-    %% calls as a pythonic call list `[func(args), ...]<|eot_id|>',
-    %% without the Llama 3.1 `<|python_tag|>...<|eom_id|>' envelope. The
-    %% chat templates for these models mention `pythonic' or `python
-    %% list' in their tool instructions and do NOT carry `<|python_tag|>'.
-    %% Disambiguate from 3.1 by the absence of `<|python_tag|>'. The
-    %% family is marker-less (no engine-side capture); the return tuple
-    %% carries `undefined' marker fields and `maybe_merge_tool_call/2'
-    %% emits `tool_call_format' WITHOUT `tool_call_markers'.
-    %%
-    %% Special-case detectors run BEFORE the generic candidate scan;
-    %% each is a `{Predicate, ReturnTuple}' pair walked in order, first
-    %% match wins. Generic scan falls through when no special-case
-    %% predicate matches.
-    SpecialCases = [
-        {fun is_qwen3_coder_template/1, {<<"qwen3-coder">>, <<"<tool_call>">>, <<"</tool_call>">>}},
-        {fun is_glm45_template/1, {<<"glm45">>, <<"<tool_call>">>, <<"</tool_call>">>}},
-        {fun is_mistral_args_template/1, {<<"mistral-args">>, <<"[TOOL_CALLS]">>, <<"</s>">>}},
-        {fun is_llama_pythonic_template/1, {<<"llama-pythonic">>, undefined, undefined}},
-        {fun is_phi4_functools_template/1, {<<"phi4-functools">>, undefined, undefined}}
-    ],
-    case first_matching_special(SpecialCases, Template) of
-        {ok, Result} -> Result;
-        none -> first_match_marker(Template, Candidates)
-    end.
-
-first_matching_special([], _Template) ->
-    none;
-first_matching_special([{Pred, Result} | Rest], Template) ->
-    case Pred(Template) of
-        true -> {ok, Result};
-        false -> first_matching_special(Rest, Template)
-    end.
-
-is_qwen3_coder_template(Template) ->
-    binary:match(Template, <<"<tool_call>">>) =/= nomatch andalso
-        binary:match(Template, <<"<function=">>) =/= nomatch.
-
-%% GLM-4.5 / 4.5-Air / 4.6 (wire-identical). The chat template emits
-%% the literal `<tool_call>NAME\n<arg_key>...</arg_key>\n
-%% <arg_value>...</arg_value>...</tool_call>' shape. Both `<tool_call>'
-%% and `<arg_key>' together uniquely identify GLM-4.x: qwen3-coder
-%% shares `<tool_call>' but uses `<function=...>' for the body, not
-%% `<arg_key>'. GLM-4.7 diverges; future `glm47' family.
-is_glm45_template(Template) ->
-    binary:match(Template, <<"<tool_call>">>) =/= nomatch andalso
-        binary:match(Template, <<"<arg_key>">>) =/= nomatch.
-
-%% Llama 3.2 / 3.3 zero-shot pythonic detection. Templates that have
-%% `<|python_tag|>' (Llama 3.1's signature marker) continue to detect
-%% as `llama-python-tag'. Templates that do NOT have `<|python_tag|>'
-%% AND mention pythonic format detect as the new `llama-pythonic'
-%% family. `<|eot_id|>' is present in every Llama 3.x template and is
-%% used here as a Llama-family anchor.
-is_llama_pythonic_template(Template) ->
-    Has = fun(M) -> binary:match(Template, M) =/= nomatch end,
-    Has(<<"<|eot_id|>">>) andalso
-        not Has(<<"<|python_tag|>">>) andalso
-        (Has(<<"pythonic">>) orelse Has(<<"python list">>)).
-
-%% Phi-4-mini-instruct / Phi-4-multimodal-instruct. The chat template
-%% renders the literal `functools[' prefix for tool-call output AND
-%% wraps the SYSTEM-block tool declarations in `<|tool|>...<|/tool|>'
-%% (vocab IDs 200023 / 200024). Both markers together uniquely
-%% identify Phi-4 with tool calling - matching just `functools[' would
-%% false-positive on prose templates that mention the token.
-is_phi4_functools_template(Template) ->
-    binary:match(Template, <<"functools[">>) =/= nomatch andalso
-        binary:match(Template, <<"<|tool|>">>) =/= nomatch.
-
-%% Require `[ARGS]' to appear AFTER `[TOOL_CALLS]' in the template (not
-%% just anywhere), so an old-Mistral template that mentions `[ARGS]' in
-%% surrounding instructions or documentation cannot get misclassified
-%% as the new format.
-is_mistral_args_template(Template) ->
-    case binary:match(Template, <<"[TOOL_CALLS]">>) of
-        nomatch ->
-            false;
-        {P, L} ->
-            After = binary:part(Template, P + L, byte_size(Template) - (P + L)),
-            binary:match(After, <<"[ARGS]">>) =/= nomatch
-    end.
-
-first_match_marker(_, []) ->
-    undefined;
-first_match_marker(Template, [{Name, Start, End} | Rest]) ->
-    case binary:match(Template, Start) of
-        nomatch -> first_match_marker(Template, Rest);
-        _ -> {Name, Start, End}
-    end.
+    barrel_inference_server_tool_format:detect(Template).
 
 %% Scan the chat_template for known reasoning-block delimiters.
 %% Two families ship today: `<think>...</think>' (Qwen3, QwQ,

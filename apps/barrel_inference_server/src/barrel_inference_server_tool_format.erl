@@ -12,9 +12,18 @@
 -module(barrel_inference_server_tool_format).
 
 -include("barrel_inference_server.hrl").
+-include("barrel_inference_server_tool_formats.hrl").
 
 -export([lookup/1, parse/2, parse_all/2, canonicalise/2]).
 -export([native_turn/1, native_render/1, render/3, markers/1, scanner_for/1]).
+%% Family list + dispatch derived from the include-file macro
+%% `?BARREL_TOOL_FORMAT_FAMILIES'. Single source of truth: the macro
+%% governs both the registry map (`formats/0' below, seeded into
+%% `barrel_inference_server_config' persistent_term at boot) and the
+%% chat-template detection order (`detect/1' walks the list top to
+%% bottom; the first family whose `detect/1' returns `{detected, _}'
+%% wins).
+-export([families/0, formats/0, detect/1, payload_markers/1]).
 %% Shared rendering helpers for the per-family render_prompt/2 callbacks.
 -export([tool_signatures/1, append_system/2]).
 %% Shared parse-side tolerance helpers used by the per-family parse/1
@@ -34,17 +43,53 @@
 %% the handler can call `Mod:parse_all/1' on the buffered text.
 -export([post_parse_mode/1, module_of/1]).
 
+%% Family name as written in the manifest's `loader.tool_call_format'
+%% field and used as the registry-map key. Must round-trip.
+-callback family_name() -> binary().
+
+%% Chat-template detection. Called once per `pull' on the GGUF
+%% chat_template. Returns the `tool_call_markers' pair the engine
+%% should configure (or `undefined' for marker-less families that
+%% opt into the handler post-parse path); `not_detected' means the
+%% template is not from this family.
+-callback detect(Template :: binary()) ->
+    {detected, Markers :: #{start := binary(), 'end' := binary()} | undefined}
+    | not_detected.
+
+%% Required: shape parsing for one captured call body.
 -callback parse(binary()) -> {ok, map()} | {error, term()}.
+
+%% Required: re-render a `#{name, arguments}' map back into the
+%% family's wire shape (for message-history exact replay).
 -callback canonicalise(map()) -> binary().
-%% Optional: render the family's native tool system block (with schemas)
-%% so the model emits its native tool-call syntax on free decode. A
-%% family that implements this opts its models into the no-grammar
-%% native path (see native_render/1); the rendered call syntax MUST
-%% match the family's `loader.tool_call_markers' or the engine's
-%% marker capture won't fire.
+
+%% Optional: extra marker fields the engine wants alongside
+%% `{start, end}'. Currently only `mistral-args' returns
+%% `#{<<"payload_start">> => <<"[ARGS]">>}'; everyone else either
+%% doesn't export this callback or returns `undefined'.
+-callback payload_markers() -> #{binary() => binary()} | undefined.
+
+%% Optional: render the family's native tool system block (with
+%% schemas) so the model emits its native tool-call syntax on free
+%% decode. A family that implements this opts its models into the
+%% no-grammar native path (see `native_render/1'); the rendered
+%% call syntax MUST match the family's `loader.tool_call_markers'
+%% or the engine's marker capture won't fire.
 -callback render_prompt([tool()], binary() | undefined) -> binary().
 
--optional_callbacks([render_prompt/2]).
+%% Optional: marker-less families opt into the handler post-parse
+%% path. `post_parse_mode/0' returns an atom (e.g. `pythonic',
+%% `functools') and `parse_all/1' parses the full buffered
+%% response into a list of calls.
+-callback parse_all(binary()) -> {ok, [map()]} | {error, term()}.
+-callback post_parse_mode() -> atom().
+
+-optional_callbacks([
+    payload_markers/0,
+    render_prompt/2,
+    parse_all/1,
+    post_parse_mode/0
+]).
 
 -type spec() :: #{module := module(), _ => _}.
 
@@ -77,6 +122,70 @@ lookup_format(FormatName) ->
             {ok, Spec};
         _ ->
             not_found
+    end.
+
+%% =============================================================================
+%% Family list + registry + detection dispatch (from the include macro)
+%% =============================================================================
+
+%% Ordered list of registered family modules. The include-file macro
+%% `?BARREL_TOOL_FORMAT_FAMILIES' is the single source of truth;
+%% adding a new family is one new module under
+%% `src/tool_formats/' plus one new line in
+%% `include/barrel_inference_server_tool_formats.hrl'.
+-spec families() -> [module()].
+families() ->
+    ?BARREL_TOOL_FORMAT_FAMILIES.
+
+%% Registry map (`<<family_name>>' -> `#{module := Mod}') built off
+%% the include-file family list. Used by
+%% `barrel_inference_server_config' to seed the `tool_call_formats'
+%% persistent_term at boot AND as the fallback when the
+%% persistent_term has not yet been written (dev shell / early
+%% eunit).
+-spec formats() -> #{binary() => #{module := module()}}.
+formats() ->
+    maps:from_list(
+        [{Mod:family_name(), #{module => Mod}} || Mod <- families()]
+    ).
+
+%% Chat-template detection dispatch. Walks the include-file family
+%% list top to bottom and returns the first family whose `detect/1'
+%% returns `{detected, _}'. List position IS the priority - specific
+%% predicates (multi-substring) precede generic ones (single
+%% substring); `bare-json' sits last and never auto-detects.
+-spec detect(binary()) ->
+    {ok, FamilyName :: binary(), Markers :: #{start := binary(), 'end' := binary()} | undefined}
+    | not_detected.
+detect(Template) when is_binary(Template) ->
+    detect_first(families(), Template).
+
+detect_first([], _Template) ->
+    not_detected;
+detect_first([Mod | Rest], Template) ->
+    case Mod:detect(Template) of
+        {detected, Markers} ->
+            {ok, Mod:family_name(), Markers};
+        not_detected ->
+            detect_first(Rest, Template)
+    end.
+
+%% Optional extra-marker lookup by family name. Currently only
+%% `mistral-args' returns a non-empty map
+%% (`#{<<"payload_start">> => <<"[ARGS]">>}'); everyone else either
+%% doesn't export `payload_markers/0' or returns `undefined'.
+%% Looked up by name (binary) so `models.erl' can merge the extras
+%% without holding the module atom.
+-spec payload_markers(binary()) -> #{binary() => binary()} | undefined.
+payload_markers(Name) when is_binary(Name) ->
+    case lookup_format(Name) of
+        {ok, #{module := Mod}} ->
+            case erlang:function_exported(Mod, payload_markers, 0) of
+                true -> Mod:payload_markers();
+                false -> undefined
+            end;
+        not_found ->
+            undefined
     end.
 
 %% Dispatch the parse to the format module.

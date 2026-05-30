@@ -30,9 +30,23 @@
 -behaviour(barrel_inference_server_tool_format).
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
+-export([family_name/0, detect/1]).
 
 -define(START, <<"[TOOL_CALLS]">>).
 -define(EOS, <<"</s>">>).
+
+family_name() -> <<"mistral-tool-calls">>.
+
+%% Generic Mistral v3 JSON-array shape. Templates that ALSO carry
+%% `[ARGS]' after `[TOOL_CALLS]' detect as `mistral-args' (the
+%% tekken-tokenizer fine-tunes); this family is the fall-through.
+-spec detect(binary()) ->
+    {detected, #{start := binary(), 'end' := binary()}} | not_detected.
+detect(T) when is_binary(T) ->
+    case binary:match(T, ?START) of
+        nomatch -> not_detected;
+        _ -> {detected, #{start => ?START, 'end' => ?EOS}}
+    end.
 
 %% Native tool system block matching the Mistral v3 tokenizer chat
 %% template: tools as a JSON array inside [AVAILABLE_TOOLS]...

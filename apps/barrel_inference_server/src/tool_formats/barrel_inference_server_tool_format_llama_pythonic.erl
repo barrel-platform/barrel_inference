@@ -33,8 +33,27 @@
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
 -export([parse_all/1, post_parse_mode/0]).
+-export([family_name/0, detect/1]).
 
 -define(EOT, <<"<|eot_id|>">>).
+
+family_name() -> <<"llama-pythonic">>.
+
+%% Llama 3.2 / 3.3 zero-shot pythonic. Llama templates that have
+%% `<|python_tag|>' continue to detect as `llama-python-tag'; this
+%% family requires `<|eot_id|>' (every Llama 3.x template has it)
+%% AND the absence of `<|python_tag|>' AND a pythonic / python-list
+%% mention in the tool instructions.
+-spec detect(binary()) -> {detected, undefined} | not_detected.
+detect(T) when is_binary(T) ->
+    Has = fun(M) -> binary:match(T, M) =/= nomatch end,
+    HasEot = Has(?EOT),
+    HasPyTag = Has(<<"<|python_tag|>">>),
+    HasPythonic = Has(<<"pythonic">>) orelse Has(<<"python list">>),
+    case HasEot andalso not HasPyTag andalso HasPythonic of
+        true -> {detected, undefined};
+        false -> not_detected
+    end.
 
 %% =============================================================================
 %% Behaviour callbacks

@@ -29,10 +29,39 @@
 -behaviour(barrel_inference_server_tool_format).
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
+-export([family_name/0, detect/1, payload_markers/0]).
 
 -define(START, <<"[TOOL_CALLS]">>).
 -define(ARGS, <<"[ARGS]">>).
 -define(EOS, <<"</s>">>).
+
+family_name() -> <<"mistral-args">>.
+
+%% The engine treats `[ARGS]' as the payload boundary, flipping
+%% sampling from the greedy syntax sampler to the request's normal
+%% sampler for the rest of the span.
+payload_markers() ->
+    #{<<"payload_start">> => ?ARGS}.
+
+%% Mistral tekken-tokenizer families (Devstral-2-2512, Mistral-Small-3.x,
+%% Magistral, Ministral, recent Codestral) emit
+%% `[TOOL_CALLS]<name>[ARGS]<json>'. Disambiguated from the older
+%% JSON-array `mistral-tool-calls' by requiring `[ARGS]' to appear
+%% AFTER `[TOOL_CALLS]' (the order rules out templates that mention
+%% `[ARGS]' in their pre-call instructions or documentation).
+-spec detect(binary()) ->
+    {detected, #{start := binary(), 'end' := binary()}} | not_detected.
+detect(T) when is_binary(T) ->
+    case binary:match(T, ?START) of
+        nomatch ->
+            not_detected;
+        {P, L} ->
+            After = binary:part(T, P + L, byte_size(T) - (P + L)),
+            case binary:match(After, ?ARGS) of
+                nomatch -> not_detected;
+                _ -> {detected, #{start => ?START, 'end' => ?EOS}}
+            end
+    end.
 
 %% Native tool system block: the tekken chat template wraps tool
 %% signatures in [AVAILABLE_TOOLS]...[/AVAILABLE_TOOLS] and instructs

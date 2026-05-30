@@ -273,3 +273,30 @@ other_family_post_parse_mode_defaults_to_none_test() ->
         none,
         barrel_inference_server_tool_format:post_parse_mode(Spec)
     ).
+
+%% =============================================================================
+%% family_name/0 + detect/1
+%% =============================================================================
+
+llama_pythonic_family_name_test() ->
+    ?assertEqual(<<"llama-pythonic">>, ?M:family_name()).
+
+llama_pythonic_detect_positive_test() ->
+    Template = <<
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+        "When the user asks for a tool, respond in pythonic format: "
+        "[func_name(arg=value)]<|eot_id|>"
+    >>,
+    ?assertEqual({detected, undefined}, ?M:detect(Template)).
+
+llama_pythonic_detect_negative_with_python_tag_test() ->
+    %% Llama 3.1 templates carry `<|python_tag|>'; they must keep
+    %% detecting as `llama-python-tag', not as `llama-pythonic'.
+    Template = <<"Use <|python_tag|>{...}<|eom_id|> to call. <|eot_id|>">>,
+    ?assertEqual(not_detected, ?M:detect(Template)).
+
+llama_pythonic_detect_negative_without_pythonic_mention_test() ->
+    %% `<|eot_id|>' alone with no pythonic / python-list mention
+    %% must NOT detect.
+    Template = <<"Generic Llama template. <|eot_id|>">>,
+    ?assertEqual(not_detected, ?M:detect(Template)).

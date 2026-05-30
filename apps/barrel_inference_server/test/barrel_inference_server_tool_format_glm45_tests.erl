@@ -209,3 +209,24 @@ glm45_registry_dispatch_test() ->
         {ok, #{name => <<"a">>, arguments => #{<<"k">> => <<"v">>}}},
         barrel_inference_server_tool_format:parse(Spec, Bin)
     ).
+
+%% =============================================================================
+%% family_name/0 + detect/1
+%% =============================================================================
+
+glm45_family_name_test() ->
+    ?assertEqual(<<"glm45">>, ?M:family_name()).
+
+glm45_detect_positive_test() ->
+    Template =
+        <<"...<tool_call>f\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>\n</tool_call>...">>,
+    ?assertEqual(
+        {detected, #{start => <<"<tool_call>">>, 'end' => <<"</tool_call>">>}},
+        ?M:detect(Template)
+    ).
+
+glm45_detect_negative_test() ->
+    %% A qwen3-coder template carries `<tool_call>' AND `<function='
+    %% but NOT `<arg_key>'; glm45 must NOT detect it.
+    Template = <<"<tool_call>\n<function=foo>\n</function>\n</tool_call>">>,
+    ?assertEqual(not_detected, ?M:detect(Template)).

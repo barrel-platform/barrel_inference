@@ -149,3 +149,20 @@ mistral_registry_dispatch_test() ->
         {ok, #{name => <<"a">>, arguments => #{}}},
         barrel_inference_server_tool_format:parse(Spec, Bin)
     ).
+
+%% =============================================================================
+%% family_name/0 + detect/1
+%% =============================================================================
+
+mistral_tool_calls_family_name_test() ->
+    ?assertEqual(<<"mistral-tool-calls">>, ?MISTRAL:family_name()).
+
+mistral_tool_calls_detect_positive_test() ->
+    Template = <<"... [TOOL_CALLS][{\"name\":\"f\",\"arguments\":{}}] ...">>,
+    ?assertEqual(
+        {detected, #{start => <<"[TOOL_CALLS]">>, 'end' => <<"</s>">>}},
+        ?MISTRAL:detect(Template)
+    ).
+
+mistral_tool_calls_detect_negative_test() ->
+    ?assertEqual(not_detected, ?MISTRAL:detect(<<"{% for x in y %}{{ x }}{% endfor %}">>)).
