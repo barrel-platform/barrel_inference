@@ -182,3 +182,23 @@ phi4_shared_post_parse_mode_helper_test() ->
         functools,
         barrel_inference_server_tool_format:post_parse_mode(Spec)
     ).
+
+%% =============================================================================
+%% family_name/0 + detect/1
+%% =============================================================================
+
+phi4_family_name_test() ->
+    ?assertEqual(<<"phi4-functools">>, ?M:family_name()).
+
+phi4_detect_positive_test() ->
+    Template = <<
+        "<|system|>You are an assistant.<|tool|>[{\"name\":\"f\"}]<|/tool|><|end|>"
+        "<|assistant|>To call a tool, emit functools[{\"name\": <f>, \"arguments\": <args>}]"
+    >>,
+    ?assertEqual({detected, undefined}, ?M:detect(Template)).
+
+phi4_detect_negative_test() ->
+    %% `functools[' as prose without the `<|tool|>' declaration
+    %% marker must NOT detect.
+    Template = <<"Random documentation mentioning functools[1,2,3].">>,
+    ?assertEqual(not_detected, ?M:detect(Template)).

@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- Tool-call format families now live under
+  `apps/barrel_inference_server/src/tool_formats/` and the registered
+  set is the single ordered list in
+  `apps/barrel_inference_server/include/barrel_inference_server_tool_formats.hrl`
+  (macro `?BARREL_TOOL_FORMAT_FAMILIES`). Adding a new family is now
+  exactly two files: one new module in the subfolder, one new line in
+  the include list. The behaviour gains four new callbacks:
+  `family_name/0`, `detect/1` (chat-template predicate + marker pair),
+  and optional `payload_markers/0` (currently only `mistral-args`
+  ships extras); `parse_all/1` and `post_parse_mode/0` are also
+  declared as optional callbacks (the marker-less post-parse path).
+  Both the registry map (`barrel_inference_server_tool_format:formats/0`)
+  and the detection dispatch (`barrel_inference_server_tool_format:detect/1`)
+  derive from the include macro; the `default_tool_call_formats/0`
+  hand-rolled map and the inline `Candidates` / `SpecialCases` +
+  `is_*_template/1` predicates in
+  `barrel_inference_server_models:detect_tool_call_format/1` (plus
+  `maybe_add_payload_markers/2`) are gone. No observable runtime
+  behaviour change; no manifest / config / CI shape change. The
+  `tool_call_formats` app env merge for operator-supplied custom
+  families is preserved.
+
 ### Added
 
 - New `glm45` tool-call format family. Covers zai-org / THUDM GLM-4.5,

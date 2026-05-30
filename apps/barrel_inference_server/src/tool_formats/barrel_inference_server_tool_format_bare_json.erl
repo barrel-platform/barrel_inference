@@ -22,6 +22,15 @@
 -behaviour(barrel_inference_server_tool_format).
 
 -export([parse/1, canonicalise/1]).
+-export([family_name/0, detect/1]).
+
+family_name() -> <<"bare-json">>.
+
+%% Runtime-configured catch-all. Never auto-detected from a
+%% chat_template; operators wire `bare-json' explicitly on the
+%% loader manifest (or via the `tool_call_formats' app env merge).
+-spec detect(binary()) -> not_detected.
+detect(_Template) -> not_detected.
 
 -spec parse(binary()) -> {ok, map()} | {error, term()}.
 parse(Bin) when is_binary(Bin) ->

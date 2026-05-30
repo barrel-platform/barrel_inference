@@ -195,3 +195,23 @@ dsml_registry_dispatch_test() ->
         {ok, #{name => <<"a">>, arguments => #{}}},
         barrel_inference_server_tool_format:parse(Spec, Bin)
     ).
+
+%% =============================================================================
+%% family_name/0 + detect/1
+%% =============================================================================
+
+dsml_family_name_test() ->
+    ?assertEqual(<<"dsml">>, ?DSML:family_name()).
+
+dsml_detect_positive_test() ->
+    Template = <<"...<｜tool▁call▁begin｜>{...}<｜tool▁call▁end｜>..."/utf8>>,
+    ?assertEqual(
+        {detected, #{
+            start => <<"<｜tool▁call▁begin｜>"/utf8>>,
+            'end' => <<"<｜tool▁call▁end｜>"/utf8>>
+        }},
+        ?DSML:detect(Template)
+    ).
+
+dsml_detect_negative_test() ->
+    ?assertEqual(not_detected, ?DSML:detect(<<"{% for x in y %}{{ x }}{% endfor %}">>)).

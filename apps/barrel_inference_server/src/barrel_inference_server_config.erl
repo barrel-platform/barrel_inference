@@ -174,36 +174,19 @@ anthropic_retry_after_seconds() ->
     persistent_term:get({?MODULE, anthropic_retry_after_seconds}, 5).
 
 %% Per-format tool-call registry used by barrel_inference_server_tool_format.
-%% Built-in defaults cover the open-weights families barrel_inference_server
-%% ships parsers for; operators may merge additional entries via the
-%% `tool_call_formats` app env (the init merge keeps both).
+%% Built-in defaults derive from the include-file family list in
+%% `barrel_inference_server_tool_format:formats/0' (single source of
+%% truth: `include/barrel_inference_server_tool_formats.hrl');
+%% operators may merge additional entries via the `tool_call_formats'
+%% app env (the init merge keeps both). The persistent_term fallback
+%% also delegates to the family list so registry lookups work in
+%% dev shell / early eunit before the boot init has run.
 -spec tool_call_formats() -> #{binary() => map()}.
 tool_call_formats() ->
-    persistent_term:get({?MODULE, tool_call_formats}, default_tool_call_formats()).
-
-default_tool_call_formats() ->
-    #{
-        <<"qwen-xml">> => #{module => barrel_inference_server_tool_format_qwen_xml},
-        <<"qwen3-coder">> => #{module => barrel_inference_server_tool_format_qwen3_coder},
-        <<"glm45">> => #{module => barrel_inference_server_tool_format_glm45},
-        <<"dsml">> => #{module => barrel_inference_server_tool_format_dsml},
-        <<"llama-python-tag">> => #{
-            module => barrel_inference_server_tool_format_llama_python_tag
-        },
-        <<"llama-pythonic">> => #{
-            module => barrel_inference_server_tool_format_llama_pythonic
-        },
-        <<"phi4-functools">> => #{
-            module => barrel_inference_server_tool_format_phi4_functools
-        },
-        <<"mistral-tool-calls">> => #{
-            module => barrel_inference_server_tool_format_mistral_tool_calls
-        },
-        <<"mistral-args">> => #{
-            module => barrel_inference_server_tool_format_mistral_args
-        },
-        <<"bare-json">> => #{module => barrel_inference_server_tool_format_bare_json}
-    }.
+    persistent_term:get(
+        {?MODULE, tool_call_formats},
+        barrel_inference_server_tool_format:formats()
+    ).
 
 %% Registry of server-side built-in tool executors used by
 %% barrel_inference_server_tool_executor. Keyed by the OpenAI built-in tool
@@ -401,7 +384,10 @@ init([]) ->
     ),
     persistent_term:put(
         {?MODULE, tool_call_formats},
-        maps:merge(default_tool_call_formats(), app_env(tool_call_formats, #{}))
+        maps:merge(
+            barrel_inference_server_tool_format:formats(),
+            app_env(tool_call_formats, #{})
+        )
     ),
     persistent_term:put(
         {?MODULE, builtin_tool_executors},

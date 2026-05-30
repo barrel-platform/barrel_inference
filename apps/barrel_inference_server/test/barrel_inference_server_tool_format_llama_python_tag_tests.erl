@@ -144,3 +144,20 @@ llama_registry_dispatch_test() ->
         {ok, #{name => <<"a">>, arguments => #{}}},
         barrel_inference_server_tool_format:parse(Spec, Bin)
     ).
+
+%% =============================================================================
+%% family_name/0 + detect/1
+%% =============================================================================
+
+llama_python_tag_family_name_test() ->
+    ?assertEqual(<<"llama-python-tag">>, ?LLAMA:family_name()).
+
+llama_python_tag_detect_positive_test() ->
+    Template = <<"... <|python_tag|>foo(bar)<|eom_id|> ...">>,
+    ?assertEqual(
+        {detected, #{start => <<"<|python_tag|>">>, 'end' => <<"<|eom_id|>">>}},
+        ?LLAMA:detect(Template)
+    ).
+
+llama_python_tag_detect_negative_test() ->
+    ?assertEqual(not_detected, ?LLAMA:detect(<<"Some Llama template without the python tag.">>)).

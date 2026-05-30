@@ -83,3 +83,24 @@ canonicalise_round_trips_test() ->
 canonicalise_typed_values_round_trip_test() ->
     Call = #{name => <<"search">>, arguments => #{<<"limit">> => 50, <<"verbose">> => true}},
     ?assertEqual({ok, Call}, ?M:parse(?M:canonicalise(Call))).
+
+%% =============================================================================
+%% family_name/0 + detect/1
+%% =============================================================================
+
+qwen3_coder_family_name_test() ->
+    ?assertEqual(<<"qwen3-coder">>, ?M:family_name()).
+
+qwen3_coder_detect_positive_test() ->
+    Template =
+        <<"<tool_call>\n<function=foo>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>">>,
+    ?assertEqual(
+        {detected, #{start => <<"<tool_call>">>, 'end' => <<"</tool_call>">>}},
+        ?M:detect(Template)
+    ).
+
+qwen3_coder_detect_negative_test() ->
+    %% Plain qwen-xml template (no `<function=') must NOT detect as
+    %% qwen3-coder.
+    Template = <<"<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>">>,
+    ?assertEqual(not_detected, ?M:detect(Template)).

@@ -23,9 +23,23 @@
 -behaviour(barrel_inference_server_tool_format).
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
+-export([family_name/0, detect/1]).
 
 -define(START, <<"<|python_tag|>">>).
 -define(END, <<"<|eom_id|>">>).
+
+family_name() -> <<"llama-python-tag">>.
+
+%% Llama 3.1 carries the `<|python_tag|>' marker; 3.2 / 3.3 use the
+%% marker-less pythonic family (`llama-pythonic') which sits earlier
+%% in `?BARREL_TOOL_FORMAT_FAMILIES'.
+-spec detect(binary()) ->
+    {detected, #{start := binary(), 'end' := binary()}} | not_detected.
+detect(T) when is_binary(T) ->
+    case binary:match(T, ?START) of
+        nomatch -> not_detected;
+        _ -> {detected, #{start => ?START, 'end' => ?END}}
+    end.
 
 %% Native tool system block matching the Llama 3.1 JSON tool format.
 %% Llama uses `parameters' (not `arguments') as the args key and emits

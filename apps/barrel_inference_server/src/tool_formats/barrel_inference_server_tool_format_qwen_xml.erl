@@ -12,9 +12,25 @@
 -behaviour(barrel_inference_server_tool_format).
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
+-export([family_name/0, detect/1]).
 
 -define(START, <<"<tool_call>">>).
 -define(END, <<"</tool_call>">>).
+
+family_name() -> <<"qwen-xml">>.
+
+%% Generic `<tool_call>...</tool_call>' shape (Qwen2.5 / Qwen3
+%% lineage). Specific siblings (`qwen3-coder', `glm45') sit earlier
+%% in `?BARREL_TOOL_FORMAT_FAMILIES' so they win when their extra
+%% substring is present; this single-substring predicate is the
+%% fall-through.
+-spec detect(binary()) ->
+    {detected, #{start := binary(), 'end' := binary()}} | not_detected.
+detect(T) when is_binary(T) ->
+    case binary:match(T, ?START) of
+        nomatch -> not_detected;
+        _ -> {detected, #{start => ?START, 'end' => ?END}}
+    end.
 
 %% Native tool system block matching the Qwen2.5 / Qwen3 chat template:
 %% function signatures inside <tools></tools>, calls emitted as

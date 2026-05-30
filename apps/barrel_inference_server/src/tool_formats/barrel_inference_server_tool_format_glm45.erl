@@ -36,9 +36,26 @@
 -behaviour(barrel_inference_server_tool_format).
 
 -export([parse/1, canonicalise/1, render_prompt/2]).
+-export([family_name/0, detect/1]).
 
 -define(START, <<"<tool_call>">>).
 -define(END, <<"</tool_call>">>).
+
+family_name() -> <<"glm45">>.
+
+%% GLM-4.5 / 4.5-Air / 4.6 share the `<tool_call>' marker with
+%% qwen-xml and qwen3-coder but emit `<arg_key>' / `<arg_value>'
+%% pairs for arguments; the disambiguator is `<arg_key>'.
+-spec detect(binary()) ->
+    {detected, #{start := binary(), 'end' := binary()}} | not_detected.
+detect(T) when is_binary(T) ->
+    case
+        binary:match(T, ?START) =/= nomatch andalso
+            binary:match(T, <<"<arg_key>">>) =/= nomatch
+    of
+        true -> {detected, #{start => ?START, 'end' => ?END}};
+        false -> not_detected
+    end.
 
 %% =============================================================================
 %% parse
