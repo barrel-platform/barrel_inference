@@ -363,10 +363,17 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
         undefined ->
             %% Captured tool calls (if any) may name server tools; if so,
             %% run them and continue the turn instead of finishing.
-            S2 = maybe_post_parse(
-                flush_scan(Req, demonitor_engine(S1))
-            ),
-            dispatch_done(Req, S2);
+            %% Two fallback paths can populate captured_calls when the
+            %% engine's marker scanner didn't fire: the existing per-
+            %% family `maybe_post_parse' (`llama-pythonic',
+            %% `phi4-functools') and the new autoparser bridge
+            %% (llama.cpp's `common_chat_parse'). Run the family-
+            %% specific one first so existing behaviour is
+            %% preserved; the autoparser only fires when both prior
+            %% paths yielded nothing.
+            S2 = maybe_post_parse(flush_scan(Req, demonitor_engine(S1))),
+            S3 = maybe_autoparser_extract(S2),
+            dispatch_done(Req, S3);
         _ ->
             {ok, Req, demonitor_engine(S1), hibernate}
     end;
@@ -1079,6 +1086,27 @@ maybe_post_parse(
             end
     end;
 maybe_post_parse(S) ->
+    S.
+
+%% Autoparser fallback: when nothing fired through the engine's
+%% marker scanner OR the family post-parse path, attempt to extract
+%% tool calls via llama.cpp's `common_chat_parse'. Translates the
+%% parsed calls into the existing captured-call shape so the dispatch
+%% path is unchanged.
+maybe_autoparser_extract(
+    S = #st{captured_calls = [], model = Model, buf_text = BufText}
+) when S#st.loop_request =/= undefined ->
+    case
+        barrel_inference_server_autoparser:maybe_extract(
+            Model, S#st.loop_request, BufText, openai
+        )
+    of
+        {ok, Calls} ->
+            S#st{captured_calls = Calls, buf_text = []};
+        none ->
+            S
+    end;
+maybe_autoparser_extract(S) ->
     S.
 
 post_parse_call(Spec, Model, #{name := Name, arguments := Args}) ->

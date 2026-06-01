@@ -349,8 +349,10 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
         undefined ->
             %% Captured tool calls (if any) are dispatched here: server
             %% calls continue the turn, client calls finish as function
-            %% call items. No captured calls -> legacy / plain finish.
-            dispatch_done(Req, flush_scan(Req, demonitor_engine(S1)));
+            %% call items. No captured calls -> attempt autoparser
+            %% fallback before the legacy / plain finish path.
+            S2 = maybe_autoparser_extract(flush_scan(Req, demonitor_engine(S1))),
+            dispatch_done(Req, S2);
         _ ->
             %% A server-tool batch is running for this round; the engine
             %% round is done but the turn continues once the results
@@ -535,6 +537,28 @@ flush_scan(_Req, S = #st{tool_scan = undefined}) ->
 flush_scan(Req, S = #st{tool_scan = Scan}) ->
     {Emits, _} = barrel_inference_server_tool_scan:finish(Scan),
     lists:foldl(fun(E, Sx) -> apply_scan_emit(E, Req, Sx) end, S#st{tool_scan = undefined}, Emits).
+
+%% Fallback: when nothing fired through the engine's marker capture
+%% path (captured_calls is empty) AND the request had tools, try
+%% parsing buf_text via llama.cpp's autoparser. The parsed tool
+%% calls (if any) are injected into captured_calls so dispatch_done
+%% routes them through the existing server-exec / client function-
+%% call paths unchanged.
+maybe_autoparser_extract(S = #st{captured_calls = []}) when
+    S#st.loop_request =/= undefined
+->
+    case
+        barrel_inference_server_autoparser:maybe_extract(
+            S#st.model, S#st.loop_request, S#st.buf_text, openai
+        )
+    of
+        {ok, Calls} ->
+            S#st{captured_calls = Calls, buf_text = []};
+        none ->
+            S
+    end;
+maybe_autoparser_extract(S) ->
+    S.
 
 %%====================================================================
 %% Tool-call (wire-driven path; barrel_inference 0.5+)

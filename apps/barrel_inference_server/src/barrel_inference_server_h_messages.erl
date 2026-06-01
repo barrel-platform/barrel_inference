@@ -516,10 +516,9 @@ info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
     S1 = accumulate_stats(S, Stats),
     case S1#st.pending_exec of
         undefined ->
-            S2 = maybe_post_parse(
-                flush_scan(Req, demonitor_engine(S1))
-            ),
-            dispatch_done(Req, S2);
+            S2 = maybe_post_parse(flush_scan(Req, demonitor_engine(S1))),
+            S3 = maybe_autoparser_extract(S2),
+            dispatch_done(Req, S3);
         _ ->
             {ok, Req, demonitor_engine(S1), hibernate}
     end;
@@ -833,6 +832,25 @@ maybe_post_parse(
             end
     end;
 maybe_post_parse(S) ->
+    S.
+
+%% Autoparser fallback (same shape as h_chat). Runs after
+%% `maybe_post_parse' when both the engine's marker scanner and the
+%% per-family post-parse path yielded no tool calls.
+maybe_autoparser_extract(
+    S = #st{captured_calls = [], model = Model, buf_text = BufText}
+) when S#st.loop_request =/= undefined ->
+    case
+        barrel_inference_server_autoparser:maybe_extract(
+            Model, S#st.loop_request, BufText, anthropic
+        )
+    of
+        {ok, Calls} ->
+            S#st{captured_calls = Calls, buf_text = []};
+        none ->
+            S
+    end;
+maybe_autoparser_extract(S) ->
     S.
 
 post_parse_call(Spec, Model, #{name := Name, arguments := Args}) ->

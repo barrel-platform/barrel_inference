@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Autoparser fallback at `barrel_inference_done' for all three handlers
+  (chat / messages / responses). When the engine's per-token marker
+  scanner AND the family `maybe_post_parse' path both yield no tool
+  calls, the new `barrel_inference_server_autoparser:maybe_extract/4'
+  bridge calls `barrel_inference:chat_apply/3' (cached per
+  `(ModelId, ToolsHash)') + `chat_parse/3' on `buf_text' and injects
+  any extracted tool calls into `captured_calls'. Per-family Erlang
+  parsers stay as the primary path for models with markers
+  configured; autoparser only fires when nothing else captured. No
+  manifest change required; no opt-in flag.
+
 ### Changed
 
 - Tool-call format families now live under
