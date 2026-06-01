@@ -101,6 +101,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
+        env:
+          # See ci.yml note: erlef/setup-beam@v1 does not yet recognise
+          # `ubuntu24-arm64' ImageOS; override on the arm runner.
+          ImageOS: ${{ matrix.runner == 'ubuntu-24.04-arm' && 'ubuntu24' || '' }}
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'

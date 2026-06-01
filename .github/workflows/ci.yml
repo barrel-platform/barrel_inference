@@ -97,6 +97,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
+        env:
+          # erlef/setup-beam@v1's image-name lookup table doesn't yet
+          # recognise GitHub's `ubuntu24-arm64' ImageOS value; the
+          # action errors out on that runner unless we override.
+          # Override on the arm runner only; the x86 and macOS runners
+          # use the action's auto-detected default.
+          ImageOS: ${{ matrix.os == 'ubuntu-24.04-arm' && 'ubuntu24' || '' }}
         with:
           otp-version: ${{ matrix.otp }}
           rebar3-version: ${{ env.REBAR3_VERSION }}
