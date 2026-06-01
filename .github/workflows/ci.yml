@@ -100,10 +100,11 @@ jobs:
         env:
           # erlef/setup-beam@v1's image-name lookup table doesn't yet
           # recognise GitHub's `ubuntu24-arm64' ImageOS value; the
-          # action errors out on that runner unless we override.
-          # Override on the arm runner only; the x86 and macOS runners
-          # use the action's auto-detected default.
-          ImageOS: ${{ matrix.os == 'ubuntu-24.04-arm' && 'ubuntu24' || '' }}
+          # action errors out on that runner unless we override. Set
+          # the right ImageOS for every runner so the override stays
+          # explicit (an empty ImageOS would mis-override the auto-
+          # detected default).
+          ImageOS: ${{ fromJSON('{"ubuntu-24.04":"ubuntu24","ubuntu-24.04-arm":"ubuntu24","macos-14":"macos14","macos-15":"macos15"}')[matrix.os] }}
         with:
           otp-version: ${{ matrix.otp }}
           rebar3-version: ${{ env.REBAR3_VERSION }}
