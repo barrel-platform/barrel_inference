@@ -878,15 +878,8 @@ parse_full_bin(Spec, FullBin) ->
             {ok, Name, Args}
     end.
 
-maybe_persist_replay(undefined, _ToolId, _Model, _FullBin, _Name, _Input) ->
-    ok;
-maybe_persist_replay(_Spec, ToolId, Model, FullBin, Name, Input) ->
-    barrel_inference_server_tool_replay:put(
-        ToolId,
-        Model,
-        FullBin,
-        #{name => Name, arguments => Input}
-    ).
+maybe_persist_replay(_Spec, _ToolId, _Model, _FullBin, _Name, _Input) ->
+    ok.
 
 %%====================================================================
 %% Agentic continue-loop (server-executed built-in tools)

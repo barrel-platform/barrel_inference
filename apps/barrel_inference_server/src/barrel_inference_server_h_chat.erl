@@ -1158,15 +1158,10 @@ parse_tool_call_to_map(JsonBin) when is_binary(JsonBin) ->
 parse_tool_call_to_map(_) ->
     {<<"unknown">>, #{}}.
 
-maybe_persist_replay(undefined, _ToolId, _Model, _FullBin, _Name, _Input) ->
-    ok;
-maybe_persist_replay(_Spec, ToolId, Model, FullBin, Name, Input) ->
-    barrel_inference_server_tool_replay:put(
-        ToolId,
-        Model,
-        FullBin,
-        #{name => Name, arguments => Input}
-    ).
+%% tool_replay store deleted; autoparser's chat-template render handles
+%% multi-turn history re-render via the model's own jinja template.
+maybe_persist_replay(_Spec, _ToolId, _Model, _FullBin, _Name, _Input) ->
+    ok.
 
 %%====================================================================
 %% Agentic continue-loop (server-executed built-in tools)

@@ -26,9 +26,6 @@
     tool_call_formats/0,
     builtin_tool_executors/0,
     max_tool_iterations/0,
-    tool_replay_dir/0,
-    tool_replay_ttl_ms/0,
-    tool_replay_gc_interval_ms/0,
     responses_store_ttl_ms/0,
     responses_store_gc_interval_ms/0,
     pool_policy_for/1,
@@ -213,37 +210,6 @@ max_tool_iterations() ->
 
 %% Directory hosting the exact-replay DETS file used by
 %% barrel_inference_server_tool_replay. Defaults to a `replay` sibling of the
-%% model cache root so storage stays grouped with the KV cache.
--spec tool_replay_dir() -> string().
-tool_replay_dir() ->
-    case application:get_env(?APP, tool_replay_dir) of
-        {ok, Path} when Path =/= undefined ->
-            ensure_string(Path);
-        _ ->
-            {ok, Root} = barrel_inference_server_fetch:cache_root(),
-            filename:join(ensure_string(Root), "replay")
-    end.
-
-%% TTL on stored replay rows. Defaults to 30 days, long enough to
-%% outlive typical Claude Code sessions but bounded so the DETS file
-%% doesn't grow without bound.
--spec tool_replay_ttl_ms() -> pos_integer().
-tool_replay_ttl_ms() ->
-    persistent_term:get(
-        {?MODULE, tool_replay_ttl_ms},
-        30 * 24 * 60 * 60 * 1000
-    ).
-
-%% Cadence of the periodic gc that evicts expired replay rows.
-%% Defaults to 1h; the cost of running gc is one ETS select plus a
-%% few dets:delete/2 calls, so the cadence isn't load-bearing.
--spec tool_replay_gc_interval_ms() -> pos_integer().
-tool_replay_gc_interval_ms() ->
-    persistent_term:get(
-        {?MODULE, tool_replay_gc_interval_ms},
-        60 * 60 * 1000
-    ).
-
 %% TTL on stored Responses-API conversations for `previous_response_id'
 %% continuation. Defaults to 1h: long enough for an interactive Codex
 %% session, short enough that the RAM-only map stays bounded.
@@ -261,9 +227,6 @@ responses_store_gc_interval_ms() ->
         {?MODULE, responses_store_gc_interval_ms},
         10 * 60 * 1000
     ).
-
-ensure_string(B) when is_binary(B) -> binary_to_list(B);
-ensure_string(L) when is_list(L) -> L.
 
 -spec tracing_config() -> off | {otlp, binary()}.
 tracing_config() ->
@@ -398,14 +361,6 @@ init([]) ->
     persistent_term:put(
         {?MODULE, max_tool_iterations},
         app_env(max_tool_iterations, 5)
-    ),
-    persistent_term:put(
-        {?MODULE, tool_replay_ttl_ms},
-        app_env(tool_replay_ttl_ms, 30 * 24 * 60 * 60 * 1000)
-    ),
-    persistent_term:put(
-        {?MODULE, tool_replay_gc_interval_ms},
-        app_env(tool_replay_gc_interval_ms, 60 * 60 * 1000)
     ),
     persistent_term:put(
         {?MODULE, responses_store_ttl_ms},

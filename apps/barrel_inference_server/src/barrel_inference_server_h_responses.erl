@@ -603,15 +603,8 @@ parse_tool_call_to_map(JsonBin) when is_binary(JsonBin) ->
 parse_tool_call_to_map(_) ->
     {<<"unknown">>, #{}}.
 
-maybe_persist_replay(undefined, _FcId, _Model, _FullBin, _Name, _Input) ->
-    ok;
-maybe_persist_replay(_Spec, FcId, Model, FullBin, Name, Input) ->
-    barrel_inference_server_tool_replay:put(
-        FcId,
-        Model,
-        FullBin,
-        #{name => Name, arguments => Input}
-    ).
+maybe_persist_replay(_Spec, _FcId, _Model, _FullBin, _Name, _Input) ->
+    ok.
 
 %% Streaming: emit one function_call's four-event sequence (added,
 %% args.delta, args.done, item.done) at the call's out_index and return
