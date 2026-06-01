@@ -24,6 +24,7 @@
 #include "barrel_inference_resources.h"
 #include "chat.h"
 
+#include <algorithm>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -77,7 +78,12 @@ ERL_NIF_TERM mk_error_str(ErlNifEnv *env, const std::string &reason) {
     if (!buf) {
         return mk_error(env, "alloc_failed");
     }
-    std::memcpy(buf, reason.data(), reason.size());
+    /* enif_make_new_binary returns a raw binary buffer; null
+     * termination is not required (this is an Erlang binary,
+     * not a C string). std::copy avoids clang-tidy's
+     * bugprone-not-null-terminated-result false positive on
+     * memcpy. */
+    std::copy(reason.begin(), reason.end(), buf);
     return enif_make_tuple2(
         env,
         mk_atom(env, "error"),
@@ -157,8 +163,8 @@ extern "C" ERL_NIF_TERM nif_chat_templates_init(
         common_chat_templates_ptr ptr = common_chat_templates_init(
             m->model,
             have_override ? override_template : std::string(),
-            /* bos = */ std::string(),
-            /* eos = */ std::string());
+            /* bos_token_override = */ std::string(),
+            /* eos_token_override = */ std::string());
         if (!ptr) {
             return mk_error(env, "templates_init_failed");
         }
