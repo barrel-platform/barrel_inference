@@ -101,6 +101,11 @@
     %% Format spec cached at admission so the hot path doesn't re-read
     %% the manifest per request.
     tool_format = undefined :: undefined | barrel_inference_server_tool_format:spec(),
+    %% llama.cpp autoparser params_ref built by the pipeline at admit
+    %% time and carried admit -> done. Used by maybe_autoparser_extract
+    %% to call chat_parse/3 on buf_text. undefined for raw-prompt
+    %% requests OR when the backend doesn't support chat_apply.
+    chat_params_ref = undefined :: undefined | barrel_inference_nif:chat_params_ref(),
     %% barrel_inference 0.8 wire capture accumulates ALL tool calls the model
     %% emits in one generation; dispatched once on barrel_inference_done.
     captured_calls = [] ::
@@ -275,8 +280,14 @@ info({pipeline, loaded}, Req, S = #st{keepalive_begun = true}) ->
 info({pipeline, loaded}, Req, S) ->
     ok = barrel_inference_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template, keepalive_begun = true}, hibernate};
-info({pipeline, templated, Tokens}, Req, S) ->
-    {ok, Req, S#st{phase = waiting_queue, prompt_token_ids = Tokens}, hibernate};
+info({pipeline, templated, Tokens, ParamsRef}, Req, S) ->
+    {ok, Req,
+        S#st{
+            phase = waiting_queue,
+            prompt_token_ids = Tokens,
+            chat_params_ref = ParamsRef
+        },
+        hibernate};
 info({pipeline, queued}, Req, S) ->
     {ok, Req, S#st{phase = waiting_admit}, hibernate};
 info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
@@ -1094,17 +1105,15 @@ maybe_post_parse(S) ->
 %% parsed calls into the existing captured-call shape so the dispatch
 %% path is unchanged.
 maybe_autoparser_extract(
-    S = #st{captured_calls = [], buf_text = BufText}
+    S = #st{buf_text = BufText, chat_params_ref = ParamsRef}
 ) when S#st.loop_request =/= undefined ->
-    %% Slice 0: ParamsRef plumbing happens in slice 2; pass undefined
-    %% so the bridge short-circuits to `none' until then.
     case
         barrel_inference_server_autoparser:maybe_extract(
-            undefined, S#st.loop_request, BufText, openai
+            ParamsRef, S#st.loop_request, BufText, openai
         )
     of
         {ok, Calls} ->
-            S#st{captured_calls = Calls, buf_text = []};
+            S#st{captured_calls = S#st.captured_calls ++ Calls, buf_text = []};
         none ->
             S
     end;

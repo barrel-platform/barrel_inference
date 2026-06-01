@@ -77,6 +77,8 @@
     fc_items = [] :: [map()],
     %% Wire-driven tool-call format spec.
     tool_format = undefined :: undefined | barrel_inference_server_tool_format:spec(),
+    %% llama.cpp autoparser params_ref. See h_chat for full docs.
+    chat_params_ref = undefined :: undefined | barrel_inference_nif:chat_params_ref(),
     %% barrel_inference 0.8 wire capture accumulates ALL tool calls the model
     %% emits in one generation; dispatched once on barrel_inference_done.
     captured_calls = [] ::
@@ -271,8 +273,14 @@ info({pipeline, loaded}, Req, S = #st{keepalive_begun = true}) ->
 info({pipeline, loaded}, Req, S) ->
     ok = barrel_inference_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template, keepalive_begun = true}, hibernate};
-info({pipeline, templated, Tokens}, Req, S) ->
-    {ok, Req, S#st{phase = waiting_queue, prompt_token_ids = Tokens}, hibernate};
+info({pipeline, templated, Tokens, ParamsRef}, Req, S) ->
+    {ok, Req,
+        S#st{
+            phase = waiting_queue,
+            prompt_token_ids = Tokens,
+            chat_params_ref = ParamsRef
+        },
+        hibernate};
 info({pipeline, queued}, Req, S) ->
     {ok, Req, S#st{phase = waiting_admit}, hibernate};
 info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
@@ -548,10 +556,8 @@ maybe_autoparser_extract(S = #st{captured_calls = []}) when
     S#st.loop_request =/= undefined
 ->
     case
-        %% Slice 0: ParamsRef plumbing happens in slice 2; pass undefined
-        %% so the bridge short-circuits to `none' until then.
         barrel_inference_server_autoparser:maybe_extract(
-            undefined, S#st.loop_request, S#st.buf_text, openai
+            S#st.chat_params_ref, S#st.loop_request, S#st.buf_text, openai
         )
     of
         {ok, Calls} ->

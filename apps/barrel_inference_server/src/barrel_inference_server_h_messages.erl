@@ -110,6 +110,8 @@
     %% (non-streaming) or after the SSE emit (streaming, observability
     %% only).
     tool_format = undefined :: undefined | barrel_inference_server_tool_format:spec(),
+    %% llama.cpp autoparser params_ref. See h_chat for full docs.
+    chat_params_ref = undefined :: undefined | barrel_inference_nif:chat_params_ref(),
     %% barrel_inference 0.8 wire capture accumulates ALL tool calls the model
     %% emits in one generation (it can emit several `<tool_call>' spans
     %% on free decode). Dispatched once on barrel_inference_done: server-targeted
@@ -397,7 +399,8 @@ info({pipeline, loaded}, Req, S = #st{keepalive_begun = true}) ->
 info({pipeline, loaded}, Req, S) ->
     ok = barrel_inference_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template, keepalive_begun = true}, hibernate};
-info({pipeline, templated, Tokens}, Req, S) ->
+info({pipeline, templated, Tokens, ParamsRef}, Req, S0) ->
+    S = S0#st{chat_params_ref = ParamsRef},
     %% Capture the prompt token count for the message_start frame's
     %% `usage.input_tokens`. Without this, streaming clients see 0
     %% in message_start while non-streaming reports the real value.
@@ -838,17 +841,15 @@ maybe_post_parse(S) ->
 %% `maybe_post_parse' when both the engine's marker scanner and the
 %% per-family post-parse path yielded no tool calls.
 maybe_autoparser_extract(
-    S = #st{captured_calls = [], buf_text = BufText}
+    S = #st{buf_text = BufText, chat_params_ref = ParamsRef}
 ) when S#st.loop_request =/= undefined ->
-    %% Slice 0: ParamsRef plumbing happens in slice 2; pass undefined
-    %% so the bridge short-circuits to `none' until then.
     case
         barrel_inference_server_autoparser:maybe_extract(
-            undefined, S#st.loop_request, BufText, anthropic
+            ParamsRef, S#st.loop_request, BufText, anthropic
         )
     of
         {ok, Calls} ->
-            S#st{captured_calls = Calls, buf_text = []};
+            S#st{captured_calls = S#st.captured_calls ++ Calls, buf_text = []};
         none ->
             S
     end;

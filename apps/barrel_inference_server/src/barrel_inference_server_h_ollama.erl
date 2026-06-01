@@ -222,7 +222,7 @@ info({pipeline, loading, _}, Req, S) ->
 info({pipeline, loaded}, Req, S) ->
     ok = barrel_inference_server_keepalive:request_begin(S#st.model),
     {ok, Req, S#st{phase = waiting_template, mono_loaded = mono_ms()}, hibernate};
-info({pipeline, templated, _}, Req, S) ->
+info({pipeline, templated, _Tokens, _ParamsRef}, Req, S) ->
     {ok, Req, S#st{phase = waiting_queue}, hibernate};
 info({pipeline, queued}, Req, S) ->
     {ok, Req, S#st{phase = waiting_admit}, hibernate};

@@ -264,10 +264,10 @@ note_tool_use_block(_Model, _) ->
 %% reserved for raw byte size).
 apply_chat_template_with_truncate(W, System, Tools, Messages) ->
     case render_template(W, System, Tools, Messages) of
-        {ok, Tokens} ->
+        {ok, Tokens, ParamsRef} ->
             case fits_context(W, length(Tokens)) of
                 ok ->
-                    accept_tokens(W, Tokens);
+                    accept_tokens(W, Tokens, ParamsRef);
                 {error, 503, _} = E ->
                     E;
                 {overflow, Ctx} when length(Messages) =< 1 ->
@@ -281,20 +281,69 @@ apply_chat_template_with_truncate(W, System, Tools, Messages) ->
             E
     end.
 
-render_template(W, System0, Tools0, Messages) ->
+%% Render via llama.cpp's autoparser when the request has tools (the
+%% autoparser embeds the model's native tool block via its own jinja
+%% template AND returns the `ParamsRef' the handler needs at done to
+%% extract structured tool calls). Without tools, fall back to the
+%% legacy `apply_chat_template/2' path - cheaper and the autoparser
+%% adds no value for plain chat.
+render_template(W, System, Tools, Messages) ->
+    R = W#work.request,
+    R1 = R#barrel_inference_request{
+        system = System,
+        tools = Tools,
+        messages = Messages
+    },
+    case has_tools_for_autoparser(R1) of
+        true -> render_template_autoparser(W, R1);
+        false -> render_template_legacy(W, R1)
+    end.
+
+has_tools_for_autoparser(#barrel_inference_request{tools = T}) when
+    is_list(T), T =/= []
+->
+    true;
+has_tools_for_autoparser(_) ->
+    false.
+
+render_template_autoparser(W, R) ->
     ModelId = model_id(W),
-    %% On the native tool path, render the model's own tool block into the
-    %% system prompt (with schemas) and stop passing `tools' to the NIF so
-    %% it doesn't also append its prose list. Gating on native_turn/1 (not
-    %% the model alone) guarantees Tools0 is a non-empty list and
-    %% tool_choice = auto here. Same decision as build_grammar/1, so the
-    %% skip and the render stay in lockstep.
-    {System, Tools} = transform_native_tools(W, System0, Tools0),
-    Req = #{messages => Messages, system => System, tools => Tools},
+    Inputs = barrel_inference_server_autoparser:build_inputs(R),
+    Call = fun() -> barrel_inference:chat_apply(ModelId, Inputs) end,
+    case call_engine_with_recovery(W, Call, chat_apply) of
+        {ok, {ok, ParamsRef, PromptBin}} ->
+            case
+                call_engine_with_recovery(
+                    W,
+                    fun() -> barrel_inference:tokenize(ModelId, PromptBin) end,
+                    tokenize
+                )
+            of
+                {ok, {ok, Tokens}} -> {ok, Tokens, ParamsRef};
+                {ok, {error, Reason}} -> {error, 400, Reason};
+                {error, _, _} = E -> E
+            end;
+        {ok, {error, no_template}} ->
+            {error, 501, no_chat_template};
+        {ok, {error, chat_not_supported}} ->
+            render_template_legacy(W, R);
+        {ok, {error, Reason}} ->
+            {error, 400, Reason};
+        {error, _, _} = E ->
+            E
+    end.
+
+render_template_legacy(W, R) ->
+    ModelId = model_id(W),
+    Req = #{
+        messages => R#barrel_inference_request.messages,
+        system => R#barrel_inference_request.system,
+        tools => R#barrel_inference_request.tools
+    },
     Call = fun() -> barrel_inference:apply_chat_template(ModelId, Req) end,
     case call_engine_with_recovery(W, Call, apply_chat_template) of
         {ok, {ok, Tokens}} ->
-            {ok, Tokens};
+            {ok, Tokens, undefined};
         {ok, {error, no_template}} ->
             {error, 501, no_chat_template};
         {ok, {error, not_supported}} ->
@@ -463,10 +512,13 @@ escalate_unload(ModelId, Op) ->
     {error, 503, model_reloading}.
 
 accept_tokens(W, Tokens) ->
+    accept_tokens(W, Tokens, undefined).
+
+accept_tokens(W, Tokens, ParamsRef) ->
     W1 = put_tokens(W, Tokens),
     W2 = maybe_arm_continuation(W1, Tokens),
     W3 = compute_prefix_boundary(W2, Tokens),
-    W#work.handler ! {pipeline, templated, Tokens},
+    W#work.handler ! {pipeline, templated, Tokens, ParamsRef},
     {ok, W3}.
 
 %% Verify the static-prefix (end-of-tools) boundary for the static
