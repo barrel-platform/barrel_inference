@@ -44,8 +44,6 @@ high-level guarantee is covered in the real-model
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
--export_type([state/0]).
-
 -define(SERVER, ?MODULE).
 -define(TAB, ?MODULE).
 -define(DEFAULT_SIZE, 64).
@@ -153,6 +151,7 @@ lookup(Tab, Key) when Tab =:= ?TAB ->
 %% gen_server callbacks
 %%====================================================================
 
+-spec init([]) -> {ok, state()}.
 init([]) ->
     _ = ets:new(?TAB, [set, named_table, protected, {read_concurrency, true}]),
     MaxSize = application:get_env(
