@@ -548,8 +548,10 @@ maybe_autoparser_extract(S = #st{captured_calls = []}) when
     S#st.loop_request =/= undefined
 ->
     case
+        %% Slice 0: ParamsRef plumbing happens in slice 2; pass undefined
+        %% so the bridge short-circuits to `none' until then.
         barrel_inference_server_autoparser:maybe_extract(
-            S#st.model, S#st.loop_request, S#st.buf_text, openai
+            undefined, S#st.loop_request, S#st.buf_text, openai
         )
     of
         {ok, Calls} ->

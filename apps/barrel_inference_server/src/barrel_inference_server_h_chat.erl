@@ -1094,11 +1094,13 @@ maybe_post_parse(S) ->
 %% parsed calls into the existing captured-call shape so the dispatch
 %% path is unchanged.
 maybe_autoparser_extract(
-    S = #st{captured_calls = [], model = Model, buf_text = BufText}
+    S = #st{captured_calls = [], buf_text = BufText}
 ) when S#st.loop_request =/= undefined ->
+    %% Slice 0: ParamsRef plumbing happens in slice 2; pass undefined
+    %% so the bridge short-circuits to `none' until then.
     case
         barrel_inference_server_autoparser:maybe_extract(
-            Model, S#st.loop_request, BufText, openai
+            undefined, S#st.loop_request, BufText, openai
         )
     of
         {ok, Calls} ->

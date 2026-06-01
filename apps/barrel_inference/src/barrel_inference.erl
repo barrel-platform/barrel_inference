@@ -61,7 +61,7 @@ an explicit `model_id` in the config map.
     tokenize/2,
     detokenize/2,
     apply_chat_template/2,
-    chat_apply/3,
+    chat_apply/2,
     chat_parse/3,
     embed/2,
     load_adapter/2,
@@ -514,14 +514,15 @@ apply_chat_template(Model, Request) ->
 
 -doc """
 Build a chat_params_ref + rendered prompt for `Model' via llama.cpp's
-autoparser. `ToolsHash' is a stable identifier for the tools set
-(same hash <=> same cached params_ref + prompt). `Inputs' is the
-map fed to `barrel_inference_chat:apply/2'.
+autoparser. `Inputs' is the map fed to `barrel_inference_chat:apply/2'
+(`messages', `tools', `tool_choice', `parallel_tool_calls').
+Each call synthesizes fresh params + prompt; only the model-level
+`templates_ref' is cached.
 """.
--spec chat_apply(model(), binary(), map()) ->
+-spec chat_apply(model(), map()) ->
     {ok, barrel_inference_nif:chat_params_ref(), binary()} | {error, term()}.
-chat_apply(Model, ToolsHash, Inputs) ->
-    barrel_inference_model:chat_apply(Model, ToolsHash, Inputs).
+chat_apply(Model, Inputs) ->
+    barrel_inference_model:chat_apply(Model, Inputs).
 
 -doc """
 Parse a model output string into a structured assistant message via

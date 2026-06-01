@@ -146,7 +146,7 @@ concurrently through one decode call per tick.
     tokenize/2,
     detokenize/2,
     apply_chat_template/2,
-    chat_apply/3,
+    chat_apply/2,
     chat_purge/1,
     embed/2,
     load_adapter/2,
@@ -874,8 +874,8 @@ apply_chat_template(Model, Request) when is_map(Request) ->
 %% binary identifier for the (canonicalised) tools array - same hash
 %% => same cached params_ref + prompt. `Inputs' is the map fed
 %% verbatim to `barrel_inference_chat:apply/2'.
-chat_apply(Model, ToolsHash, Inputs) when is_binary(ToolsHash), is_map(Inputs) ->
-    gen_statem:call(via(Model), {chat_apply, ToolsHash, Inputs}).
+chat_apply(Model, Inputs) when is_map(Inputs) ->
+    gen_statem:call(via(Model), {chat_apply, Inputs}).
 
 %% Drop every chat-cache entry for this model. Called on model
 %% terminate so the cache does not extend templates_ref / params_ref
@@ -2001,8 +2001,8 @@ handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
     reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
-handle_common(_State, {call, From}, {chat_apply, ToolsHash, Inputs}, Data) ->
-    reply(From, do_chat_apply(Data, ToolsHash, Inputs), Data);
+handle_common(_State, {call, From}, {chat_apply, Inputs}, Data) ->
+    reply(From, do_chat_apply(Data, Inputs), Data);
 handle_common(_State, {call, From}, chat_purge, Data) ->
     barrel_inference_chat_cache:purge(Data#data.model_id),
     reply(From, ok, Data);
@@ -2197,14 +2197,16 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
     end.
 
 %% Resolve a chat templates_ref via the cache (init-once per model id)
-%% and apply the inputs to get a params_ref + rendered prompt
-%% (cached per (model_id, tools-hash)). Reaches the underlying NIF
-%% model resource via the backend module's `get_model_ref/1' getter;
-%% backends without that callback (the stub) return
-%% `{error, chat_not_supported}'.
+%% then call the autoparser fresh to get a params_ref + rendered
+%% prompt. NOTHING is cached at the params/prompt level: llama.cpp
+%% bakes `tool_choice' + `parallel_tool_calls' + message content
+%% into the synthesized `common_chat_params', so sharing across
+%% requests would be incorrect. Each call pays one
+%% `templates_apply' synthesis. The model resource is reached via
+%% the backend module's `get_model_ref/1' getter; backends without
+%% that callback (the stub) return `{error, chat_not_supported}'.
 do_chat_apply(
     #data{backend = Mod, backend_state = S, model_id = ModelId},
-    ToolsHash,
     Inputs
 ) ->
     case erlang:function_exported(Mod, get_model_ref, 1) of
@@ -2218,9 +2220,7 @@ do_chat_apply(
                 )
             of
                 {ok, Templates} ->
-                    barrel_inference_chat_cache:get_or_apply(
-                        ModelId, ToolsHash, Templates, Inputs
-                    );
+                    barrel_inference_chat:apply(Templates, Inputs);
                 Err ->
                     Err
             end
