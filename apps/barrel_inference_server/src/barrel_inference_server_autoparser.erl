@@ -99,13 +99,8 @@ build_inputs(#barrel_inference_request{
             <<>> -> [];
             S when is_binary(S) -> [#{<<"role">> => <<"system">>, <<"content">> => S}]
         end,
-    UserMsgs =
-        case Messages of
-            L when is_list(L) -> L;
-            undefined -> []
-        end,
     {Tools, ToolChoiceAtom} = map_tool_choice(Tools0, ToolChoice0),
-    MsgsJson = iolist_to_binary(json:encode(SysMsg ++ UserMsgs)),
+    MsgsJson = iolist_to_binary(json:encode(SysMsg ++ Messages)),
     ToolsJson = iolist_to_binary(json:encode(safe_list(Tools))),
     #{
         messages => MsgsJson,
@@ -126,9 +121,7 @@ map_tool_choice(_Tools, none) ->
     {[], none};
 map_tool_choice(Tools, {named, Name}) ->
     Filtered = [T || T = #{name := N} <- safe_list(Tools), N =:= Name],
-    {Filtered, required};
-map_tool_choice(Tools, _) ->
-    {Tools, auto}.
+    {Filtered, required}.
 
 safe_list(undefined) -> [];
 safe_list(L) when is_list(L) -> L.
