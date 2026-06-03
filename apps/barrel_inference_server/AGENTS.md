@@ -61,7 +61,6 @@ barrel_inference_server_sup (rest_for_one)
 ├── barrel_inference_server_disk_cache    DETS-backed KV cache file
 ├── barrel_inference_server_registry      via callback for {queue, ModelId}
 ├── barrel_inference_server_config        aliases + load policy + persistent_term
-├── barrel_inference_server_tool_replay   DETS-backed exact-replay map for tool-call bytes
 ├── barrel_inference_server_loaders_sup   per-model loader processes
 ├── barrel_inference_server_queues_sup    per-model semaphore queues
 ├── barrel_inference_server_fetch_sup     manifest / blob download workers
@@ -136,44 +135,20 @@ The translator does NOT tokenise. The handler's pipeline calls
 `barrel_inference:apply_chat_template/2` (chat / messages) or
 `barrel_inference:tokenize/2` (legacy completions) to produce token ids.
 
-### Tool-call grammar
+### Tool-call parsing (autoparser)
 
-`barrel_inference_server_grammar:from_tools/2` converts the OpenAI/Anthropic
-tools array into a GBNF grammar that `barrel_inference:infer/4` accepts via
-`Params.grammar`. `tool_choice = auto` emits
-`text_response | tool_alt`; `required` omits the text branch;
-`{named, _}` pins to a single tool; `none` returns no grammar.
-
-### Tool-call exact replay (barrel_inference 0.5)
-
-When a model declares `loader.tool_call_markers` in its manifest,
-barrel_inference emits `{tool_call_delta, _}` deltas and one
-`barrel_inference_tool_call_end` per call instead of routing tool JSON
-through the first-byte heuristic. The capture path lives in both
-handlers' info/3 clauses:
-
-1. `barrel_inference_server_tool_format:lookup/1` is called once at admit
-   time to resolve the model id to a `parse/1` + `canonicalise/1`
-   module via `loader.tool_call_format`. Five families ship in
-   the default registry: `qwen-xml`, `dsml`,
-   `llama-python-tag`, `mistral-tool-calls`, `bare-json`. Adding
-   a new family is one new `barrel_inference_server_tool_format_<family>`
-   module plus one entry in
-   `barrel_inference_server_config:default_tool_call_formats/0`.
-2. On `barrel_inference_tool_call_end`, the handler parses `FullBin` via
-   the format module, mints a `toolu_...` id, and persists
-   `{ToolId, Model, FullBin, Json}` in `barrel_inference_server_tool_replay`
-   (DETS-backed, ETS hot path). The Anthropic SSE
-   (`content_block_start` / `input_json_delta` /
-   `content_block_stop`) or OpenAI `chat.completion.chunk`
-   `tool_calls` frame is emitted from the captured block.
-3. `barrel_inference_server_pipeline:apply_chat_template/1` walks the
-   message history before rendering and consults the replay map
-   for each prior `tool_use` block. Outcome lands on the
-   `barrel_inference_tool_replay_lookups_total` counter (label
-   `result = hit | miss | no_format`). Byte-exact splice awaits
-   an engine-side ask (see
-   `/Users/benoitc/Projects/barrel_inference_anthropic_support_prompt.md`).
+Tool calls are extracted at done by llama.cpp's `common_chat_parse`
+via `barrel_inference:chat_parse/3`. The pipeline renders the prompt
+through `barrel_inference:chat_apply/2` (the autoparser's chat
+templates apply path), which returns a `ParamsRef` carried admit ->
+done on `{pipeline, templated, Tokens, ParamsRef}`. At done the
+handler bridge `barrel_inference_server_autoparser:maybe_extract/4`
+parses the buffered response text into structured tool calls.
+HTTP wire shape is unchanged (OpenAI `tool_calls`, Anthropic
+`tool_use`, Responses `function_call`). For tools requests grammar
+is left empty (model decodes freely); response_format / format
+without tools still drives GBNF via
+`barrel_inference_server_grammar:from_response_format/1`.
 
 ### Sticky-seq session id
 
@@ -242,18 +217,11 @@ garbage):
 
 - `test/barrel_inference_server_translate_SUITE.erl`: schema translation,
   request and response directions, both APIs.
-- `test/barrel_inference_server_grammar_SUITE.erl`: GBNF generation, JSON
-  Schema subset, tool_choice variants.
+- `test/barrel_inference_server_grammar_SUITE.erl`: GBNF generation for
+  response_format / JSON Schema subset.
 - `test/barrel_inference_server_smoke_SUITE.erl`: HTTP surface boot probe -
   health, ready, models, metrics, embeddings/chat error paths,
   CORS, request-id.
-- `test/barrel_inference_server_tool_replay_SUITE.erl`: CT for the DETS-
-  backed replay store (put/get round-trip, gc-evicts-expired,
-  restart survival).
-- `test/barrel_inference_server_tool_format_tests.erl`,
-  `..._dsml_tests.erl`, `..._llama_python_tag_tests.erl`,
-  `..._mistral_tool_calls_tests.erl`, `..._bare_json_tests.erl`:
-  eunit round-trip and tolerance for each shipped format family.
 - `test/barrel_inference_server_session_tests.erl`: eunit for the layered
   session-id derivation.
 

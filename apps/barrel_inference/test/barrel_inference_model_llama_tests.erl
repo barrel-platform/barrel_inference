@@ -55,4 +55,3 @@ thinking_signature_empty_key_treated_as_unset_test() ->
     after
         application:unset_env(barrel_inference, thinking_signing_key)
     end.
-

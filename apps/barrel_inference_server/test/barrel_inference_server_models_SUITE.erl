@@ -162,7 +162,6 @@ pull_short_name_wraps_to_ollama(_Config) ->
     ?assertEqual(<<"llama3">>, Name2),
     ?assertEqual(<<"8b">>, Tag2).
 
-
 pull_detects_think_tag_thinking_markers(Config) ->
     Template = <<"...<think>{ chain of thought }</think>...">>,
     Loader = pull_loader_with_template(Config, Template, <<"qwen3-fake">>),

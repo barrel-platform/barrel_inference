@@ -6,18 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-### Added
+### Removed
 
-- Autoparser fallback at `barrel_inference_done' for all three handlers
-  (chat / messages / responses). When the engine's per-token marker
-  scanner AND the family `maybe_post_parse' path both yield no tool
-  calls, the new `barrel_inference_server_autoparser:maybe_extract/4'
-  bridge calls `barrel_inference:chat_apply/3' (cached per
-  `(ModelId, ToolsHash)') + `chat_parse/3' on `buf_text' and injects
-  any extracted tool calls into `captured_calls'. Per-family Erlang
-  parsers stay as the primary path for models with markers
-  configured; autoparser only fires when nothing else captured. No
-  manifest change required; no opt-in flag.
+- Per-family Erlang tool-call format modules (`qwen-xml`, `qwen3-coder`,
+  `dsml`, `llama-python-tag`, `llama-pythonic`, `mistral-tool-calls`,
+  `mistral-args`, `phi4-functools`, `glm45`, `bare-json`),
+  `barrel_inference_server_tool_format` behaviour + registry,
+  `src/tool_formats/' source directory,
+  `barrel_inference_server_tool_scan' streaming module, and
+  `barrel_inference_server_tool_replay' DETS store. Tool-call parsing
+  routes through llama.cpp's `common_chat_parse' on the buffered
+  response at `barrel_inference_done' via the
+  `barrel_inference_server_autoparser' bridge.
+- `barrel_inference_server_grammar:from_tools/2' tool-grammar generator.
+  Tools requests now decode freely (empty grammar); the autoparser
+  extracts calls at done. `from_response_format/1' stays for
+  response_format / format directives.
+- `loader.tool_call_format' / `loader.tool_call_markers' manifest
+  fields (silently ignored if present in existing manifests; no
+  re-pull needed).
+- `tool_call_formats' app env (silently ignored if set).
+
+### Changed
+
+- Tool-call parsing moves from engine-side per-token marker capture
+  to llama.cpp's `common_chat_parse' on the buffered response at
+  `barrel_inference_done'. HTTP wire format unchanged.
+- Pipeline renders all chat / messages requests through
+  `barrel_inference:chat_apply/2' (autoparser), with the legacy
+  `apply_chat_template/2' kept only as a fallback for backends that
+  don't support chat at all. The `ParamsRef' is carried admit ->
+  done via `{pipeline, templated, Tokens, ParamsRef}` (4-tuple,
+  was 3-tuple).
 
 ### Changed
 

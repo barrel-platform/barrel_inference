@@ -26,7 +26,7 @@
 
 -include("barrel_inference_server.hrl").
 
--export([from_tools/2, schema_to_gbnf/1, from_response_format/1]).
+-export([schema_to_gbnf/1, from_response_format/1]).
 
 -export_type([gbnf/0]).
 
@@ -35,33 +35,6 @@
 %%====================================================================
 %% Public API
 %%====================================================================
-
-%% Build a grammar binding the model's output to either freeform text
-%% (when tool_choice = auto) or a tool call. Returns `{ok, Bin}` or
-%% `{error, Reason}`.
--spec from_tools([tool()] | undefined, tool_choice()) ->
-    {ok, gbnf()} | {error, term()}.
-from_tools(undefined, _Choice) ->
-    {ok, no_grammar()};
-from_tools([], _Choice) ->
-    {ok, no_grammar()};
-from_tools(_Tools, none) ->
-    {ok, no_grammar()};
-from_tools(Tools, Choice) when is_list(Tools) ->
-    try
-        ToolRules = [
-            {tool_rule_name(I), tool_rule(T, I)}
-         || {I, T} <- enumerate(filter_tools(Tools, Choice))
-        ],
-        Top = top_rule(Choice, ToolRules),
-        Body = render_rules(
-            [{<<"root">>, Top} | ToolRules] ++
-                shared_rules()
-        ),
-        {ok, iolist_to_binary(Body)}
-    catch
-        throw:{grammar_error, R} -> {error, R}
-    end.
 
 %% Render a single JSON Schema fragment as a GBNF body. Exposed for
 %% testing.
@@ -92,56 +65,6 @@ from_response_format({json_schema, Schema}) when is_map(Schema) ->
     end;
 from_response_format(_) ->
     {ok, no_grammar()}.
-
-%%====================================================================
-%% Top-level rule
-%%====================================================================
-
-top_rule(auto, ToolRules) ->
-    %% text_response | one_of_tools
-    [<<"text-response | ">>, tool_alternation(ToolRules)];
-top_rule(required, ToolRules) ->
-    tool_alternation(ToolRules);
-top_rule({named, _Name}, [{Rule, _Body}]) ->
-    Rule;
-top_rule({named, Name}, _) ->
-    throw({grammar_error, {unknown_tool, Name}}).
-
-tool_alternation([{R, _}]) ->
-    R;
-tool_alternation([{First, _} | Rest]) ->
-    [First | [[<<" | ">>, N] || {N, _} <- Rest]].
-
-%%====================================================================
-%% Per-tool rule
-%%====================================================================
-
-tool_rule(#{name := Name, schema := Schema}, _Index) ->
-    %% A tool call is a JSON object: {"name":"...", "arguments":...}
-    NameLit = json_string_literal(Name),
-    Args = schema_value(Schema),
-    [
-        <<"\"{\" ws \"\\\"name\\\":\" ws ">>,
-        NameLit,
-        <<" \",\" ws \"\\\"arguments\\\":\" ws ">>,
-        Args,
-        <<" ws \"}\"">>
-    ].
-
-tool_rule_name(I) ->
-    %% llama.cpp's GBNF parser (`is_word_char` in src/llama-grammar.cpp)
-    %% accepts letters, digits, and `-` for rule names but rejects
-    %% `_'. The hyphen form is the only portable rule-name spelling
-    %% across the grammar parsers we care about.
-    iolist_to_binary([<<"tool-">>, integer_to_binary(I)]).
-
-filter_tools(Tools, {named, Name}) ->
-    case [T || T = #{name := N} <- Tools, N =:= Name] of
-        [] -> throw({grammar_error, {unknown_tool, Name}});
-        Sel -> Sel
-    end;
-filter_tools(Tools, _) ->
-    Tools.
 
 %%====================================================================
 %% JSON Schema -> GBNF
@@ -277,10 +200,6 @@ render_rule(Name, Body) ->
 %%====================================================================
 %% Helpers
 %%====================================================================
-
-enumerate(L) -> enumerate(L, 0).
-enumerate([], _) -> [];
-enumerate([H | T], I) -> [{I, H} | enumerate(T, I + 1)].
 
 join_with([], _Sep) -> [];
 join_with([H], _Sep) -> [H];
