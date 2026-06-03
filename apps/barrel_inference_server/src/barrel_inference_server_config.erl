@@ -23,7 +23,6 @@
     generation_ping_ms/0,
     anthropic_api_keys/0,
     anthropic_retry_after_seconds/0,
-    tool_call_formats/0,
     builtin_tool_executors/0,
     max_tool_iterations/0,
     responses_store_ttl_ms/0,
@@ -170,21 +169,6 @@ anthropic_api_keys() ->
 anthropic_retry_after_seconds() ->
     persistent_term:get({?MODULE, anthropic_retry_after_seconds}, 5).
 
-%% Per-format tool-call registry used by barrel_inference_server_tool_format.
-%% Built-in defaults derive from the include-file family list in
-%% `barrel_inference_server_tool_format:formats/0' (single source of
-%% truth: `include/barrel_inference_server_tool_formats.hrl');
-%% operators may merge additional entries via the `tool_call_formats'
-%% app env (the init merge keeps both). The persistent_term fallback
-%% also delegates to the family list so registry lookups work in
-%% dev shell / early eunit before the boot init has run.
--spec tool_call_formats() -> #{binary() => map()}.
-tool_call_formats() ->
-    persistent_term:get(
-        {?MODULE, tool_call_formats},
-        barrel_inference_server_tool_format:formats()
-    ).
-
 %% Registry of server-side built-in tool executors used by
 %% barrel_inference_server_tool_executor. Keyed by the OpenAI built-in tool
 %% `type` binary (e.g. <<"web_search">>); each value is an executor
@@ -208,8 +192,6 @@ default_builtin_tool_executors() ->
 max_tool_iterations() ->
     persistent_term:get({?MODULE, max_tool_iterations}, 5).
 
-%% Directory hosting the exact-replay DETS file used by
-%% barrel_inference_server_tool_replay. Defaults to a `replay` sibling of the
 %% TTL on stored Responses-API conversations for `previous_response_id'
 %% continuation. Defaults to 1h: long enough for an interactive Codex
 %% session, short enough that the RAM-only map stays bounded.
@@ -344,13 +326,6 @@ init([]) ->
     persistent_term:put(
         {?MODULE, anthropic_retry_after_seconds},
         app_env(anthropic_retry_after_seconds, 5)
-    ),
-    persistent_term:put(
-        {?MODULE, tool_call_formats},
-        maps:merge(
-            barrel_inference_server_tool_format:formats(),
-            app_env(tool_call_formats, #{})
-        )
     ),
     persistent_term:put(
         {?MODULE, builtin_tool_executors},

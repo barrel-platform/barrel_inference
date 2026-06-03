@@ -465,8 +465,7 @@ manifest_to_config(Manifest) ->
         ),
         model_opts => model_opts_from(Loader, Params)
     },
-    Config1 = maybe_put_thinking_markers(Config0, Loader),
-    maybe_put_tool_call_markers(Config1, Loader).
+    maybe_put_thinking_markers(Config0, Loader).
 
 %% barrel_inference 0.4.0 takes per-model extended-thinking markers via
 %% `thinking_markers => #{start := Bin, end := Bin}` on load_model/2.
@@ -483,33 +482,6 @@ maybe_put_thinking_markers(Config, Loader) ->
         _ ->
             Config
     end.
-
-%% barrel_inference 0.5.0 takes per-model tool-call markers via
-%% `tool_call_markers => #{start := Bin, end := Bin, ...}` on
-%% load_model/2. Operators declare them in the manifest's loader
-%% section per model family (qwen-xml uses <tool_call>/</tool_call>,
-%% etc.). With markers set, the engine builds a deterministic
-%% greedy-on-syntax sampler and emits `tool_call_delta` /
-%% `barrel_inference_tool_call_end` wire messages. Optional payload_start /
-%% payload_end mark string regions inside the span that flip back
-%% to the request's normal sampler for caller-supplied content.
-maybe_put_tool_call_markers(Config, Loader) ->
-    case maps:get(<<"tool_call_markers">>, Loader, undefined) of
-        #{<<"start">> := Start, <<"end">> := End} = M when
-            is_binary(Start), is_binary(End), Start =/= <<>>, End =/= <<>>
-        ->
-            Base = #{start => Start, 'end' => End},
-            Config#{tool_call_markers => add_payload_markers(Base, M)};
-        _ ->
-            Config
-    end.
-
-add_payload_markers(Base, #{<<"payload_start">> := PS, <<"payload_end">> := PE}) when
-    is_binary(PS), is_binary(PE), PS =/= <<>>, PE =/= <<>>
-->
-    Base#{payload_start => PS, payload_end => PE};
-add_payload_markers(Base, _) ->
-    Base.
 
 %% Normalise an optional non-negative-integer manifest field (0 is valid,
 %% e.g. it disables the decode budget); anything else collapses to
