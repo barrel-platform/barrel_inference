@@ -224,14 +224,6 @@ async messages:
   exactly once per closed block before any subsequent
   `{barrel_inference_token, _, _}` message. `Sig` is `<<>>` when no
   signature is available
-- `{barrel_inference_token, Ref, {tool_call_delta, Bin :: binary()}}` —
-  fragment of a tool-call body; emitted between a `tool_call`
-  start marker and an end marker when the model is loaded with
-  `tool_call_markers`
-- `{barrel_inference_tool_call_end, Ref, Full :: binary()}` — close marker
-  for a tool-call span; carries the full concatenated bytes of
-  every `{tool_call_delta, _}` sent for the span so the downstream
-  can store them verbatim for byte-exact replay on later turns
 - `{barrel_inference_done, Ref, Stats}` — normal completion
 - `{barrel_inference_error, Ref, Reason}` — failure
 
