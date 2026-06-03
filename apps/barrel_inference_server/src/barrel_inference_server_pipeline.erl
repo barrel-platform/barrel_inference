@@ -251,12 +251,12 @@ apply_chat_template_with_truncate(W, System, Tools, Messages) ->
             E
     end.
 
-%% Render via llama.cpp's autoparser when the request has tools (the
-%% autoparser embeds the model's native tool block via its own jinja
-%% template AND returns the `ParamsRef' the handler needs at done to
-%% extract structured tool calls). Without tools, fall back to the
-%% legacy `apply_chat_template/2' path - cheaper and the autoparser
-%% adds no value for plain chat.
+%% Always render via llama.cpp's autoparser: it owns the per-family
+%% wire shape via the model's own jinja template (including no-tools
+%% chat) and returns the `ParamsRef' the handler needs at done to
+%% extract structured tool calls. The legacy `apply_chat_template/2'
+%% path remains only as a fallback when the backend doesn't support
+%% chat at all (raw-completion-only models).
 render_template(W, System, Tools, Messages) ->
     R = W#work.request,
     R1 = R#barrel_inference_request{
@@ -264,17 +264,7 @@ render_template(W, System, Tools, Messages) ->
         tools = Tools,
         messages = Messages
     },
-    case has_tools_for_autoparser(R1) of
-        true -> render_template_autoparser(W, R1);
-        false -> render_template_legacy(W, R1)
-    end.
-
-has_tools_for_autoparser(#barrel_inference_request{tools = T}) when
-    is_list(T), T =/= []
-->
-    true;
-has_tools_for_autoparser(_) ->
-    false.
+    render_template_autoparser(W, R1).
 
 render_template_autoparser(W, R) ->
     ModelId = model_id(W),
@@ -517,40 +507,37 @@ compute_prefix_boundary(W, Tokens) ->
             W
     end.
 
-%% Head-only render of the transformed system+tools (same native-tool
-%% fold render_template/4 applies), memoized per transformed-head
-%% identity in the public ETS table. Returns `none` on any render
+%% Head-only render (empty messages) routed through the same autoparser
+%% chat_apply path as the full render so the prefix boundary aligns
+%% exactly with the full prompt. Memoized per (model, system, tools)
+%% identity in the public ETS table. Returns `none' on any render
 %% failure (skip the boundary; never guess).
 head_tokens(W, System0, Tools0) ->
     ModelId = model_id(W),
-    {System2, Tools2} = transform_native_tools(W, System0, Tools0),
-    MemoKey = crypto:hash(sha256, term_to_binary({ModelId, System2, Tools2})),
+    MemoKey = crypto:hash(sha256, term_to_binary({ModelId, System0, Tools0})),
     case ets:lookup(?PREFIX_HEAD_TBL, MemoKey) of
         [{_, HeadTokens}] ->
             {ok, HeadTokens};
         [] ->
-            Req = #{messages => [], system => System2, tools => Tools2},
-            Call = fun() -> barrel_inference:apply_chat_template(ModelId, Req) end,
-            case call_engine_with_recovery(W, Call, apply_chat_template) of
-                {ok, {ok, HeadTokens}} ->
-                    ets:insert(?PREFIX_HEAD_TBL, {MemoKey, HeadTokens}),
-                    {ok, HeadTokens};
+            R = W#work.request,
+            HeadReq = R#barrel_inference_request{
+                system = System0, tools = Tools0, messages = []
+            },
+            Inputs = barrel_inference_server_autoparser:build_inputs(HeadReq),
+            Call = fun() -> barrel_inference:chat_apply(ModelId, Inputs) end,
+            case call_engine_with_recovery(W, Call, chat_apply) of
+                {ok, {ok, _ParamsRef, PromptBin}} ->
+                    TokCall = fun() -> barrel_inference:tokenize(ModelId, PromptBin) end,
+                    case call_engine_with_recovery(W, TokCall, tokenize) of
+                        {ok, {ok, HeadTokens}} ->
+                            ets:insert(?PREFIX_HEAD_TBL, {MemoKey, HeadTokens}),
+                            {ok, HeadTokens};
+                        _ ->
+                            none
+                    end;
                 _ ->
                     none
             end
-    end.
-
-%% On the native-tool path, fold the model's own tool block (with
-%% schemas) into the system prompt and stop passing `tools' to the NIF
-%% so it doesn't also append its prose list. Shared by render_template/4
-%% and head_tokens/3 so the full render and the head render transform
-%% identically.
-transform_native_tools(W, System0, Tools0) ->
-    case barrel_inference_server_tool_format:native_turn(W#work.request) of
-        {ok, Mod} ->
-            {barrel_inference_server_tool_format:render(Mod, Tools0, System0), undefined};
-        none ->
-            {System0, Tools0}
     end.
 
 %% Longest common prefix length of two token lists (tail-recursive;
@@ -678,29 +665,19 @@ step_grammar(W) ->
             {error, 400, Reason}
     end.
 
-%% Decide the grammar source for a request. On the native free-decode
-%% tool path (marker model + native renderer + tool_choice = auto) emit
-%% an empty grammar so the model decodes freely and the marker capture
-%% path (barrel_inference_tool_call_end) collects the calls - the GBNF
-%% grammar is ~40x slower per token and pure overhead there. Otherwise:
-%% a non-empty tools array builds the tool grammar, else the
-%% response_format / format directive drives it. nullable_bin/1 maps the
-%% empty grammar to `undefined' (no constraint).
+%% Decide the grammar source for a request. With autoparser as the
+%% primary tool-call capture path, tools requests decode freely (empty
+%% grammar); the autoparser extracts calls at done. Non-tools requests
+%% may still drive the grammar from the response_format / format
+%% directive.
 build_grammar(R) ->
-    case barrel_inference_server_tool_format:native_turn(R) of
-        {ok, _Format} ->
+    case has_tools(R) of
+        true ->
             {ok, <<>>};
-        none ->
-            case has_tools(R) of
-                true ->
-                    barrel_inference_server_grammar:from_tools(
-                        R#barrel_inference_request.tools, R#barrel_inference_request.tool_choice
-                    );
-                false ->
-                    barrel_inference_server_grammar:from_response_format(
-                        R#barrel_inference_request.response_format
-                    )
-            end
+        false ->
+            barrel_inference_server_grammar:from_response_format(
+                R#barrel_inference_request.response_format
+            )
     end.
 
 has_tools(#barrel_inference_request{tools = undefined}) -> false;
