@@ -1014,9 +1014,7 @@ parse_tool_call_to_map(JsonBin) when is_binary(JsonBin) ->
             {<<"unknown">>, #{}}
     catch
         _:_ -> {<<"unknown">>, #{}}
-    end;
-parse_tool_call_to_map(_) ->
-    {<<"unknown">>, #{}}.
+    end.
 
 %%====================================================================
 %% Agentic continue-loop (server-executed built-in tools)
