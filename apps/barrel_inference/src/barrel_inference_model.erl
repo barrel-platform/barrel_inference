@@ -144,6 +144,7 @@ concurrently through one decode call per tick.
     shutdown/1,
     model_info/1,
     tokenize/2,
+    tokenize/3,
     detokenize/2,
     apply_chat_template/2,
     chat_apply/2,
@@ -821,6 +822,11 @@ runs against the model's static vocabulary, not the live KV cache.
     {ok, [non_neg_integer()]} | {error, term()}.
 tokenize(Model, Text) when is_binary(Text) ->
     gen_statem:call(via(Model), {tokenize, Text}).
+
+-spec tokenize(model(), binary(), map()) ->
+    {ok, [non_neg_integer()]} | {error, term()}.
+tokenize(Model, Text, Opts) when is_binary(Text), is_map(Opts) ->
+    gen_statem:call(via(Model), {tokenize, Text, Opts}).
 
 -doc """
 Detokenise a list of token IDs back to a string. Safe to call
@@ -1967,6 +1973,8 @@ handle_common(_State, {call, From}, {reset_session, SessionId}, Data) ->
     reply(From, {ok, Outcome}, NewData);
 handle_common(_State, {call, From}, {tokenize, Text}, Data) ->
     reply(From, wrap_ok(backend_call(Data, tokenize, [Text])), Data);
+handle_common(_State, {call, From}, {tokenize, Text, Opts}, Data) ->
+    reply(From, wrap_ok(backend_tokenize_with_opts(Data, Text, Opts)), Data);
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
     reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
@@ -3567,6 +3575,15 @@ backend_kv_unpack(Bin, SeqId, #data{backend = Mod, backend_state = S}) ->
 
 backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
     apply(Mod, Fn, [S | Args]).
+
+%% Tokenize via the backend's optional 3-arity callback (forwards
+%% caller-supplied options like `parse_special'). Falls back to the
+%% 2-arity callback when the backend hasn't been updated.
+backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) ->
+    case erlang:function_exported(Mod, tokenize, 3) of
+        true -> Mod:tokenize(S, Text, Opts);
+        false -> Mod:tokenize(S, Text)
+    end.
 
 %% Resolve a model() reference to a Pid that gen_statem:call/2,3
 %% accepts. Binary IDs go through the registry; pids pass through.

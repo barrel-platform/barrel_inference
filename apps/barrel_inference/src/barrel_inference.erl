@@ -59,6 +59,7 @@ an explicit `model_id` in the config map.
     list_models/0,
     model_info/1,
     tokenize/2,
+    tokenize/3,
     detokenize/2,
     apply_chat_template/2,
     chat_apply/2,
@@ -488,6 +489,18 @@ concurrently with `complete/2,3`.
     {ok, [barrel_inference_nif:token_id()]} | {error, term()}.
 tokenize(Model, Text) ->
     barrel_inference_model:tokenize(Model, Text).
+
+-doc """
+Tokenise text with explicit options. `parse_special => true' lets
+chat-template markers (e.g. `[INST]', `[AVAILABLE_TOOLS]') decode to
+single special-token ids; the 2-arity form keeps them as raw bytes
+to match user-typed input. The pipeline uses the 3-arity form for
+prompt rendered through `chat_apply/2'.
+""".
+-spec tokenize(model(), binary(), map()) ->
+    {ok, [barrel_inference_nif:token_id()]} | {error, term()}.
+tokenize(Model, Text, Opts) when is_map(Opts) ->
+    barrel_inference_model:tokenize(Model, Text, Opts).
 
 -doc "Detokenise a list of token ids back to text.".
 -spec detokenize(model(), [barrel_inference_nif:token_id()]) ->

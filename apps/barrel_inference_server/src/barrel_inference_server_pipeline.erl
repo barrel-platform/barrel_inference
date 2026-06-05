@@ -275,7 +275,20 @@ render_template_autoparser(W, R) ->
             case
                 call_engine_with_recovery(
                     W,
-                    fun() -> barrel_inference:tokenize(ModelId, PromptBin) end,
+                    fun() ->
+                        %% Chat-template output uses model-specific special
+                        %% tokens (`[INST]`, `[AVAILABLE_TOOLS]`, ...). They
+                        %% must tokenise as single special-token ids, not
+                        %% raw character sequences, or the model can not
+                        %% recognise turn / tool-block boundaries and bails
+                        %% with an immediate EOS. The 2-arity tokenize
+                        %% defaults to `parse_special => false' which is
+                        %% wrong here.
+                        barrel_inference:tokenize(
+                            ModelId, PromptBin,
+                            #{add_special => false, parse_special => true}
+                        )
+                    end,
                     tokenize
                 )
             of
@@ -527,7 +540,12 @@ head_tokens(W, System0, Tools0) ->
             Call = fun() -> barrel_inference:chat_apply(ModelId, Inputs) end,
             case call_engine_with_recovery(W, Call, chat_apply) of
                 {ok, {ok, _ParamsRef, PromptBin}} ->
-                    TokCall = fun() -> barrel_inference:tokenize(ModelId, PromptBin) end,
+                    TokCall = fun() ->
+                        barrel_inference:tokenize(
+                            ModelId, PromptBin,
+                            #{add_special => false, parse_special => true}
+                        )
+                    end,
                     case call_engine_with_recovery(W, TokCall, tokenize) of
                         {ok, {ok, HeadTokens}} ->
                             ets:insert(?PREFIX_HEAD_TBL, {MemoKey, HeadTokens}),

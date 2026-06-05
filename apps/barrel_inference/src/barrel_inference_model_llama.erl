@@ -26,6 +26,7 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     init/1,
     terminate/1,
     tokenize/2,
+    tokenize/3,
     detokenize/2,
     prefill/2,
     decode_one/2,
@@ -164,6 +165,9 @@ abort_handle(#s{ctx = Ctx}) ->
 
 tokenize(#s{model = M}, Text) ->
     barrel_inference_nif:tokenize(M, Text, #{add_special => true, parse_special => false}).
+
+tokenize(#s{model = M}, Text, Opts) when is_map(Opts) ->
+    barrel_inference_nif:tokenize(M, Text, Opts).
 
 detokenize(#s{model = M}, Tokens) ->
     barrel_inference_nif:detokenize(M, Tokens).
