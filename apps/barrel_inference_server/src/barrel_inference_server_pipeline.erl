@@ -285,7 +285,8 @@ render_template_autoparser(W, R) ->
                         %% defaults to `parse_special => false' which is
                         %% wrong here.
                         barrel_inference:tokenize(
-                            ModelId, PromptBin,
+                            ModelId,
+                            PromptBin,
                             #{add_special => false, parse_special => true}
                         )
                     end,
@@ -542,7 +543,8 @@ head_tokens(W, System0, Tools0) ->
                 {ok, {ok, _ParamsRef, PromptBin}} ->
                     TokCall = fun() ->
                         barrel_inference:tokenize(
-                            ModelId, PromptBin,
+                            ModelId,
+                            PromptBin,
                             #{add_special => false, parse_special => true}
                         )
                     end,
