@@ -540,12 +540,18 @@ normalise_residency(<<"lazy">>) ->
     lazy;
 normalise_residency(<<"pinned">>) ->
     pinned;
+normalise_residency(<<"lazy_then_pin_resident">>) ->
+    lazy_pin_resident;
 normalise_residency(eager) ->
     eager;
 normalise_residency(lazy) ->
     lazy;
 normalise_residency(pinned) ->
     pinned;
+normalise_residency(lazy_then_pin_resident) ->
+    lazy_pin_resident;
+normalise_residency(lazy_pin_resident) ->
+    lazy_pin_resident;
 normalise_residency(Other) ->
     logger:warning(
         "barrel_inference_server: ignoring unknown weight_residency value "
@@ -554,9 +560,24 @@ normalise_residency(Other) ->
     ),
     barrel_inference_server_config:weight_residency_default().
 
-residency_to_opts(eager) -> #{use_mmap => true, use_mlock => false, prefetch => true};
-residency_to_opts(lazy) -> #{use_mmap => true, use_mlock => false, prefetch => false};
-residency_to_opts(pinned) -> #{use_mmap => true, use_mlock => true, prefetch => true}.
+residency_to_opts(eager) ->
+    #{use_mmap => true, use_mlock => false, prefetch => true};
+residency_to_opts(lazy) ->
+    #{use_mmap => true, use_mlock => false, prefetch => false};
+residency_to_opts(pinned) ->
+    #{use_mmap => true, use_mlock => true, prefetch => true};
+residency_to_opts(lazy_pin_resident) ->
+    %% Load like lazy (MADV_RANDOM, no mlock up front). The scheduler then
+    %% mlocks just the resident pages after the first request completes.
+    %% The `pin_resident_after_first_request' flag lives next to the
+    %% three llama-cpp booleans because the model gen_statem reads it
+    %% from the same model_opts map at init.
+    #{
+        use_mmap => true,
+        use_mlock => false,
+        prefetch => false,
+        pin_resident_after_first_request => true
+    }.
 
 %% Modelfile PARAMETER (Params) takes precedence over the manifest's
 %% loader sub-map. n_gpu_layers must be a positive integer to count

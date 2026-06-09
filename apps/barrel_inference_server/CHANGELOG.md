@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Fourth `loader.weight_residency` mode: `lazy_then_pin_resident`. Loads
+  with `MADV_RANDOM` (kernel does not read ahead); once the first request
+  completes the scheduler calls the backend's `pin_resident_pages/1` to
+  mlock just the working set the prompt selected. Pages outside the
+  set still page in lazily on later prompts but are not pinned. The
+  closest barrel-level approximation of Apple's "per-prompt expert
+  routing" idea (AFM3) for off-the-shelf dense GGUFs. Operator-facing
+  surface is identical to the other modes (manifest field + Modelfile
+  PARAMETER + app env). One-shot per model load; failures are logged
+  and the model continues unpinned.
+
 - New `loader.weight_residency` manifest field (and matching Modelfile
   `PARAMETER weight_residency`). Accepts `eager` (current default,
   kernel reads ahead), `lazy` (`MADV_RANDOM`, the kernel only pages
