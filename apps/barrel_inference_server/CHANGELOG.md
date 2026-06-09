@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- New Prometheus gauge `barrel_inference_resident_bytes{model=...}`,
+  sampled per /metrics scrape via `mincore(2)`. Reports bytes of the
+  model's mmap regions currently faulted in, so operators can watch
+  the working set evolve under `weight_residency = lazy` and
+  `lazy_then_pin_resident`. Scrape cost is one extra mincore walk per
+  loaded model (~few ms each on Apple silicon for a 24 B model).
+
 - Fourth `loader.weight_residency` mode: `lazy_then_pin_resident`. Loads
   with `MADV_RANDOM` (kernel does not read ahead); once the first request
   completes the scheduler calls the backend's `pin_resident_pages/1` to

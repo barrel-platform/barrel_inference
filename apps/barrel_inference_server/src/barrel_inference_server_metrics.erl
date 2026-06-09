@@ -190,6 +190,22 @@ init() ->
             #{description => <<"Models currently loaded">>}
         )
     ),
+    put_inst(
+        resident_bytes,
+        instrument_meter:create_gauge(
+            M,
+            <<"barrel_inference_resident_bytes">>,
+            #{
+                description =>
+                    <<
+                        "Bytes of a loaded model's mmap regions currently "
+                        "resident (faulted in). Sampled per /metrics scrape "
+                        "via mincore(2)."
+                    >>,
+                unit => <<"By">>
+            }
+        )
+    ),
     ok.
 
 %%====================================================================
@@ -289,7 +305,46 @@ update_cache_gauges() ->
             ok;
         _ ->
             ok
-    end.
+    end,
+    sample_resident_bytes(),
+    ok.
+
+%% Sample `barrel_inference:resident_bytes/1' once per loaded model and
+%% surface as the `barrel_inference_resident_bytes{model=...}' gauge.
+%% Runs on the /metrics scrape path so the cost is paid only when a
+%% Prometheus client asks. mincore over a 14 GB model is a few ms on
+%% Apple silicon, which is well within scrape budget for the
+%% single-model case; multi-model deployments should keep an eye on the
+%% scrape duration histogram if it shows up.
+sample_resident_bytes() ->
+    Inst = inst(resident_bytes),
+    Infos =
+        try barrel_inference:list_models() of
+            L when is_list(L) -> L;
+            _ -> []
+        catch
+            _:_ -> []
+        end,
+    lists:foreach(
+        fun(Info) ->
+            case maps:get(model_id, Info, undefined) of
+                ModelId when is_binary(ModelId) ->
+                    try barrel_inference:resident_bytes(ModelId) of
+                        N when is_integer(N), N >= 0 ->
+                            instrument_meter:record(
+                                Inst, N, #{model => ModelId}
+                            );
+                        _ ->
+                            ok
+                    catch
+                        _:_ -> ok
+                    end;
+                _ ->
+                    ok
+            end
+        end,
+        Infos
+    ).
 
 project_delta(Model, Kind, NewTotal) ->
     Key = {?MODULE, cache_seen, Model, Kind},
