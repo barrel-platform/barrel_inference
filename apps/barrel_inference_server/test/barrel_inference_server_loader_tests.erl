@@ -254,6 +254,26 @@ manifest_to_config_weight_residency_pinned_test() ->
     ?assertEqual(true, maps:get(use_mlock, ModelOpts)),
     ?assertEqual(true, maps:get(prefetch, ModelOpts)).
 
+%% Manifest `loader.weight_residency = "lazy_then_pin_resident"` -> load
+%% lazy (prefetch=false) AND surface the `pin_resident_after_first_request'
+%% flag so the scheduler pins the resident set after the first request
+%% completes.
+manifest_to_config_weight_residency_lazy_then_pin_resident_test() ->
+    Manifest = (manifest(<<"sha256:1006">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{
+            <<"quant_bits">> => 4,
+            <<"weight_residency">> => <<"lazy_then_pin_resident">>
+        }
+    },
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ModelOpts = maps:get(model_opts, Config),
+    ?assertEqual(true, maps:get(use_mmap, ModelOpts)),
+    ?assertEqual(false, maps:get(use_mlock, ModelOpts)),
+    ?assertEqual(false, maps:get(prefetch, ModelOpts)),
+    ?assertEqual(
+        true, maps:get(pin_resident_after_first_request, ModelOpts)
+    ).
+
 %% Modelfile PARAMETER `weight_residency` wins over the manifest's
 %% loader value (same precedence as n_ctx).
 manifest_to_config_weight_residency_param_overrides_loader_test() ->
