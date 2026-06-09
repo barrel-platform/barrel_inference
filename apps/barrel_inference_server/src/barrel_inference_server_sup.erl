@@ -40,13 +40,6 @@ init([]) ->
         },
 
         #{
-            id => barrel_inference_server_tool_replay,
-            start => {barrel_inference_server_tool_replay, start_link, []},
-            type => worker,
-            shutdown => 5000
-        },
-
-        #{
             id => barrel_inference_server_session_state,
             start => {barrel_inference_server_session_state, start_link, []},
             type => worker,

@@ -402,39 +402,10 @@ loader_opts(Quant, Ctx, Tpl, IsEmbed) ->
             true -> Base0#{<<"embeddings">> => true};
             false -> Base0
         end,
-    Base1 = maybe_merge_tool_call(Base, detect_tool_call_format(Tpl)),
-    maybe_merge_thinking(Base1, detect_thinking_markers(Tpl)).
+    maybe_merge_thinking(Base, detect_thinking_markers(Tpl)).
 
 cap_ctx(undefined) -> undefined;
 cap_ctx(N) when is_integer(N) -> min(N, ?DEFAULT_PULL_MAX_CTX).
-
-maybe_merge_tool_call(Base, not_detected) ->
-    Base;
-maybe_merge_tool_call(Base, {ok, Name, undefined}) ->
-    %% Marker-less family (e.g. `llama-pythonic', `phi4-functools'):
-    %% the family opts into the handlers' post-parse path on
-    %% `buf_text' rather than the engine's native marker capture,
-    %% so the manifest carries only the format name. No
-    %% `tool_call_markers' is set, which keeps
-    %% `barrel_inference_server_tool_format:native_turn/1' returning
-    %% `none' for the request - the request still streams normally
-    %% and the handler post-parses on done.
-    Base#{<<"tool_call_format">> => Name};
-maybe_merge_tool_call(Base, {ok, Name, #{start := Start, 'end' := End}}) ->
-    Markers0 = #{<<"start">> => Start, <<"end">> => End},
-    %% Optional family-supplied extras (currently only
-    %% `mistral-args' returns `#{<<"payload_start">> => <<"[ARGS]">>}',
-    %% which flips the engine's greedy syntax sampler to the
-    %% request's normal sampler for the args span).
-    Markers =
-        case barrel_inference_server_tool_format:payload_markers(Name) of
-            undefined -> Markers0;
-            Extra -> maps:merge(Markers0, Extra)
-        end,
-    Base#{
-        <<"tool_call_format">> => Name,
-        <<"tool_call_markers">> => Markers
-    }.
 
 maybe_merge_thinking(Base, undefined) ->
     Base;
@@ -445,23 +416,6 @@ maybe_merge_thinking(Base, {Start, End}) ->
             <<"end">> => End
         }
     }.
-
-%% Chat-template detection dispatch. Each format family declares
-%% its own `detect/1' callback in
-%% `apps/barrel_inference_server/src/tool_formats/'; the
-%% `barrel_inference_server_tool_format' behaviour walks the
-%% include-file family list top to bottom and returns the first
-%% `{detected, _}' match. Templates that match none fall through,
-%% leaving the loader without `tool_call_markers' /
-%% `tool_call_format' so the engine uses the legacy GBNF
-%% `text-response | tool-N' grammar. Mirrors Ollama's
-%% auto-detect-at-pull-time pattern.
-detect_tool_call_format(undefined) ->
-    not_detected;
-detect_tool_call_format(<<>>) ->
-    not_detected;
-detect_tool_call_format(Template) when is_binary(Template) ->
-    barrel_inference_server_tool_format:detect(Template).
 
 %% Scan the chat_template for known reasoning-block delimiters.
 %% Two families ship today: `<think>...</think>' (Qwen3, QwQ,

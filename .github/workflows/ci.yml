@@ -59,6 +59,20 @@ jobs:
             ~/.cache/rebar3
           key: build-ubuntu-24.04-otp-${{ env.OTP_VERSION }}-${{ hashFiles('rebar.lock', 'apps/barrel_inference/c_src/llama.cpp/CMakeLists.txt') }}
           restore-keys: build-ubuntu-24.04-otp-${{ env.OTP_VERSION }}-
+      - name: Prune orphan .beam files (sources removed since cache)
+        run: |
+          for app in apps/*/; do
+            name=$(basename "$app")
+            ebin="_build/default/lib/${name}/ebin"
+            [ -d "$ebin" ] || continue
+            for beam in "$ebin"/*.beam; do
+              [ -e "$beam" ] || continue
+              mod=$(basename "$beam" .beam)
+              if ! find "$app" -name "${mod}.erl" -print -quit | grep -q .; then
+                rm -f "$beam"
+              fi
+            done
+          done
       - run: rebar3 xref
 
   # Single PLT across the whole umbrella, keyed to the umbrella lock.

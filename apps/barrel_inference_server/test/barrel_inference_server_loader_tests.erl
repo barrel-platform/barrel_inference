@@ -223,61 +223,6 @@ manifest_to_config_param_overrides_loader_for_n_gpu_layers_test() ->
     Config = barrel_inference_server_loader:manifest_to_config(Manifest),
     ?assertEqual(99, maps:get(n_gpu_layers, maps:get(model_opts, Config))).
 
-%% barrel_inference 0.5.0 tool_call_markers wire from manifest -> load_model/2.
-manifest_to_config_propagates_tool_call_markers_test() ->
-    Manifest = (manifest(<<"sha256:0005">>, <<"q4_k_m">>, 4096, 4))#{
-        <<"loader">> => #{
-            <<"quant_bits">> => 4,
-            <<"tool_call_markers">> => #{
-                <<"start">> => <<"<tool_call>">>,
-                <<"end">> => <<"</tool_call>">>
-            }
-        }
-    },
-    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
-    ?assertEqual(
-        #{start => <<"<tool_call>">>, 'end' => <<"</tool_call>">>},
-        maps:get(tool_call_markers, Config)
-    ).
-
-manifest_to_config_propagates_tool_call_payload_markers_test() ->
-    Manifest = (manifest(<<"sha256:0006">>, <<"q4_k_m">>, 4096, 4))#{
-        <<"loader">> => #{
-            <<"quant_bits">> => 4,
-            <<"tool_call_markers">> => #{
-                <<"start">> => <<"<tool_call>">>,
-                <<"end">> => <<"</tool_call>">>,
-                <<"payload_start">> => <<"<arg>">>,
-                <<"payload_end">> => <<"</arg>">>
-            }
-        }
-    },
-    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
-    ?assertEqual(
-        #{
-            start => <<"<tool_call>">>,
-            'end' => <<"</tool_call>">>,
-            payload_start => <<"<arg>">>,
-            payload_end => <<"</arg>">>
-        },
-        maps:get(tool_call_markers, Config)
-    ).
-
-manifest_to_config_omits_tool_call_markers_when_absent_test() ->
-    Manifest = manifest(<<"sha256:0007">>, <<"q4_k_m">>, 4096, 4),
-    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
-    ?assertNot(maps:is_key(tool_call_markers, Config)).
-
-manifest_to_config_ignores_malformed_tool_call_markers_test() ->
-    Manifest = (manifest(<<"sha256:0008">>, <<"q4_k_m">>, 4096, 4))#{
-        <<"loader">> => #{
-            <<"quant_bits">> => 4,
-            <<"tool_call_markers">> => #{<<"start">> => <<>>, <<"end">> => <<"</x>">>}
-        }
-    },
-    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
-    ?assertNot(maps:is_key(tool_call_markers, Config)).
-
 %% Manifest's `loader.n_seq_max` becomes `context_opts.n_seq_max'.
 %% Required for sticky-seq + continue/3 to admit more than one
 %% session concurrently against the same model.

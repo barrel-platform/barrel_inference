@@ -6,27 +6,34 @@
 Shared handler-side autoparser bridge.
 
 Each of `barrel_inference_server_h_chat', `barrel_inference_server_h_messages',
-and `barrel_inference_server_h_responses' calls
-`maybe_extract/4' on `barrel_inference_done' when no tool calls were
-captured by the engine's marker path. The helper rebuilds (or fetches
-from cache) a chat params_ref for `(Model, ToolsHash)' and parses the
-buffered response text via llama.cpp's autoparser.
+and `barrel_inference_server_h_responses' calls `maybe_extract/4'
+on `barrel_inference_done'. The bridge takes the `ParamsRef'
+that the pipeline built at admit time (and carried admit -> done
+on the `{pipeline, templated, Tokens, ParamsRef}' message),
+parses the buffered response text via llama.cpp's autoparser,
+and translates each `tool_call' into the handler's captured-call
+shape (`#{id, name, input, full_bin}').
 
-When the parser returns at least one tool_call, the helper translates
-each to the handler's captured-call shape
-(`#{id, name, input, full_bin}'); when it returns none, the helper
-returns `none' so the handler dispatches its existing
-text-only path.
+This is now the PRIMARY path. The engine's per-token marker
+scanner is gone; tool-call classification happens once, post-decode,
+via `barrel_inference:chat_parse/3'.
 
-This is the fall-back path: models whose manifest carries
-`tool_call_markers' continue to capture via the engine's
-per-token marker scanner. The autoparser only fires when that
-yields nothing.
+The bridge short-circuits to `none' (no NIF call) when:
+- `ParamsRef' is `undefined' (raw-prompt path; no autoparser was
+  set up at admit time), OR
+- the request's `tools' field is `undefined' / `[]' (no tools were
+  requested; no work to do).
+
+`build_inputs(Request)' is the canonical Inputs shape; the
+pipeline also calls it to render the prompt. The autoparser NIF
+expects a map with `messages' (JSON binary, with system folded
+in), `tools' (JSON binary), `tool_choice' (atom), and
+`parallel_tool_calls' (atom).
 """.
 
 -include_lib("barrel_inference_server/include/barrel_inference_server.hrl").
 
--export([maybe_extract/4]).
+-export([maybe_extract/4, build_inputs/1]).
 
 -export_type([captured_call/0]).
 
@@ -37,65 +44,90 @@ yields nothing.
     full_bin := binary()
 }.
 
-%% Attempt to extract tool calls from BufText for (Model, Request).
-%% Returns `{ok, [Call]}' on a non-empty extraction, `none'
-%% otherwise (no tools requested, no model_ref support, parser
+%% Attempt to extract tool calls from BufText using the carried
+%% ParamsRef. Returns `{ok, [Call]}' on a non-empty extraction,
+%% `none' otherwise (params undefined, no tools requested, parser
 %% returned no tool calls, or any error).
 -spec maybe_extract(
-    Model :: binary(),
+    ParamsRef :: undefined | barrel_inference_nif:chat_params_ref(),
     Request :: #barrel_inference_request{},
     BufText :: iodata(),
     ApiHint :: openai | anthropic
 ) ->
     {ok, [captured_call()]} | none.
-maybe_extract(_Model, #barrel_inference_request{tools = undefined}, _BufText, _Api) ->
+maybe_extract(undefined, _Request, _BufText, _Api) ->
     none;
-maybe_extract(_Model, #barrel_inference_request{tools = []}, _BufText, _Api) ->
+maybe_extract(_Params, #barrel_inference_request{tools = undefined}, _BufText, _Api) ->
     none;
-maybe_extract(
-    Model,
-    #barrel_inference_request{tools = Tools, messages = Messages, system = System},
-    BufText,
-    _Api
-) ->
+maybe_extract(_Params, #barrel_inference_request{tools = []}, _BufText, _Api) ->
+    none;
+maybe_extract(Params, _Request, BufText, _Api) ->
     BufBin = iolist_to_binary(BufText),
-    Inputs = build_inputs(Messages, System, Tools),
-    ToolsHash = tools_hash(Tools),
-    case barrel_inference:chat_apply(Model, ToolsHash, Inputs) of
-        {ok, Params, _Prompt} ->
-            case barrel_inference:chat_parse(Params, BufBin, false) of
-                {ok, #{tool_calls := [_ | _] = Calls}} ->
-                    {ok, [translate(C, BufBin) || C <- Calls]};
-                _ ->
-                    none
-            end;
+    case barrel_inference:chat_parse(Params, BufBin, false) of
+        {ok, #{tool_calls := [_ | _] = Calls}} ->
+            {ok, [translate(C, BufBin) || C <- Calls]};
         _ ->
             none
     end.
 
-%% =============================================================================
-%% Internals
-%% =============================================================================
-
-build_inputs(Messages, System, Tools) ->
+%% Canonical Inputs builder used by BOTH the pipeline (prompt
+%% render) AND the autoparser bridge (well, used to - the bridge
+%% now uses the carried params and doesn't need this). The pipeline
+%% imports it from here so prompt-render and parse share one shape.
+%%
+%% Behaviour:
+%% - `messages' (JSON binary) is the user-supplied list prepended
+%%   with a synthetic `system' message when `Request.system' is
+%%   non-empty (the NIF reads only `messages'; `system' is not a
+%%   separate Inputs key).
+%% - `tools' (JSON binary): pass through. For `tool_choice =
+%%   {named, Name}', filter to just that tool.
+%% - `tool_choice' (atom): `auto' | `required' | `none'.
+%%   `{named, _}' -> `required' (plus the tools filter above).
+%% - `parallel_tool_calls' (atom): `true' | `false'.
+-spec build_inputs(#barrel_inference_request{}) -> map().
+build_inputs(#barrel_inference_request{
+    messages = Messages,
+    system = System,
+    tools = Tools0,
+    tool_choice = ToolChoice0,
+    parallel_tool_calls = Parallel
+}) ->
     SysMsg =
         case System of
             undefined -> [];
             <<>> -> [];
             S when is_binary(S) -> [#{<<"role">> => <<"system">>, <<"content">> => S}]
         end,
-    %% `messages' on `#barrel_inference_request{}' is always a list
-    %% (possibly empty); the type spec forbids `undefined' here.
-    UserMsgs = Messages,
-    MsgsJson = iolist_to_binary(json:encode(SysMsg ++ UserMsgs)),
-    ToolsJson = iolist_to_binary(json:encode(Tools)),
+    {Tools, ToolChoiceAtom} = map_tool_choice(Tools0, ToolChoice0),
+    MsgsJson = iolist_to_binary(json:encode(SysMsg ++ Messages)),
+    ToolsJson = iolist_to_binary(json:encode(safe_list(Tools))),
     #{
         messages => MsgsJson,
-        tools => ToolsJson
+        tools => ToolsJson,
+        tool_choice => ToolChoiceAtom,
+        parallel_tool_calls => bool_atom(Parallel)
     }.
 
-tools_hash(Tools) ->
-    crypto:hash(sha256, iolist_to_binary(json:encode(Tools))).
+%% =============================================================================
+%% Internals
+%% =============================================================================
+
+map_tool_choice(Tools, auto) ->
+    {Tools, auto};
+map_tool_choice(Tools, required) ->
+    {Tools, required};
+map_tool_choice(_Tools, none) ->
+    {[], none};
+map_tool_choice(Tools, {named, Name}) ->
+    Filtered = [T || T = #{name := N} <- safe_list(Tools), N =:= Name],
+    {Filtered, required}.
+
+safe_list(undefined) -> [];
+safe_list(L) when is_list(L) -> L.
+
+bool_atom(true) -> true;
+bool_atom(_) -> false.
 
 translate(#{name := Name, arguments := Args}, BufBin) ->
     Id = make_tool_id(),

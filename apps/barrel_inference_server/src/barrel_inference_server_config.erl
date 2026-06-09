@@ -23,12 +23,8 @@
     generation_ping_ms/0,
     anthropic_api_keys/0,
     anthropic_retry_after_seconds/0,
-    tool_call_formats/0,
     builtin_tool_executors/0,
     max_tool_iterations/0,
-    tool_replay_dir/0,
-    tool_replay_ttl_ms/0,
-    tool_replay_gc_interval_ms/0,
     responses_store_ttl_ms/0,
     responses_store_gc_interval_ms/0,
     pool_policy_for/1,
@@ -173,21 +169,6 @@ anthropic_api_keys() ->
 anthropic_retry_after_seconds() ->
     persistent_term:get({?MODULE, anthropic_retry_after_seconds}, 5).
 
-%% Per-format tool-call registry used by barrel_inference_server_tool_format.
-%% Built-in defaults derive from the include-file family list in
-%% `barrel_inference_server_tool_format:formats/0' (single source of
-%% truth: `include/barrel_inference_server_tool_formats.hrl');
-%% operators may merge additional entries via the `tool_call_formats'
-%% app env (the init merge keeps both). The persistent_term fallback
-%% also delegates to the family list so registry lookups work in
-%% dev shell / early eunit before the boot init has run.
--spec tool_call_formats() -> #{binary() => map()}.
-tool_call_formats() ->
-    persistent_term:get(
-        {?MODULE, tool_call_formats},
-        barrel_inference_server_tool_format:formats()
-    ).
-
 %% Registry of server-side built-in tool executors used by
 %% barrel_inference_server_tool_executor. Keyed by the OpenAI built-in tool
 %% `type` binary (e.g. <<"web_search">>); each value is an executor
@@ -211,39 +192,6 @@ default_builtin_tool_executors() ->
 max_tool_iterations() ->
     persistent_term:get({?MODULE, max_tool_iterations}, 5).
 
-%% Directory hosting the exact-replay DETS file used by
-%% barrel_inference_server_tool_replay. Defaults to a `replay` sibling of the
-%% model cache root so storage stays grouped with the KV cache.
--spec tool_replay_dir() -> string().
-tool_replay_dir() ->
-    case application:get_env(?APP, tool_replay_dir) of
-        {ok, Path} when Path =/= undefined ->
-            ensure_string(Path);
-        _ ->
-            {ok, Root} = barrel_inference_server_fetch:cache_root(),
-            filename:join(ensure_string(Root), "replay")
-    end.
-
-%% TTL on stored replay rows. Defaults to 30 days, long enough to
-%% outlive typical Claude Code sessions but bounded so the DETS file
-%% doesn't grow without bound.
--spec tool_replay_ttl_ms() -> pos_integer().
-tool_replay_ttl_ms() ->
-    persistent_term:get(
-        {?MODULE, tool_replay_ttl_ms},
-        30 * 24 * 60 * 60 * 1000
-    ).
-
-%% Cadence of the periodic gc that evicts expired replay rows.
-%% Defaults to 1h; the cost of running gc is one ETS select plus a
-%% few dets:delete/2 calls, so the cadence isn't load-bearing.
--spec tool_replay_gc_interval_ms() -> pos_integer().
-tool_replay_gc_interval_ms() ->
-    persistent_term:get(
-        {?MODULE, tool_replay_gc_interval_ms},
-        60 * 60 * 1000
-    ).
-
 %% TTL on stored Responses-API conversations for `previous_response_id'
 %% continuation. Defaults to 1h: long enough for an interactive Codex
 %% session, short enough that the RAM-only map stays bounded.
@@ -261,9 +209,6 @@ responses_store_gc_interval_ms() ->
         {?MODULE, responses_store_gc_interval_ms},
         10 * 60 * 1000
     ).
-
-ensure_string(B) when is_binary(B) -> binary_to_list(B);
-ensure_string(L) when is_list(L) -> L.
 
 -spec tracing_config() -> off | {otlp, binary()}.
 tracing_config() ->
@@ -383,13 +328,6 @@ init([]) ->
         app_env(anthropic_retry_after_seconds, 5)
     ),
     persistent_term:put(
-        {?MODULE, tool_call_formats},
-        maps:merge(
-            barrel_inference_server_tool_format:formats(),
-            app_env(tool_call_formats, #{})
-        )
-    ),
-    persistent_term:put(
         {?MODULE, builtin_tool_executors},
         maps:merge(
             default_builtin_tool_executors(), app_env(builtin_tool_executors, #{})
@@ -398,14 +336,6 @@ init([]) ->
     persistent_term:put(
         {?MODULE, max_tool_iterations},
         app_env(max_tool_iterations, 5)
-    ),
-    persistent_term:put(
-        {?MODULE, tool_replay_ttl_ms},
-        app_env(tool_replay_ttl_ms, 30 * 24 * 60 * 60 * 1000)
-    ),
-    persistent_term:put(
-        {?MODULE, tool_replay_gc_interval_ms},
-        app_env(tool_replay_gc_interval_ms, 60 * 60 * 1000)
     ),
     persistent_term:put(
         {?MODULE, responses_store_ttl_ms},
