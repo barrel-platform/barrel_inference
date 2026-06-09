@@ -387,6 +387,13 @@ effective_context_size(Manifest) when is_map(Manifest) ->
             undefined
     end.
 
+%% Build the manifest's `loader' sub-map at pull time. Fields here are
+%% pull-detected (n_ctx from gguf metadata, thinking_markers from the
+%% chat template). Operator-supplied fields like
+%% `weight_residency :: <<"eager">> | <<"lazy">> | <<"pinned">>' are
+%% NOT auto-written; operators set them via `/api/edit' or a Modelfile
+%% PARAMETER, and the loader resolves the residency mode to a
+%% `(use_mmap, use_mlock, prefetch)' triple on `model_opts'.
 loader_opts(Quant, Ctx, Tpl, IsEmbed) ->
     Base0 = #{
         <<"n_gpu_layers">> => 0,

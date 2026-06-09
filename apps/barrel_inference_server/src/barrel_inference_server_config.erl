@@ -33,6 +33,7 @@
     request_id_header/0,
     auto_pull/0,
     keep_alive_default_ms/0,
+    weight_residency_default/0,
     ensure_loaded_async/3
 ]).
 
@@ -238,6 +239,14 @@ auto_pull() ->
 keep_alive_default_ms() ->
     persistent_term:get({?MODULE, keep_alive_default_ms}, 300000).
 
+%% Fleet-wide default for `loader.weight_residency` when neither the
+%% manifest nor a Modelfile PARAMETER specifies one. Maps to a triple
+%% of `(use_mmap, use_mlock, prefetch)` flags on the NIF side via the
+%% loader. `eager` matches the long-standing behaviour.
+-spec weight_residency_default() -> eager | lazy | pinned.
+weight_residency_default() ->
+    persistent_term:get({?MODULE, weight_residency_default}, eager).
+
 %% Synchronous on a successful in-cache check; otherwise the call is
 %% un-replied and the loader process replies later. Caller's deadline
 %% is honoured by the loader.
@@ -319,6 +328,10 @@ init([]) ->
     persistent_term:put(
         {?MODULE, keep_alive_default_ms},
         app_env(keep_alive_default_ms, 300000)
+    ),
+    persistent_term:put(
+        {?MODULE, weight_residency_default},
+        normalise_residency_env(app_env(weight_residency_default, eager))
     ),
     persistent_term:put(
         {?MODULE, anthropic_api_keys}, app_env(anthropic_api_keys, [])
@@ -409,6 +422,35 @@ terminate(_, _) -> ok.
 
 app_env(Key, Default) ->
     application:get_env(?APP, Key, Default).
+
+%% Coerce the `weight_residency_default' app env (atom or string) to
+%% one of the three accepted atoms. Unknown values log once at boot
+%% and fall back to `eager`.
+normalise_residency_env(eager) ->
+    eager;
+normalise_residency_env(lazy) ->
+    lazy;
+normalise_residency_env(pinned) ->
+    pinned;
+normalise_residency_env(<<"eager">>) ->
+    eager;
+normalise_residency_env(<<"lazy">>) ->
+    lazy;
+normalise_residency_env(<<"pinned">>) ->
+    pinned;
+normalise_residency_env("eager") ->
+    eager;
+normalise_residency_env("lazy") ->
+    lazy;
+normalise_residency_env("pinned") ->
+    pinned;
+normalise_residency_env(Other) ->
+    logger:warning(
+        "barrel_inference_server: ignoring unknown weight_residency_default "
+        "app env ~p; using eager",
+        [Other]
+    ),
+    eager.
 
 fast_check(ModelId) ->
     %% barrel_inference:model_info/1 returns the map directly when loaded and
