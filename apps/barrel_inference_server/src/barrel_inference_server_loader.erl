@@ -508,7 +508,7 @@ model_opts_from(Loader, Params) ->
         {use_mmap, <<"use_mmap">>},
         {use_mlock, <<"use_mlock">>}
     ],
-    lists:foldl(
+    Base = lists:foldl(
         fun({Atom, BinKey}, Acc) ->
             case manifest_param(BinKey, Loader, Params) of
                 undefined -> Acc;
@@ -517,7 +517,46 @@ model_opts_from(Loader, Params) ->
         end,
         #{},
         Sources
-    ).
+    ),
+    maps:merge(Base, residency_opts(Loader, Params)).
+
+%% Resolve `loader.weight_residency' (manifest) or Modelfile PARAMETER
+%% `weight_residency' to the `{use_mmap, use_mlock, prefetch}' triple
+%% the NIF reads. The named-mode form is the operator-facing surface;
+%% direct overrides of `use_mmap' / `use_mlock' (above) still win when
+%% set, so this layer only fills in the explicit residency choice.
+%% Unknown values fall back to the config-level default with a logger
+%% warning; missing values defer to `weight_residency_default/0'.
+residency_opts(Loader, Params) ->
+    Raw = manifest_param(<<"weight_residency">>, Loader, Params),
+    Mode = normalise_residency(Raw),
+    residency_to_opts(Mode).
+
+normalise_residency(undefined) ->
+    barrel_inference_server_config:weight_residency_default();
+normalise_residency(<<"eager">>) ->
+    eager;
+normalise_residency(<<"lazy">>) ->
+    lazy;
+normalise_residency(<<"pinned">>) ->
+    pinned;
+normalise_residency(eager) ->
+    eager;
+normalise_residency(lazy) ->
+    lazy;
+normalise_residency(pinned) ->
+    pinned;
+normalise_residency(Other) ->
+    logger:warning(
+        "barrel_inference_server: ignoring unknown weight_residency value "
+        "~p; falling back to default",
+        [Other]
+    ),
+    barrel_inference_server_config:weight_residency_default().
+
+residency_to_opts(eager) -> #{use_mmap => true, use_mlock => false, prefetch => true};
+residency_to_opts(lazy) -> #{use_mmap => true, use_mlock => false, prefetch => false};
+residency_to_opts(pinned) -> #{use_mmap => true, use_mlock => true, prefetch => true}.
 
 %% Modelfile PARAMETER (Params) takes precedence over the manifest's
 %% loader sub-map. n_gpu_layers must be a positive integer to count

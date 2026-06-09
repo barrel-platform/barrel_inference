@@ -214,6 +214,76 @@ manifest_to_config_drops_zero_n_gpu_layers_test() ->
     ModelOpts = maps:get(model_opts, Config),
     ?assertNot(maps:is_key(n_gpu_layers, ModelOpts)).
 
+%% weight_residency default (no manifest field, no Modelfile parameter):
+%% mode `eager` from the config getter yields use_mmap=true, use_mlock=false,
+%% prefetch=true in model_opts.
+manifest_to_config_weight_residency_default_eager_test() ->
+    Manifest = manifest(<<"sha256:1001">>, <<"q4_k_m">>, 4096, 4),
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ModelOpts = maps:get(model_opts, Config),
+    ?assertEqual(true, maps:get(use_mmap, ModelOpts)),
+    ?assertEqual(false, maps:get(use_mlock, ModelOpts)),
+    ?assertEqual(true, maps:get(prefetch, ModelOpts)).
+
+%% Manifest `loader.weight_residency = "lazy"` -> use_mmap=true,
+%% use_mlock=false, prefetch=false. The kernel skips read-ahead.
+manifest_to_config_weight_residency_lazy_test() ->
+    Manifest = (manifest(<<"sha256:1002">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{
+            <<"quant_bits">> => 4,
+            <<"weight_residency">> => <<"lazy">>
+        }
+    },
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ModelOpts = maps:get(model_opts, Config),
+    ?assertEqual(true, maps:get(use_mmap, ModelOpts)),
+    ?assertEqual(false, maps:get(use_mlock, ModelOpts)),
+    ?assertEqual(false, maps:get(prefetch, ModelOpts)).
+
+%% Manifest `loader.weight_residency = "pinned"` -> use_mlock=true.
+manifest_to_config_weight_residency_pinned_test() ->
+    Manifest = (manifest(<<"sha256:1003">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{
+            <<"quant_bits">> => 4,
+            <<"weight_residency">> => <<"pinned">>
+        }
+    },
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ModelOpts = maps:get(model_opts, Config),
+    ?assertEqual(true, maps:get(use_mmap, ModelOpts)),
+    ?assertEqual(true, maps:get(use_mlock, ModelOpts)),
+    ?assertEqual(true, maps:get(prefetch, ModelOpts)).
+
+%% Modelfile PARAMETER `weight_residency` wins over the manifest's
+%% loader value (same precedence as n_ctx).
+manifest_to_config_weight_residency_param_overrides_loader_test() ->
+    Manifest = (manifest(<<"sha256:1004">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{
+            <<"quant_bits">> => 4,
+            <<"weight_residency">> => <<"eager">>
+        },
+        <<"parameters">> => #{<<"weight_residency">> => <<"lazy">>}
+    },
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ModelOpts = maps:get(model_opts, Config),
+    ?assertEqual(false, maps:get(prefetch, ModelOpts)).
+
+%% Unknown weight_residency string falls back to the config default
+%% with a logger warning (we just assert it does not crash and the
+%% triple resolves to eager).
+manifest_to_config_weight_residency_unknown_falls_back_test() ->
+    Manifest = (manifest(<<"sha256:1005">>, <<"q4_k_m">>, 4096, 4))#{
+        <<"loader">> => #{
+            <<"quant_bits">> => 4,
+            <<"weight_residency">> => <<"nonsense">>
+        }
+    },
+    Config = barrel_inference_server_loader:manifest_to_config(Manifest),
+    ModelOpts = maps:get(model_opts, Config),
+    ?assertEqual(true, maps:get(use_mmap, ModelOpts)),
+    ?assertEqual(false, maps:get(use_mlock, ModelOpts)),
+    ?assertEqual(true, maps:get(prefetch, ModelOpts)).
+
 %% Modelfile PARAMETER overrides manifest's loader value.
 manifest_to_config_param_overrides_loader_for_n_gpu_layers_test() ->
     Manifest = (manifest(<<"sha256:0004">>, <<"q4_k_m">>, 4096, 4))#{

@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- New `loader.weight_residency` manifest field (and matching Modelfile
+  `PARAMETER weight_residency`). Accepts `eager` (current default,
+  kernel reads ahead), `lazy` (`MADV_RANDOM`, the kernel only pages
+  in weights on first touch — lower peak RSS, slightly higher first-
+  token latency, useful for sparse-prompt agent workloads), and
+  `pinned` (mlock the whole file — predictable jitter on fleet nodes
+  with plenty of RAM). The loader maps the named mode to a
+  `(use_mmap, use_mlock, prefetch)` triple on `model_opts`. Modelfile
+  parameter wins over the manifest, which wins over the new fleet-wide
+  `weight_residency_default` app env. Cross-platform mlock caveats
+  (RLIMIT_MEMLOCK on macOS, capability/sysctl on Linux) are operator
+  concerns — failures degrade to a logger warning, not a crash.
+
 ### Removed
 
 - Per-family Erlang tool-call format modules (`qwen-xml`, `qwen3-coder`,
