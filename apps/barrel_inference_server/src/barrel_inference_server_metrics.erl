@@ -26,7 +26,12 @@
     inc_active_streams/1,
     dec_active_streams/1,
     set_models_loaded/1,
-    update_cache_gauges/0
+    update_cache_gauges/0,
+    %% Observer callbacks invoked by barrel_inference_chat when its
+    %% NIF entries return. Registered via barrel_inference_chat:set_observer/1
+    %% during init/0.
+    observe_chat_apply_duration/2,
+    observe_chat_parse_duration/2
 ]).
 
 -define(METER_NAME, <<"barrel_inference_server">>).
@@ -206,6 +211,56 @@ init() ->
             }
         )
     ),
+    put_inst(
+        dirty_cpu_scheduler_util,
+        instrument_meter:create_gauge(
+            M,
+            <<"barrel_inference_dirty_cpu_scheduler_util">>,
+            #{
+                description =>
+                    <<
+                        "Per-dirty-CPU-scheduler busy ratio over the window "
+                        "between two /metrics scrapes. Reads "
+                        "erlang:statistics(scheduler_wall_time_all). "
+                        "Useful for spotting saturation of the autoparser "
+                        "NIF pool."
+                    >>
+            }
+        )
+    ),
+    put_inst(
+        chat_apply_duration,
+        instrument_meter:create_histogram(
+            M,
+            <<"barrel_inference_chat_apply_duration_seconds">>,
+            #{
+                description =>
+                    <<
+                        "Wall-time of the autoparser apply-family NIF calls "
+                        "(apply / render_only / make_params)."
+                    >>,
+                unit => <<"s">>,
+                boundaries => ?PREFILL_BUCKETS
+            }
+        )
+    ),
+    put_inst(
+        chat_parse_duration,
+        instrument_meter:create_histogram(
+            M,
+            <<"barrel_inference_chat_parse_duration_seconds">>,
+            #{
+                description =>
+                    <<"Wall-time of chat_parse (PEG match) per NIF call.">>,
+                unit => <<"s">>,
+                boundaries => ?PREFILL_BUCKETS
+            }
+        )
+    ),
+    %% Wire the runtime's chat module to call our observers on every
+    %% NIF round-trip. Decoupled via persistent_term so the runtime
+    %% app carries no compile-time reference to the server.
+    ok = barrel_inference_chat:set_observer(?MODULE),
     ok.
 
 %%====================================================================
@@ -283,6 +338,27 @@ dec_active_streams(Model) ->
 set_models_loaded(N) when is_integer(N), N >= 0 ->
     instrument_meter:record(inst(models_loaded), N, #{}).
 
+%% Observer callbacks called by barrel_inference_chat on every NIF
+%% round-trip. The runtime app passes microseconds; we convert to
+%% seconds for the histogram (matches the *_duration_seconds suffix).
+observe_chat_apply_duration(Variant, ElapsedMicros) when
+    is_atom(Variant), is_integer(ElapsedMicros), ElapsedMicros >= 0
+->
+    instrument_meter:record(
+        inst(chat_apply_duration),
+        ElapsedMicros / 1.0e6,
+        #{variant => Variant}
+    ).
+
+observe_chat_parse_duration(IsPartial, ElapsedMicros) when
+    is_boolean(IsPartial), is_integer(ElapsedMicros), ElapsedMicros >= 0
+->
+    instrument_meter:record(
+        inst(chat_parse_duration),
+        ElapsedMicros / 1.0e6,
+        #{is_partial => IsPartial}
+    ).
+
 %%====================================================================
 %% Cache stats projection
 %%====================================================================
@@ -307,6 +383,7 @@ update_cache_gauges() ->
             ok
     end,
     sample_resident_bytes(),
+    sample_scheduler_util(),
     ok.
 
 %% Sample `barrel_inference:resident_bytes/1' once per loaded model and
@@ -344,6 +421,60 @@ sample_resident_bytes() ->
         end,
         Infos
     ).
+
+%% Per-scrape sample of the dirty CPU scheduler busy ratio. Reads
+%% `erlang:statistics(scheduler_wall_time_all)' (enabled at boot via
+%% `barrel_inference_app:start/2'), diffs against the per-scheduler
+%% snapshot saved in persistent_term, and emits ActiveTime / TotalTime
+%% per scheduler under the `dirty_cpu' kind. The 'normal' scheduler
+%% ratios are also recorded under `cpu' for completeness — a normal
+%% scheduler at high utilisation while NIFs are starving in the dirty
+%% pool tells a different story than dirty saturation in isolation.
+sample_scheduler_util() ->
+    case erlang:statistics(scheduler_wall_time_all) of
+        undefined ->
+            ok;
+        Stats when is_list(Stats) ->
+            Inst = inst(dirty_cpu_scheduler_util),
+            lists:foreach(
+                fun({Sched, Type, Active, Total}) ->
+                    Key = {?MODULE, sched_snap, Sched, Type},
+                    {PrevA, PrevT} = persistent_term:get(Key, {0, 0}),
+                    DA = Active - PrevA,
+                    DT = Total - PrevT,
+                    persistent_term:put(Key, {Active, Total}),
+                    case DT > 0 of
+                        true ->
+                            Kind = scheduler_kind(Type),
+                            instrument_meter:record(
+                                Inst,
+                                DA / DT,
+                                #{scheduler => Sched, kind => Kind}
+                            );
+                        false ->
+                            ok
+                    end
+                end,
+                normalise_sched_stats(Stats)
+            )
+    end.
+
+%% scheduler_wall_time_all returns 4-tuples since OTP 21 with the
+%% scheduler type in slot 2 (`normal | cpu | io`). Older shape was a
+%% 3-tuple with no Type; coerce both into 4-tuples so the rest of
+%% the sampler does not have to branch.
+normalise_sched_stats(Stats) ->
+    [normalise_sched_entry(E) || E <- Stats].
+
+normalise_sched_entry({Sched, Active, Total}) ->
+    {Sched, normal, Active, Total};
+normalise_sched_entry({Sched, Type, Active, Total}) ->
+    {Sched, Type, Active, Total}.
+
+scheduler_kind(cpu) -> <<"dirty_cpu">>;
+scheduler_kind(io) -> <<"dirty_io">>;
+scheduler_kind(normal) -> <<"cpu">>;
+scheduler_kind(Other) -> atom_to_binary(Other, utf8).
 
 project_delta(Model, Kind, NewTotal) ->
     Key = {?MODULE, cache_seen, Model, Kind},
