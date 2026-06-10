@@ -29,6 +29,13 @@ This is good news for models bigger than RAM: the loader doesn't
 OOM at load time. It just runs slow until the working set is
 warm.
 
+Picking *which* of those pages get pulled into RAM, and whether they
+stay there, is the [Weight residency](weight_residency.md) knob. The
+default (`eager`) reads weights ahead at load time; `lazy` defers them
+to first touch; `pinned` mlocks the whole file; `lazy_then_pin_resident`
+discovers the working set then pins just that. On a tight memory budget
+this is the main thing to tune.
+
 ## Picking by model class
 
 For a typical Apple Silicon laptop, here's the comfortable-vs-
