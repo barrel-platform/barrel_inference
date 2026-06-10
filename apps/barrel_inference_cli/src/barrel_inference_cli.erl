@@ -7,7 +7,7 @@ Command-line front end for Barrel Inference.
 
 Built as a `rebar3 escriptize` artefact at `_build/default/bin/barrel-inference`.
 `serve` launches the release daemon; every other subcommand speaks to a
-running daemon over HTTP (hackney). Nothing here loads inference modules
+running daemon over HTTP (livery_client). Nothing here loads inference modules
 directly.
 
 Subcommands:
@@ -53,7 +53,7 @@ main(["cluster" | Rest]) ->
     %% this clause wires it up with no further change here.
     delegate(barrel_inference_cluster_cli, Rest);
 main(Args) ->
-    {ok, _} = application:ensure_all_started(hackney),
+    {ok, _} = application:ensure_all_started(livery),
     Base = base_url(),
     dispatch(Base, Args).
 
@@ -434,11 +434,15 @@ base_url() ->
     end.
 
 json_get(URL) ->
-    %% hackney 4.0 returns the body inline as the 4th element.
-    case hackney:request(get, to_bin(URL), [], <<>>, []) of
-        {ok, 200, _Hdrs, Body} -> {ok, json:decode(Body)};
-        {ok, Code, _Hdrs, Body} -> {error, {http, Code, Body}};
-        {error, _} = E -> E
+    case livery_client:get(client(), to_bin(URL)) of
+        {ok, Resp} ->
+            {full, Body} = livery_client:body(Resp),
+            case livery_client:status(Resp) of
+                200 -> {ok, json:decode(Body)};
+                Code -> {error, {http, Code, Body}}
+            end;
+        {error, _} = E ->
+            E
     end.
 
 json_post(URL, Body) ->
@@ -446,24 +450,41 @@ json_post(URL, Body) ->
 
 json_request(Method, URL, Body) ->
     Headers = [{<<"content-type">>, <<"application/json">>}],
-    case hackney:request(Method, to_bin(URL), Headers, Body, []) of
-        {ok, Code, _Hdrs, RawBody} when Code >= 200, Code < 300 ->
-            case RawBody of
-                <<>> -> {ok, Code, #{}};
-                _ -> {ok, json:decode(RawBody)}
+    Opts = #{headers => Headers, body => {full, Body}},
+    case livery_client:request(client(), Method, to_bin(URL), Opts) of
+        {ok, Resp} ->
+            {full, RawBody} = livery_client:body(Resp),
+            Code = livery_client:status(Resp),
+            if
+                Code >= 200, Code < 300 ->
+                    case RawBody of
+                        <<>> -> {ok, Code, #{}};
+                        _ -> {ok, json:decode(RawBody)}
+                    end;
+                true ->
+                    {error, {http, Code, RawBody}}
             end;
-        {ok, Code, _Hdrs, RawBody} ->
-            {error, {http, Code, RawBody}};
         {error, _} = E ->
             E
     end.
 
+%% Shared client; no per-call layers (each subcommand is short-lived).
+client() ->
+    livery_client:new(#{}).
+
 %% Streaming POST that prints each NDJSON status line as it arrives.
-%% hackney 4.0 async mode: {ok, Ref} then {hackney_response, Ref, _} messages.
+%% livery_client push-stream: status + chunks delivered as
+%% `{livery_response, Ref, _}` messages on this process's mailbox.
 stream_post(URL, Body) ->
     Headers = [{<<"content-type">>, <<"application/json">>}],
-    case hackney:request(post, to_bin(URL), Headers, Body, [{async, true}]) of
-        {ok, Ref} ->
+    Opts = #{
+        headers => Headers,
+        body => {full, Body},
+        stream => true,
+        stream_to => self()
+    },
+    case livery_client:request(client(), post, to_bin(URL), Opts) of
+        {ok, #{body := {push, Ref}}} ->
             stream_recv_ndjson(Ref, <<>>, progress_state());
         {error, _} = E ->
             E
@@ -471,14 +492,12 @@ stream_post(URL, Body) ->
 
 stream_recv_ndjson(Ref, Buf, State) ->
     receive
-        {hackney_response, Ref, {status, Code, _}} when Code >= 400 ->
+        {livery_response, Ref, {status, Code, _Hdrs}} when Code >= 400 ->
             _ = finalize_progress(State),
             drain_error(Ref, Code, <<>>);
-        {hackney_response, Ref, {status, _Code, _}} ->
+        {livery_response, Ref, {status, _Code, _Hdrs}} ->
             stream_recv_ndjson(Ref, Buf, State);
-        {hackney_response, Ref, {headers, _}} ->
-            stream_recv_ndjson(Ref, Buf, State);
-        {hackney_response, Ref, done} ->
+        {livery_response, Ref, done} ->
             {_, State1} = print_ndjson_lines(<<Buf/binary, "\n">>, State),
             _ = finalize_progress(State1),
             %% A 200 stream can still carry an {"error": ...} event
@@ -488,31 +507,29 @@ stream_recv_ndjson(Ref, Buf, State) ->
                 undefined -> ok;
                 Err -> {error, {pull, Err}}
             end;
-        {hackney_response, Ref, {error, Reason}} ->
+        {livery_response, Ref, {error, Reason}} ->
             _ = finalize_progress(State),
             {error, Reason};
-        {hackney_response, Ref, Chunk} when is_binary(Chunk) ->
+        {livery_response, Ref, {chunk, Chunk}} ->
             {Buf1, State1} = print_ndjson_lines(<<Buf/binary, Chunk/binary>>, State),
-            stream_recv_ndjson(Ref, Buf1, State1);
-        {hackney_response, Ref, _Other} ->
-            stream_recv_ndjson(Ref, Buf, State)
+            stream_recv_ndjson(Ref, Buf1, State1)
     after 600000 ->
         _ = finalize_progress(State),
+        _ = livery_client:stop_stream(Ref),
         {error, timeout}
     end.
 
-%% Collect the body of a >= 400 response (async mode) for the error report.
+%% Collect the body of a >= 400 response (push stream) for the error report.
 drain_error(Ref, Code, Acc) ->
     receive
-        {hackney_response, Ref, done} ->
+        {livery_response, Ref, done} ->
             {error, {http, Code, Acc}};
-        {hackney_response, Ref, {error, Reason}} ->
+        {livery_response, Ref, {error, Reason}} ->
             {error, Reason};
-        {hackney_response, Ref, Chunk} when is_binary(Chunk) ->
-            drain_error(Ref, Code, <<Acc/binary, Chunk/binary>>);
-        {hackney_response, Ref, _Other} ->
-            drain_error(Ref, Code, Acc)
+        {livery_response, Ref, {chunk, Chunk}} ->
+            drain_error(Ref, Code, <<Acc/binary, Chunk/binary>>)
     after 600000 ->
+        _ = livery_client:stop_stream(Ref),
         {error, {http, Code, Acc}}
     end.
 
@@ -628,12 +645,18 @@ human_bytes(N) when N < 1024 * 1024 * 1024 ->
 human_bytes(N) ->
     io_lib:format("~.2f GB", [N / 1024 / 1024 / 1024]).
 
-%% Streaming POST that prints OpenAI SSE deltas as they arrive (hackney 4.0
-%% async mode).
+%% Streaming POST that prints OpenAI SSE deltas as they arrive (livery
+%% push stream).
 stream_post_sse(URL, Body) ->
     Headers = [{<<"content-type">>, <<"application/json">>}],
-    case hackney:request(post, to_bin(URL), Headers, Body, [{async, true}]) of
-        {ok, Ref} ->
+    Opts = #{
+        headers => Headers,
+        body => {full, Body},
+        stream => true,
+        stream_to => self()
+    },
+    case livery_client:request(client(), post, to_bin(URL), Opts) of
+        {ok, #{body := {push, Ref}}} ->
             R = stream_recv_sse(Ref, <<>>),
             io:put_chars("\n"),
             R;
@@ -643,22 +666,19 @@ stream_post_sse(URL, Body) ->
 
 stream_recv_sse(Ref, Buf) ->
     receive
-        {hackney_response, Ref, {status, Code, _}} when Code >= 400 ->
+        {livery_response, Ref, {status, Code, _Hdrs}} when Code >= 400 ->
             drain_error(Ref, Code, <<>>);
-        {hackney_response, Ref, {status, _Code, _}} ->
+        {livery_response, Ref, {status, _Code, _Hdrs}} ->
             stream_recv_sse(Ref, Buf);
-        {hackney_response, Ref, {headers, _}} ->
-            stream_recv_sse(Ref, Buf);
-        {hackney_response, Ref, done} ->
+        {livery_response, Ref, done} ->
             ok;
-        {hackney_response, Ref, {error, Reason}} ->
+        {livery_response, Ref, {error, Reason}} ->
             {error, Reason};
-        {hackney_response, Ref, Chunk} when is_binary(Chunk) ->
+        {livery_response, Ref, {chunk, Chunk}} ->
             Buf1 = print_sse_events(<<Buf/binary, Chunk/binary>>),
-            stream_recv_sse(Ref, Buf1);
-        {hackney_response, Ref, _Other} ->
-            stream_recv_sse(Ref, Buf)
+            stream_recv_sse(Ref, Buf1)
     after 600000 ->
+        _ = livery_client:stop_stream(Ref),
         {error, timeout}
     end.
 
