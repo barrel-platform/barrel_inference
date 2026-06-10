@@ -319,9 +319,8 @@ update_cache_gauges() ->
 sample_resident_bytes() ->
     Inst = inst(resident_bytes),
     Infos =
-        try barrel_inference:list_models() of
-            L when is_list(L) -> L;
-            _ -> []
+        try
+            barrel_inference:list_models()
         catch
             _:_ -> []
         end,
