@@ -368,9 +368,7 @@ observe_chat_parse_duration(IsPartial, ElapsedMicros) when
 %% ones we care about into Prometheus counters. barrel_inference already
 %% exports counters/0 in v0.1.0.
 update_cache_gauges() ->
-    case catch barrel_inference:counters() of
-        {'EXIT', _} ->
-            ok;
+    try barrel_inference:counters() of
         Map when is_map(Map) ->
             ExactNew = maps:get(cache_exact_hits, Map, 0),
             PartialNew = maps:get(cache_partial_hits, Map, 0),
@@ -378,9 +376,9 @@ update_cache_gauges() ->
             project_delta(<<"_global">>, exact, ExactNew),
             project_delta(<<"_global">>, partial, PartialNew),
             project_delta(<<"_global">>, cold, ColdNew),
-            ok;
-        _ ->
             ok
+    catch
+        _:_ -> ok
     end,
     sample_resident_bytes(),
     sample_scheduler_util(),
@@ -436,16 +434,17 @@ sample_scheduler_util() ->
             ok;
         Stats when is_list(Stats) ->
             Inst = inst(dirty_cpu_scheduler_util),
+            {NCpu, NDcpu} = scheduler_counts(),
             lists:foreach(
-                fun({Sched, Type, Active, Total}) ->
-                    Key = {?MODULE, sched_snap, Sched, Type},
+                fun({Sched, Active, Total}) ->
+                    Key = {?MODULE, sched_snap, Sched},
                     {PrevA, PrevT} = persistent_term:get(Key, {0, 0}),
                     DA = Active - PrevA,
                     DT = Total - PrevT,
                     persistent_term:put(Key, {Active, Total}),
                     case DT > 0 of
                         true ->
-                            Kind = scheduler_kind(Type),
+                            Kind = scheduler_kind(Sched, NCpu, NDcpu),
                             instrument_meter:record(
                                 Inst,
                                 DA / DT,
@@ -455,26 +454,23 @@ sample_scheduler_util() ->
                             ok
                     end
                 end,
-                normalise_sched_stats(Stats)
+                Stats
             )
     end.
 
-%% scheduler_wall_time_all returns 4-tuples since OTP 21 with the
-%% scheduler type in slot 2 (`normal | cpu | io`). Older shape was a
-%% 3-tuple with no Type; coerce both into 4-tuples so the rest of
-%% the sampler does not have to branch.
-normalise_sched_stats(Stats) ->
-    [normalise_sched_entry(E) || E <- Stats].
+%% scheduler_wall_time_all returns 3-tuples `{SchedulerId, Active, Total}`.
+%% Scheduler IDs are laid out as: 1..N normal, N+1..N+D dirty CPU,
+%% N+D+1..N+D+I dirty IO (N = schedulers, D = dirty_cpu_schedulers,
+%% I = dirty_io_schedulers). Classify by that range.
+scheduler_counts() ->
+    {erlang:system_info(schedulers), erlang:system_info(dirty_cpu_schedulers)}.
 
-normalise_sched_entry({Sched, Active, Total}) ->
-    {Sched, normal, Active, Total};
-normalise_sched_entry({Sched, Type, Active, Total}) ->
-    {Sched, Type, Active, Total}.
-
-scheduler_kind(cpu) -> <<"dirty_cpu">>;
-scheduler_kind(io) -> <<"dirty_io">>;
-scheduler_kind(normal) -> <<"cpu">>;
-scheduler_kind(Other) -> atom_to_binary(Other, utf8).
+scheduler_kind(Sched, NCpu, _NDcpu) when Sched =< NCpu ->
+    <<"cpu">>;
+scheduler_kind(Sched, NCpu, NDcpu) when Sched =< NCpu + NDcpu ->
+    <<"dirty_cpu">>;
+scheduler_kind(_, _, _) ->
+    <<"dirty_io">>.
 
 project_delta(Model, Kind, NewTotal) ->
     Key = {?MODULE, cache_seen, Model, Kind},
