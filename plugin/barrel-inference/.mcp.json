@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "barrel-inference": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/barrel-inference-mcp",
+      "env": {
+        "BARREL_URL": "http://localhost:8080"
+      }
+    }
+  }
+}

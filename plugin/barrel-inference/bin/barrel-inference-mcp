@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# Launch the Barrel Inference MCP server over stdio for an MCP client
+# (Claude Code / Desktop). Prerequisite: the umbrella has been compiled
+# with `rebar3 compile` so the beams exist under _build/default/lib.
+#
+# The repo root is three levels up: bin -> barrel-inference -> plugin -> repo.
+# BARREL_URL (passed by the MCP host, default http://localhost:8080) tells
+# the server where the barrel daemon is.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+BUILD="${REPO_ROOT}/_build/default/lib"
+
+if [ ! -d "${BUILD}" ]; then
+  echo "barrel-inference-mcp: no build found at ${BUILD}." >&2
+  echo "Run 'rebar3 compile' in ${REPO_ROOT} first." >&2
+  exit 1
+fi
+
+# stdout is the MCP JSON-RPC channel: keep it clean by sending all Erlang
+# logging to stderr.
+exec erl \
+  -noshell \
+  -pa "${BUILD}"/*/ebin \
+  -kernel logger '[{handler, default, logger_std_h, #{config => #{type => standard_error}}}]' \
+  -eval 'barrel_inference_mcp:run_stdio()'
