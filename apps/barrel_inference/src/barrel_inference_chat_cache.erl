@@ -79,19 +79,10 @@ start_link() ->
 get_or_init(ModelIdBin, ModelRef, TemplateOverride) when
     is_binary(ModelIdBin)
 ->
-    Key = {templates, ModelIdBin},
-    case lookup(?TAB, Key) of
-        {ok, Ref} ->
-            {ok, Ref};
-        not_found ->
-            case barrel_inference_chat:init(ModelRef, TemplateOverride) of
-                {ok, Ref} ->
-                    ok = put(?TAB, Key, Ref),
-                    {ok, Ref};
-                Err ->
-                    Err
-            end
-    end.
+    cached_or_build(
+        {templates, ModelIdBin},
+        fun() -> barrel_inference_chat:init(ModelRef, TemplateOverride) end
+    ).
 
 %% Get (or build + cache) a params_ref for the given templates +
 %% (tools, tool_choice, parallel_tool_calls). The cache key is
@@ -109,12 +100,19 @@ get_or_init(ModelIdBin, ModelRef, TemplateOverride) when
 get_or_make_params(ModelIdBin, Templates, Inputs) when
     is_binary(ModelIdBin), is_map(Inputs)
 ->
-    Key = params_key(ModelIdBin, Inputs),
+    cached_or_build(
+        params_key(ModelIdBin, Inputs),
+        fun() -> barrel_inference_chat:make_params(Templates, Inputs) end
+    ).
+
+%% Shared cache fast path: return the cached ref on hit, or run the
+%% builder fun and insert its result on miss.
+cached_or_build(Key, BuildFn) ->
     case lookup(?TAB, Key) of
         {ok, Ref} ->
             {ok, Ref};
         not_found ->
-            case barrel_inference_chat:make_params(Templates, Inputs) of
+            case BuildFn() of
                 {ok, Ref} ->
                     ok = put(?TAB, Key, Ref),
                     {ok, Ref};
