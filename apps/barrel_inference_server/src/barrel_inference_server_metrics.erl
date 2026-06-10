@@ -368,9 +368,7 @@ observe_chat_parse_duration(IsPartial, ElapsedMicros) when
 %% ones we care about into Prometheus counters. barrel_inference already
 %% exports counters/0 in v0.1.0.
 update_cache_gauges() ->
-    case catch barrel_inference:counters() of
-        {'EXIT', _} ->
-            ok;
+    try barrel_inference:counters() of
         Map when is_map(Map) ->
             ExactNew = maps:get(cache_exact_hits, Map, 0),
             PartialNew = maps:get(cache_partial_hits, Map, 0),
@@ -381,6 +379,8 @@ update_cache_gauges() ->
             ok;
         _ ->
             ok
+    catch
+        _:_ -> ok
     end,
     sample_resident_bytes(),
     sample_scheduler_util(),
