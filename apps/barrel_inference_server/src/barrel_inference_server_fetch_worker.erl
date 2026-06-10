@@ -302,7 +302,7 @@ consume(State, Tmp, Resolved, Parsed, Root) ->
             FinalHex = bin_to_hex(crypto:hash_final(FinalCtx)),
             finalize(Tmp, FinalHex, Resolved, Parsed, Root);
         {error, Reason, FinalState} ->
-            try_close(FinalState#stream.io),
+            _ = try_close(FinalState#stream.io),
             {error, Reason}
     end.
 
@@ -492,9 +492,7 @@ safe_integer(B) when is_binary(B) ->
         binary_to_integer(B)
     catch
         _:_ -> undefined
-    end;
-safe_integer(L) when is_list(L) ->
-    safe_integer(unicode:characters_to_binary(L)).
+    end.
 
 header(Hdrs, NameLower) ->
     case
