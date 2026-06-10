@@ -454,19 +454,17 @@ json_request(Method, URL, Body) ->
     case livery_client:request(client(), Method, to_bin(URL), Opts) of
         {ok, Resp} ->
             {full, RawBody} = livery_client:body(Resp),
-            Code = livery_client:status(Resp),
-            if
-                Code >= 200, Code < 300 ->
-                    case RawBody of
-                        <<>> -> {ok, Code, #{}};
-                        _ -> {ok, json:decode(RawBody)}
-                    end;
-                true ->
-                    {error, {http, Code, RawBody}}
-            end;
+            decode_json_response(livery_client:status(Resp), RawBody);
         {error, _} = E ->
             E
     end.
+
+decode_json_response(Code, <<>>) when Code >= 200, Code < 300 ->
+    {ok, Code, #{}};
+decode_json_response(Code, RawBody) when Code >= 200, Code < 300 ->
+    {ok, json:decode(RawBody)};
+decode_json_response(Code, RawBody) ->
+    {error, {http, Code, RawBody}}.
 
 %% Shared client; no per-call layers (each subcommand is short-lived).
 client() ->
