@@ -14,6 +14,10 @@
  {<<"hackney">>,{pkg,<<"hackney">>,<<"4.0.0">>},0},
  {<<"idna">>,{pkg,<<"idna">>,<<"7.1.0">>},1},
  {<<"instrument">>,{pkg,<<"instrument">>,<<"1.0.0">>},0},
+ {<<"livery">>,
+  {git,"https://github.com/benoitc/livery.git",
+       {ref,"c4aadfad1af4ca87f86468e259192024de77e873"}},
+  0},
  {<<"mimerl">>,{pkg,<<"mimerl">>,<<"1.5.0">>},1},
  {<<"parse_trans">>,{pkg,<<"parse_trans">>,<<"3.4.1">>},1},
  {<<"quic">>,{pkg,<<"quic">>,<<"1.0.0">>},1},
@@ -21,7 +25,9 @@
   {git,"https://github.com/ninenines/ranch",
        {ref,"10b51304b26062e0dbfd5e74824324e9a911e269"}},
   1},
- {<<"ssl_verify_fun">>,{pkg,<<"ssl_verify_fun">>,<<"1.1.7">>},1}]}.
+ {<<"ssl_verify_fun">>,{pkg,<<"ssl_verify_fun">>,<<"1.1.7">>},1},
+ {<<"webtransport">>,{pkg,<<"webtransport">>,<<"0.3.2">>},1},
+ {<<"ws">>,{pkg,<<"erlang_ws">>,<<"0.3.0">>},1}]}.
 [
 {pkg_hash,[
  {<<"barrel_mcp">>, <<"0752D2B5BA3AA879CE2389DAD706D07A49D2D182092CF510C3CDA3448AC6A8AA">>},
@@ -34,7 +40,9 @@
  {<<"mimerl">>, <<"F35ACA6F23242339B3666E0AC0702379E362B469D0AEA167F6CC713547E777ED">>},
  {<<"parse_trans">>, <<"6E6AA8167CB44CC8F39441D05193BE6E6F4E7C2946CB2759F015F8C56B76E5FF">>},
  {<<"quic">>, <<"2FE86FEEDAB19A2CD4E1355553FB7F30CD7968C66D79E45E331A8CA60FDF4661">>},
- {<<"ssl_verify_fun">>, <<"354C321CF377240C7B8716899E182CE4890C5938111A1296ADD3EC74CF1715DF">>}]},
+ {<<"ssl_verify_fun">>, <<"354C321CF377240C7B8716899E182CE4890C5938111A1296ADD3EC74CF1715DF">>},
+ {<<"webtransport">>, <<"1A2976420A7AFA6675A7E19FE034956174966A6BA8D9F68EEF785056AE0E1E58">>},
+ {<<"ws">>, <<"6778E82A478FF6D205C14E5F17883447CF8BF4919E2C4F811FE3BE263635E37D">>}]},
 {pkg_hash_ext,[
  {<<"barrel_mcp">>, <<"DFB4A9D17C454445DA4AD14DCA02E9248005AA07CB47A2AEA64AE6621BC587F5">>},
  {<<"certifi">>, <<"8A64F6669D85E9CC0E5086FCF29A5B13DE57A13EFA23D3582874B9A19303F184">>},
@@ -46,5 +54,7 @@
  {<<"mimerl">>, <<"DB648CE065BAE14EA84CA8B5DD123F42F49417CEF693541110BF6F9E9BE9ECC4">>},
  {<<"parse_trans">>, <<"620A406CE75DADA827B82E453C19CF06776BE266F5A67CFF34E1EF2CBB60E49A">>},
  {<<"quic">>, <<"52F59E0BBA92ECEE80A7E685F92B8F498E7ED01F6DD05A682808AFB70279AFCC">>},
- {<<"ssl_verify_fun">>, <<"FE4C190E8F37401D30167C8C405EDA19469F34577987C76DDE613E838BBC67F8">>}]}
+ {<<"ssl_verify_fun">>, <<"FE4C190E8F37401D30167C8C405EDA19469F34577987C76DDE613E838BBC67F8">>},
+ {<<"webtransport">>, <<"9BC90C2DAB6C09FB6532A27BCAF10A2ACE5749A7DB1C583329462974DE7DD9B1">>},
+ {<<"ws">>, <<"4F6FA9DFBDB49D27B6407F7ED5EA34F09499892079A9E5BED7389E352FFC80C5">>}]}
 ].
