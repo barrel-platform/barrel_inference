@@ -68,13 +68,19 @@ run(Other, _, _, _) ->
     {error, {unknown_source, Other}}.
 
 http_get_body(URL, Hdrs, Timeout) ->
-    Opts = [
-        {follow_redirect, true},
-        {max_redirect, 5},
-        {connect_timeout, Timeout},
-        {recv_timeout, Timeout}
-    ],
-    case hackney:request(get, URL, Hdrs, <<>>, Opts) of
-        {ok, Status, RespHdrs, Body} when is_binary(Body) -> {ok, Status, RespHdrs, Body};
-        {error, _} = E -> E
+    Client = livery_client:new(#{
+        adapter_opts => #{
+            hackney => [
+                {follow_redirect, true},
+                {max_redirect, 5},
+                {connect_timeout, Timeout}
+            ]
+        }
+    }),
+    case livery_client:request(Client, get, URL, #{headers => Hdrs, timeout => Timeout}) of
+        {ok, Resp} ->
+            {full, Body} = livery_client:body(Resp),
+            {ok, livery_client:status(Resp), livery_client:headers(Resp), Body};
+        {error, _} = E ->
+            E
     end.
