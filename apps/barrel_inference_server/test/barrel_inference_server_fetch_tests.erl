@@ -15,9 +15,9 @@ setup() ->
     %% Don't boot the full barrel_inference_server application; that pulls in
     %% the registry/loader/listener subtree and would conflict with
     %% sibling test modules. We only need the fetch processes plus
-    %% hackney + inets. Unlink so test-process exit doesn't take them
-    %% down mid-test.
-    [application:ensure_all_started(A) || A <- [crypto, ssl, inets, hackney]],
+    %% livery (transitively pulls hackney) + inets. Unlink so
+    %% test-process exit doesn't take them down mid-test.
+    [application:ensure_all_started(A) || A <- [crypto, ssl, inets, livery]],
     {ok, FetchSup} = barrel_inference_server_fetch_sup:start_link(),
     unlink(FetchSup),
     {ok, FetchSrv} = barrel_inference_server_fetch_srv:start_link(),
