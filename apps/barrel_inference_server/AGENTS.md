@@ -150,6 +150,37 @@ is left empty (model decodes freely); response_format / format
 without tools still drives GBNF via
 `barrel_inference_server_grammar:from_response_format/1`.
 
+### Weight residency
+
+A `loader.weight_residency` manifest field picks how a model's weights
+live in memory. Four modes ship: `eager` (default; kernel reads
+ahead), `lazy` (`MADV_RANDOM`; pages fault in on first touch),
+`pinned` (mlock the whole file), and `lazy_then_pin_resident` (load
+lazy, then mlock the resident set after the first request via the
+scheduler's hook in `finish_req`). The loader's `residency_to_opts/1`
+(`src/barrel_inference_server_loader.erl`) maps each mode to a
+`(use_mmap, use_mlock, prefetch)` triple plus, for the
+`lazy_then_pin_resident` case, the `pin_resident_after_first_request`
+flag the engine reads at init.
+
+Resolution precedence: Modelfile `PARAMETER weight_residency` >
+manifest `loader.weight_residency` > app env
+`weight_residency_default` (surfaced by
+`barrel_inference_server_config:weight_residency_default/0`,
+default `eager`). Unknown values fall back to the default with a
+`logger:warning/2`.
+
+Observability: the Prometheus gauge
+`barrel_inference_resident_bytes{model=...}` reports
+`mincore`-resident bytes per loaded model, sampled per `/metrics`
+scrape by `barrel_inference_server_metrics:sample_resident_bytes/0`.
+Use it together with the process RSS to see whether the lazy mode is
+actually keeping pages off the BEAM's account.
+
+Operator-facing details live in `guides/weight_residency.md`; the
+real-model bench writeup is at
+`apps/barrel_inference/internals/weight-residency-bench.md`.
+
 ### Sticky-seq session id
 
 `barrel_inference_server_session:derive/2` yields a stable `session_id`
