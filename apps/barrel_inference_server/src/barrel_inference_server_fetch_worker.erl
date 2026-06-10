@@ -12,8 +12,8 @@ Lifecycle:
    `barrel_inference_server_fetch_srv`.
 2. The worker resolves the request (HF HEAD for `X-Linked-ETag`,
    Ollama manifest for the model layer digest) inline, then issues
-   an async-once GET via hackney with a `Range` header when a
-   `.part` file is present.
+   a push-stream GET via livery_client with `flow => manual` and a
+   `Range` header when a `.part` file is present.
 3. Each chunk is appended to the `.part` file and folded into a
    running sha256 context. Progress is rate-limited to ~1 update per
    100 ms and forwarded to the srv as a cast.
@@ -31,51 +31,10 @@ Lifecycle:
 
 -include_lib("kernel/include/file.hrl").
 
-%% Hackney 4.0.0's `request_async` returns `{ok, self()}` (a connection
-%% pid) per `hackney_conn:do_request_async/9`, but its spec advertises
-%% `{ok, reference()}` and `stream_next/1` then expects a `pid()`. We
-%% pass the value through verbatim; runtime is fine, dialyzer just
-%% sees the broken specs. Suppress the resulting cascade.
--dialyzer(
-    {nowarn_function, [
-        stream/6,
-        stream_with_redirects/7,
-        open_stream/6,
-        stream_recv/10,
-        handle_ok_status/2,
-        init_stream/6,
-        consume/5,
-        try_close/1,
-        advance/1,
-        stream_loop/1,
-        on_chunk/2,
-        on_done/1,
-        update_stream/2,
-        emit_progress/1,
-        wait_status/2,
-        wait_headers/2,
-        drain/2,
-        finalize/5,
-        promote/4,
-        place_blob/2,
-        publish/3,
-        write_ref/3,
-        copy_then_delete/2,
-        file_mode/1,
-        resume_for_status/3,
-        total_size/3,
-        content_length_total/1,
-        parse_total_from_range/1,
-        safe_integer/1,
-        normalise_hex/1,
-        bin_to_hex/1
-    ]}
-).
-
 -define(PROGRESS_INTERVAL_MS, 100).
 
 -record(stream, {
-    ref :: reference(),
+    ref :: livery_client:stream_ref(),
     io :: file:io_device(),
     ctx :: term(),
     bytes :: non_neg_integer(),
@@ -194,8 +153,8 @@ stream_with_redirects(_Parsed, _Resolved, _Opts, _SrvPid, _Self, _Root, 0) ->
 stream_with_redirects(Parsed, Resolved, Opts, SrvPid, Self, Root, N) ->
     case open_stream(Parsed, Resolved, Opts, SrvPid, Self, Root) of
         {redirect, NewURL} ->
-            %% Hackney 4 async mode hands redirects back; retry
-            %% with the new location and a fresh connection.
+            %% livery push-stream surfaces unfollowed redirects (e.g.
+            %% cross-host); retry with the new location.
             Resolved1 = Resolved#{url => NewURL},
             stream_with_redirects(Parsed, Resolved1, Opts, SrvPid, Self, Root, N - 1);
         Other ->
@@ -209,10 +168,18 @@ open_stream(Parsed, Resolved, Opts, SrvPid, Self, Root) ->
     URL = maps:get(url, Resolved),
     Hdrs = build_headers(maps:get(headers, Resolved), Offset),
     Timeout = maps:get(timeout, Opts, 120_000),
-    case hackney:request(get, URL, Hdrs, <<>>, hackney_options(Timeout)) of
-        {ok, ClientRef} ->
+    Client = stream_client(Timeout),
+    ReqOpts = #{
+        headers => Hdrs,
+        timeout => Timeout,
+        stream => true,
+        stream_to => self(),
+        flow => manual
+    },
+    case livery_client:request(Client, get, URL, ReqOpts) of
+        {ok, #{body := {push, StreamRef}}} ->
             stream_recv(
-                ClientRef,
+                StreamRef,
                 Tmp,
                 Offset,
                 HashCtx0,
@@ -239,20 +206,35 @@ build_headers(Hdrs, Offset) ->
     Range = iolist_to_binary([<<"bytes=">>, integer_to_binary(Offset), <<"-">>]),
     [{<<"Range">>, Range} | Hdrs].
 
-hackney_options(Timeout) ->
-    %% Force HTTP/1.1 ALPN: hackney 4.0.0 async streaming wedges
-    %% silently on HTTP/2 connections (no `hackney_response`
-    %% messages ever arrive). Sync mode is fine, but we need async
-    %% for chunked downloads.
-    [
-        {async, once},
-        {stream_to, self()},
-        {protocols, [http1]}
-        | common_opts(Timeout)
-    ].
+%% A livery_client wrapped around the hackney adapter. We force HTTP/1.1
+%% ALPN because async streaming over HTTP/2 wedges silently on this
+%% hackney version (no body messages arrive). Sync HEAD / manifest GET
+%% reuse the same client.
+stream_client(Timeout) ->
+    livery_client:new(#{
+        adapter_opts => #{
+            hackney => [
+                {follow_redirect, true},
+                {max_redirect, 5},
+                {connect_timeout, Timeout},
+                {protocols, [http1]}
+            ]
+        }
+    }).
+
+sync_client(Timeout) ->
+    livery_client:new(#{
+        adapter_opts => #{
+            hackney => [
+                {follow_redirect, true},
+                {max_redirect, 5},
+                {connect_timeout, Timeout}
+            ]
+        }
+    }).
 
 -record(rcv, {
-    client :: pid(),
+    client :: livery_client:stream_ref(),
     tmp :: file:filename_all(),
     offset :: non_neg_integer(),
     hash :: term(),
@@ -264,9 +246,9 @@ hackney_options(Timeout) ->
     root :: file:filename_all()
 }).
 
-stream_recv(ClientRef, Tmp, Offset, HashCtx0, Timeout, SrvPid, Self, Resolved, Parsed, Root) ->
+stream_recv(StreamRef, Tmp, Offset, HashCtx0, Timeout, SrvPid, Self, Resolved, Parsed, Root) ->
     R = #rcv{
-        client = ClientRef,
+        client = StreamRef,
         tmp = Tmp,
         offset = Offset,
         hash = HashCtx0,
@@ -277,30 +259,25 @@ stream_recv(ClientRef, Tmp, Offset, HashCtx0, Timeout, SrvPid, Self, Resolved, P
         parsed = Parsed,
         root = Root
     },
-    case wait_status(ClientRef, Timeout) of
-        {ok, Status} when Status =:= 200; Status =:= 206 -> handle_ok_status(Status, R);
-        {ok, Status} ->
-            drain(ClientRef, Timeout),
+    case wait_status(StreamRef, Timeout) of
+        {ok, Status, RespHdrs} when Status =:= 200; Status =:= 206 ->
+            handle_ok_status(Status, RespHdrs, R);
+        {ok, Status, _RespHdrs} ->
+            stop_stream(StreamRef),
             {error, {http_status, Status}};
         {redirect, _} = Redir ->
-            drain(ClientRef, Timeout),
+            stop_stream(StreamRef),
             Redir;
         {error, _} = E ->
             E
     end.
 
-handle_ok_status(Status, #rcv{client = ClientRef, timeout = Timeout} = R) ->
-    case wait_headers(ClientRef, Timeout) of
-        {ok, RespHdrs} ->
-            {RealOffset, HashCtx} = resume_for_status(Status, R#rcv.offset, R#rcv.hash),
-            {ok, IO} = file:open(R#rcv.tmp, file_mode(RealOffset)),
-            State = init_stream(R, IO, HashCtx, RealOffset, Status, RespHdrs),
-            ok = emit_progress(State),
-            consume(advance(State), R#rcv.tmp, R#rcv.resolved, R#rcv.parsed, R#rcv.root);
-        {error, _} = E ->
-            drain(ClientRef, Timeout),
-            E
-    end.
+handle_ok_status(Status, RespHdrs, R) ->
+    {RealOffset, HashCtx} = resume_for_status(Status, R#rcv.offset, R#rcv.hash),
+    {ok, IO} = file:open(R#rcv.tmp, file_mode(RealOffset)),
+    State = init_stream(R, IO, HashCtx, RealOffset, Status, RespHdrs),
+    ok = emit_progress(State),
+    consume(advance(State), R#rcv.tmp, R#rcv.resolved, R#rcv.parsed, R#rcv.root).
 
 init_stream(R, IO, HashCtx, Offset, Status, RespHdrs) ->
     #stream{
@@ -336,20 +313,19 @@ try_close(IO) ->
         _:_ -> ok
     end.
 
-%% Advance the async-once stream by one message slot.
+%% Advance the manual-flow push stream by one message slot.
 advance(#stream{ref = Ref} = S) ->
-    ok = hackney:stream_next(Ref),
+    ok = livery_client:stream_next(Ref),
     S.
 
 stream_loop(#stream{ref = Ref, timeout = Timeout} = S) ->
     receive
-        {hackney_response, Ref, Bin} when is_binary(Bin) -> on_chunk(Bin, S);
-        {hackney_response, Ref, done} -> on_done(S);
-        {hackney_response, Ref, {error, Reason}} -> {error, Reason, S};
-        {hackney_response, Ref, {redirect, Loc, _}} -> {error, {unfollowed_redirect, Loc}, S};
+        {livery_response, Ref, {chunk, Bin}} when is_binary(Bin) -> on_chunk(Bin, S);
+        {livery_response, Ref, done} -> on_done(S);
+        {livery_response, Ref, {error, Reason}} -> {error, Reason, S};
         _Other -> stream_loop(S)
     after Timeout ->
-        _ = hackney:stop_async(Ref),
+        stop_stream(Ref),
         {error, recv_timeout, S}
     end.
 
@@ -382,45 +358,28 @@ emit_progress(#stream{srv = SrvPid, self_ref = Self, bytes = Bytes, total = Tota
     ok.
 
 %% =============================================================================
-%% Status / header reception (async-once)
+%% Status / header reception (push stream)
 %% =============================================================================
 
+%% Push streaming delivers status + headers in a single first message.
+%% A redirect hackney does not follow (e.g. cross-host with auth) is
+%% surfaced as `{error, {redirect, Location}}` from the livery relay; the
+%% caller retries with the new URL.
 wait_status(Ref, Timeout) ->
     receive
-        {hackney_response, Ref, {status, Status, _Reason}} ->
-            ok = hackney:stream_next(Ref),
-            {ok, Status};
-        {hackney_response, Ref, {error, Reason}} ->
-            {error, Reason};
-        {hackney_response, Ref, {redirect, Loc, _}} ->
+        {livery_response, Ref, {status, Status, Hdrs}} ->
+            {ok, Status, Hdrs};
+        {livery_response, Ref, {error, {redirect, Loc}}} ->
             {redirect, Loc};
-        {hackney_response, Ref, {see_other, Loc, _}} ->
-            {redirect, Loc};
-        _Other ->
-            wait_status(Ref, Timeout)
+        {livery_response, Ref, {error, Reason}} ->
+            {error, Reason}
     after Timeout ->
-        _ = hackney:stop_async(Ref),
+        stop_stream(Ref),
         {error, status_timeout}
     end.
 
-wait_headers(Ref, Timeout) ->
-    receive
-        {hackney_response, Ref, {headers, Hdrs}} ->
-            {ok, Hdrs};
-        {hackney_response, Ref, {error, Reason}} ->
-            {error, Reason};
-        _Other ->
-            wait_headers(Ref, Timeout)
-    after Timeout ->
-        _ = hackney:stop_async(Ref),
-        {error, headers_timeout}
-    end.
-
-%% Async-once gives us one message at a time and only on demand. The
-%% body would never arrive without further `stream_next` calls, so
-%% just abort the request and let the gen_statem disappear.
-drain(Ref, _Timeout) ->
-    _ = hackney:stop_async(Ref),
+stop_stream(Ref) ->
+    _ = livery_client:stop_stream(Ref),
     ok.
 
 %% =============================================================================
@@ -581,25 +540,22 @@ bin_to_hex(Bin) ->
 %% =============================================================================
 
 http_head(URL, Hdrs, Opts) ->
-    case hackney:request(head, URL, Hdrs, <<>>, sync_opts(Opts)) of
-        {ok, Status, RespHdrs} -> {ok, Status, RespHdrs};
-        {ok, Status, RespHdrs, _Body} -> {ok, Status, RespHdrs};
-        {error, _} = E -> E
+    Timeout = maps:get(timeout, Opts, 15000),
+    Client = sync_client(Timeout),
+    case livery_client:request(Client, head, URL, #{headers => Hdrs, timeout => Timeout}) of
+        {ok, Resp} ->
+            {ok, livery_client:status(Resp), livery_client:headers(Resp)};
+        {error, _} = E ->
+            E
     end.
 
 http_get_body(URL, Hdrs, Opts) ->
-    case hackney:request(get, URL, Hdrs, <<>>, sync_opts(Opts)) of
-        {ok, Status, RespHdrs, Body} when is_binary(Body) -> {ok, Status, RespHdrs, Body};
-        {error, _} = E -> E
+    Timeout = maps:get(timeout, Opts, 15000),
+    Client = sync_client(Timeout),
+    case livery_client:request(Client, get, URL, #{headers => Hdrs, timeout => Timeout}) of
+        {ok, Resp} ->
+            {full, Body} = livery_client:body(Resp),
+            {ok, livery_client:status(Resp), livery_client:headers(Resp), Body};
+        {error, _} = E ->
+            E
     end.
-
-sync_opts(Opts) ->
-    common_opts(maps:get(timeout, Opts, 15000)).
-
-common_opts(Timeout) ->
-    [
-        {follow_redirect, true},
-        {max_redirect, 5},
-        {connect_timeout, Timeout},
-        {recv_timeout, Timeout}
-    ].
