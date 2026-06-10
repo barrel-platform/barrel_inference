@@ -168,18 +168,23 @@ query_string(Pairs) ->
 
 http_call(Method, Url, Headers, Body, Config) ->
     Timeout = maps:get(timeout_ms, Config, ?DEFAULT_TIMEOUT_MS),
-    Opts = [
-        with_body,
-        {recv_timeout, Timeout},
-        {connect_timeout, Timeout},
-        {max_body, maps:get(max_body, Config, ?DEFAULT_MAX_BODY)},
-        {ssl_options, tls_opts()}
-    ],
-    case hackney:request(Method, Url, Headers, Body, Opts) of
-        {ok, 200, _RespHeaders, RespBody} ->
-            {ok, RespBody};
-        {ok, Status, _RespHeaders, _RespBody} ->
-            {error, {http_status, Status}};
+    MaxBody = maps:get(max_body, Config, ?DEFAULT_MAX_BODY),
+    Client = livery_client:new(#{
+        adapter_opts => #{
+            hackney => [
+                {connect_timeout, Timeout},
+                {max_body, MaxBody},
+                {ssl_options, tls_opts()}
+            ]
+        }
+    }),
+    ReqOpts = #{headers => Headers, body => {full, Body}, timeout => Timeout},
+    case livery_client:request(Client, Method, Url, ReqOpts) of
+        {ok, Resp} ->
+            case {livery_client:status(Resp), livery_client:body(Resp)} of
+                {200, {full, RespBody}} -> {ok, RespBody};
+                {Status, _} -> {error, {http_status, Status}}
+            end;
         {error, Reason} ->
             {error, Reason}
     end.

@@ -117,21 +117,28 @@ blocked_address(_) -> false.
 
 fetch(Url, Config) ->
     Timeout = maps:get(timeout_ms, Config, ?DEFAULT_TIMEOUT_MS),
-    Opts = [
-        with_body,
-        {recv_timeout, Timeout},
-        {connect_timeout, Timeout},
-        {max_body, maps:get(max_body, Config, ?DEFAULT_MAX_BODY)},
-        {ssl_options, tls_opts()}
-    ],
-    case hackney:request(get, Url, [], <<>>, Opts) of
-        {ok, 200, Headers, Body} ->
-            {ok, #{
-                <<"url">> => Url,
-                <<"content">> => extract(Headers, Body, Config)
-            }};
-        {ok, Status, _Headers, _Body} ->
-            {error, {http_status, Status}};
+    MaxBody = maps:get(max_body, Config, ?DEFAULT_MAX_BODY),
+    Client = livery_client:new(#{
+        adapter_opts => #{
+            hackney => [
+                {connect_timeout, Timeout},
+                {max_body, MaxBody},
+                {ssl_options, tls_opts()}
+            ]
+        }
+    }),
+    case livery_client:request(Client, get, Url, #{timeout => Timeout}) of
+        {ok, Resp} ->
+            Headers = livery_client:headers(Resp),
+            case {livery_client:status(Resp), livery_client:body(Resp)} of
+                {200, {full, Body}} ->
+                    {ok, #{
+                        <<"url">> => Url,
+                        <<"content">> => extract(Headers, Body, Config)
+                    }};
+                {Status, _} ->
+                    {error, {http_status, Status}}
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
