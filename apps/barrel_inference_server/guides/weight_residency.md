@@ -94,7 +94,7 @@ resident may show only a few hundred MB of process RSS.
 
 ## Bench numbers
 
-See [Weight residency bench](../../barrel_inference/internals/weight-residency-bench.md)
+See [Weight residency bench](../../runtime/internals/weight-residency-bench.md)
 for measured values across the four modes on Devstral 24B Q4 on an
 Apple M4 Pro. Headline:
 
