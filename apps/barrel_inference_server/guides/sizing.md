@@ -198,6 +198,51 @@ You'll get a Claude Code drop-in that fits comfortably in 48 GB
 of unified memory, with KV reuse across turns and tool calling
 on the v0.5 wire.
 
+## Autoparser scheduler pressure
+
+Every chat / messages request runs through llama.cpp's
+`common_chat_*` autoparser, which lives on the BEAM's **dirty CPU
+scheduler pool**. A request typically pays two trips into the NIF:
+
+- A jinja render (cheap, ~ms for a 700-token prompt).
+- A PEG parse over the buffered model response when generation
+  finishes (can climb into tens of ms for multi-thousand-token
+  outputs with rich tools).
+
+Dirty schedulers exist exactly so these long C++ calls do not stall
+the normal scheduler pool that runs HTTP handlers, gen_statems, and
+SSE writes — but the dirty pool itself has a fixed thread count.
+When all of them are busy, new dirty-NIF calls queue.
+
+Two metrics to watch:
+
+- `barrel_inference_dirty_cpu_scheduler_util{kind="dirty_cpu"}` —
+  per-scheduler busy ratio (0..1), sampled per `/metrics` scrape.
+  Sustained values above ~0.8 on every thread mean the pool is the
+  bottleneck.
+- `barrel_inference_chat_parse_duration_seconds` — histogram of
+  parse wall-time. Pair with `barrel_inference_chat_apply_duration_seconds`
+  (apply / render_only / make_params) to see whether pressure is
+  parse-bound (typical) or apply-bound (rare after the PR #42 cache).
+
+When the gauge stays saturated, raise the dirty CPU pool size in
+`config/vm.args`:
+
+```
++SDcpu 32
+```
+
+Default is the number of online schedulers (≈ CPU cores). Dirty
+threads are cheap; pick a value that matches your expected
+**concurrent autoparser request count**, not the core count.
+Operators on 12-core boxes serving high-concurrency agent traffic
+have used `+SDcpu 64` without problems.
+
+The chat-templates params cache landed in PR #42 already cuts the
+apply cost on repeat turns with the same tools schema (the common
+agent-loop case), so steady-state pressure should be parse-bound
+unless you see a high apply-duration p99.
+
 ## Reads to follow
 
 - [`clients.md`](clients.md) — full Claude Code walkthrough,

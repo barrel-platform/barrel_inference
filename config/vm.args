@@ -6,3 +6,16 @@
 +sbwt none
 +sbwtdcpu none
 +sbwtdio none
+
+## Dirty CPU schedulers carry every autoparser NIF call
+## (chat_templates_apply, chat_render_only, chat_make_params,
+## chat_parse) as well as the existing decode / step calls. Default
+## pool size is the number of online CPU schedulers (one per CPU
+## core on most boxes). For boxes serving many concurrent agent
+## requests where the
+## `barrel_inference_dirty_cpu_scheduler_util' Prometheus gauge
+## stays above ~0.8 for sustained periods, raise the pool:
+##   +SDcpu 32
+## Pick a value that matches your expected parse concurrency, not
+## the number of cores; the dirty pool is OS-thread-cheap.
+# +SDcpu 32

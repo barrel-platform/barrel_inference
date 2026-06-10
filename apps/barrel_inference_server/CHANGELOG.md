@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Autoparser scheduler-pressure instrumentation:
+  - `barrel_inference_dirty_cpu_scheduler_util` gauge — per-scheduler
+    busy ratio for both the normal and dirty pools, sampled per
+    `/metrics` scrape via `erlang:statistics(scheduler_wall_time_all)`.
+  - `barrel_inference_chat_apply_duration_seconds` histogram —
+    wall-time of the chat apply / render_only / make_params NIF
+    entries.
+  - `barrel_inference_chat_parse_duration_seconds` histogram —
+    wall-time of `chat_parse` (the PEG match).
+  The runtime's `barrel_inference_chat` module gains a
+  `set_observer/1` hook the server's metrics module registers itself
+  with at boot; the runtime stays free of any server dependency.
+- New operator guidance in `guides/sizing.md`:
+  "Autoparser scheduler pressure" subsection plus a commented
+  `+SDcpu` example in `config/vm.args` for raising the dirty CPU
+  pool when the new gauge shows sustained saturation.
+
 - New Prometheus gauge `barrel_inference_resident_bytes{model=...}`,
   sampled per /metrics scrape via `mincore(2)`. Reports bytes of the
   model's mmap regions currently faulted in, so operators can watch
