@@ -1,0 +1,5 @@
+{
+  "name": "barrel-inference",
+  "version": "0.1.0",
+  "description": "Expose the local Barrel Inference engine to Claude as MCP tools, plus an operating skill for residency tuning and cache diagnostics."
+}

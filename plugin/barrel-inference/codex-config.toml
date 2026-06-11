@@ -1,0 +1,21 @@
+# Barrel Inference MCP server for OpenAI Codex.
+#
+# Codex loads MCP servers from ~/.codex/config.toml. Copy the block below
+# into that file (adjust the absolute path to your checkout), or run:
+#
+#   codex mcp add barrel_inference \
+#     --env BARREL_URL=http://localhost:8080 \
+#     -- /ABSOLUTE/PATH/TO/barrel_inference/plugin/barrel-inference/bin/barrel-inference-mcp
+#
+# Prerequisites: the umbrella compiled (`rebar3 compile`) and the barrel
+# daemon running (default http://localhost:8080).
+
+[mcp_servers.barrel_inference]
+command = "/ABSOLUTE/PATH/TO/barrel_inference/plugin/barrel-inference/bin/barrel-inference-mcp"
+# args = []  # none needed; the launcher resolves the build relative to itself
+
+[mcp_servers.barrel_inference.env]
+BARREL_URL = "http://localhost:8080"
+# If Codex runs from a different location than your compiled checkout, point
+# the launcher at it explicitly:
+# BARREL_BUILD = "/ABSOLUTE/PATH/TO/barrel_inference/_build/default/lib"

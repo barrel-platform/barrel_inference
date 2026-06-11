@@ -1,0 +1,19 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
+{application, barrel_inference_mcp, [
+    {description,
+        "MCP server exposing the Barrel Inference runtime to MCP clients (Claude Code/Desktop)"},
+    {vsn, "0.8.0"},
+    {registered, []},
+    {mod, {barrel_inference_mcp_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        hackney,
+        barrel_mcp
+    ]},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{<<"GitHub">>, <<"https://github.com/barrel-platform/barrel_inference">>}]}
+]}.

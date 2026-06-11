@@ -89,6 +89,7 @@ nav:
       - HTTP API: server/guides/api.md
       - OpenAPI spec: server/guides/openapi.md
       - Clients & SDKs: server/guides/clients.md
+      - MCP plugin (Claude/Codex/Gemini): server/guides/mcp-plugin.md
       - Server-side tools: server/guides/tools.md
       - Model registry: server/guides/registry.md
       - Fetching models: server/guides/fetching.md
