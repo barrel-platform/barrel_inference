@@ -42,9 +42,18 @@
     responses_codex_envelope_accepted/1,
     request_id_minted_when_absent/1,
     request_id_echoed_when_present/1,
+    request_id_custom_header_name_echoed/1,
     cors_disabled_by_default/1,
     cors_preflight_returns_204/1,
-    cors_headers_present_on_response/1
+    cors_headers_present_on_response/1,
+    method_not_allowed_sweep/1,
+    completions_invalid_json_returns_400/1,
+    completions_missing_model_returns_400/1,
+    api_version_returns_200/1,
+    api_tags_returns_200/1,
+    api_ps_returns_200/1,
+    api_search_invalid_json_returns_400/1,
+    api_pull_emits_ndjson_lines/1
 ]).
 
 suite() -> [{timetrap, {seconds, 30}}].
@@ -82,9 +91,18 @@ all() ->
         responses_codex_envelope_accepted,
         request_id_minted_when_absent,
         request_id_echoed_when_present,
+        request_id_custom_header_name_echoed,
         cors_disabled_by_default,
         cors_preflight_returns_204,
-        cors_headers_present_on_response
+        cors_headers_present_on_response,
+        method_not_allowed_sweep,
+        completions_invalid_json_returns_400,
+        completions_missing_model_returns_400,
+        api_version_returns_200,
+        api_tags_returns_200,
+        api_ps_returns_200,
+        api_search_invalid_json_returns_400,
+        api_pull_emits_ndjson_lines
     ].
 
 init_per_suite(Config) ->
@@ -651,4 +669,156 @@ responses_codex_envelope_accepted(Cfg) ->
     case Status of
         200 -> ?assert(binary:match(Bin, <<"event: response.failed">>) =/= nomatch);
         _ -> ?assert(is_binary(Bin))
+    end.
+
+%%====================================================================
+%% Phase α contract tests: pin framework-visible behaviour before the
+%% cowboy -> livery migration so any handler swap is regression-checked
+%% against this baseline.
+%%====================================================================
+
+%% The request-id header name is operator-configurable via the
+%% `request_id_header' env. Set a non-default name at runtime (the
+%% config layer caches it in persistent_term so a put / restore here
+%% reaches the middleware on the next request), assert the response
+%% carries the value under the configured name.
+request_id_custom_header_name_echoed(Cfg) ->
+    Key = {barrel_inference_server_config, request_id_header},
+    Original = persistent_term:get(Key, <<"x-request-id">>),
+    persistent_term:put(Key, <<"x-trace-id">>),
+    try
+        Url = ?config(base, Cfg) ++ "/health",
+        {ok, {{_, 200, _}, Headers, _}} =
+            httpc:request(get, {Url, [{"x-trace-id", "trace-abc"}]}, [], []),
+        {value, {_, Id}} = lists:keysearch("x-trace-id", 1, Headers),
+        ?assertEqual("trace-abc", Id),
+        ?assertEqual(false, lists:keymember("x-request-id", 1, Headers))
+    after
+        persistent_term:put(Key, Original)
+    end.
+
+%% Every routed path is reachable under at least one HTTP method; this
+%% case probes each with a wrong method and asserts 405. Catches the
+%% (currently absent) framework-level method-not-allowed contract that
+%% the livery router will surface differently than cowboy's per-handler
+%% dispatch.
+method_not_allowed_sweep(Cfg) ->
+    Base = ?config(base, Cfg),
+    %% {Path, WrongMethod}; the path is an existing route + a method it
+    %% does NOT serve.
+    Probes = [
+        {"/health", post},
+        {"/health/ready", post},
+        {"/metrics", post},
+        {"/v1/models", post},
+        {"/v1/chat/completions", get},
+        {"/v1/completions", get},
+        {"/v1/responses", get},
+        {"/v1/messages", get},
+        {"/v1/messages/count_tokens", get},
+        {"/v1/embeddings", get},
+        {"/api/tags", post},
+        {"/api/version", post},
+        {"/api/ps", post},
+        {"/api/pull", get},
+        {"/api/generate", get},
+        {"/api/chat", get},
+        {"/api/embed", get},
+        {"/api/embeddings", get},
+        {"/api/show", get},
+        {"/api/copy", get},
+        {"/api/edit", get},
+        {"/api/create", get},
+        {"/api/search", get}
+    ],
+    [check_method_405(Base, Path, Method) || {Path, Method} <- Probes],
+    ok.
+
+check_method_405(Base, Path, get) ->
+    Url = Base ++ Path,
+    {ok, {{_, Status, _}, _, _}} = httpc:request(get, {Url, []}, [], []),
+    ?assertEqual({Path, 405}, {Path, Status});
+check_method_405(Base, Path, post) ->
+    Url = Base ++ Path,
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", <<"{}">>}, [], []),
+    ?assertEqual({Path, 405}, {Path, Status}).
+
+%% OpenAI legacy completions (POST /v1/completions) is routed via the
+%% chat handler with `api => openai_legacy'; verify the JSON validation
+%% path and the missing-model path land on the documented 400s.
+completions_invalid_json_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/completions",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+
+completions_missing_model_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/completions",
+    Body = json:encode(#{<<"prompt">> => <<"hello">>}),
+    {ok, {{_, Status, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    ?assertEqual(400, Status).
+
+%% Ollama-shaped non-streaming GET endpoints. /api/version reports the
+%% server version, /api/tags lists registry entries, /api/ps lists
+%% loaded model processes. None require an actual model load, so they
+%% should all return 200 with a JSON body in the smoke baseline.
+api_version_returns_200(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/api/version",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(is_map(Decoded)),
+    ?assert(maps:is_key(<<"version">>, Decoded)).
+
+api_tags_returns_200(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/api/tags",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(maps:is_key(<<"models">>, Decoded)).
+
+api_ps_returns_200(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/api/ps",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(maps:is_key(<<"models">>, Decoded)).
+
+%% POST /api/search has no test coverage today. Drive the invalid-JSON
+%% path so the route at least exists and validates input the same way
+%% as the rest of the Ollama-shaped surface.
+api_search_invalid_json_returns_400(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/api/search",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+
+%% POST /api/pull is NDJSON-streaming. Even on a fast-failing spec
+%% (unknown model) the body must consist of `\n'-terminated parseable
+%% JSON objects, no half-frames at the end. Pins the framing the
+%% livery_resp:stream/3 producer must reproduce.
+api_pull_emits_ndjson_lines(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/api/pull",
+    Body = json:encode(#{<<"model">> => <<"no-such-model:notag">>, <<"stream">> => true}),
+    {ok, {{_, _Status, _}, Headers, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Bin = list_to_binary(RespBody),
+    %% The Content-Type is application/x-ndjson on success and
+    %% application/json on a synchronous error envelope; either is fine
+    %% as long as the body framing matches.
+    {value, {_, CT}} = lists:keysearch("content-type", 1, Headers),
+    case string:str(CT, "x-ndjson") of
+        0 ->
+            %% Synchronous error path: body is a single JSON object.
+            Decoded = json:decode(Bin),
+            ?assert(is_map(Decoded));
+        _ ->
+            %% Streaming path: split on \n, drop any trailing empty,
+            %% each non-empty line decodes to a JSON map.
+            Lines = [L || L <- binary:split(Bin, <<"\n">>, [global]), L =/= <<>>],
+            ?assert(Lines =/= []),
+            [
+                begin
+                    M = json:decode(L),
+                    ?assert(is_map(M))
+                end
+             || L <- Lines
+            ]
     end.
