@@ -12,6 +12,35 @@
 
 -export([init/2]).
 
+%% livery entry points.
+-export([list/1, single/1]).
+
+list(_Req) ->
+    Now = erlang:system_time(second),
+    Loaded = [model_entry(I, Now, <<"barrel_inference">>) || I <- safe_list_models()],
+    Aliases = alias_entries(Now),
+    Body = #{
+        <<"object">> => <<"list">>,
+        <<"data">> => Loaded ++ Aliases
+    },
+    livery_resp:json(200, json:encode(Body)).
+
+single(Req) ->
+    ModelId = livery_req:binding(<<"model_id">>, Req),
+    Resolved = barrel_inference_server_config:resolve_model(ModelId),
+    case lookup(Resolved) of
+        {ok, Info} ->
+            Body = model_entry(Info, erlang:system_time(second), <<"barrel_inference">>),
+            livery_resp:json(200, json:encode(Body));
+        not_found ->
+            Body = openai_error(
+                <<"model not found">>,
+                <<"invalid_request_error">>,
+                <<"model_not_found">>
+            ),
+            livery_resp:json(404, json:encode(Body))
+    end.
+
 init(Req0, Opts) ->
     case cowboy_req:method(Req0) of
         <<"GET">> ->

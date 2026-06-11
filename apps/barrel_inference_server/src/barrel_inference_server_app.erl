@@ -10,10 +10,51 @@ start(_StartType, _StartArgs) ->
     case barrel_inference_server_sup:start_link() of
         {ok, _Sup} = OK ->
             ok = maybe_bootstrap_models(),
+            ok = maybe_start_livery_listener(),
             OK;
         E ->
             E
     end.
+
+%% Optional livery listener for the migration window. When the
+%% `livery_port' env is unset the listener is not started and only the
+%% cowboy listener serves traffic. When set, both listeners run
+%% side-by-side on different ports so a CT suite (or an operator who
+%% wants to probe the new stack) can target livery directly without
+%% replacing the production listener. The cowboy listener stays the
+%% default until phase δ flips the production port.
+maybe_start_livery_listener() ->
+    case application:get_env(barrel_inference_server, livery_port, undefined) of
+        undefined ->
+            ok;
+        Port when is_integer(Port) ->
+            Routes = barrel_inference_server_routes:livery_routes(),
+            Router = livery_router:compile(Routes),
+            Stack = livery_middleware_stack(),
+            HttpOpts = #{
+                port => Port,
+                ip => application:get_env(barrel_inference_server, livery_ip, {0, 0, 0, 0}),
+                acceptors =>
+                    application:get_env(barrel_inference_server, livery_acceptors, 100),
+                idle_timeout =>
+                    application:get_env(
+                        barrel_inference_server,
+                        livery_idle_timeout_ms,
+                        1800000
+                    )
+            },
+            Config = #{http => HttpOpts, router => Router, middleware => Stack},
+            {ok, ServicePid} = livery:start_service(Config),
+            persistent_term:put({?MODULE, livery_service_pid}, ServicePid),
+            ok
+    end.
+
+livery_middleware_stack() ->
+    [
+        {barrel_inference_server_request_id_mw, undefined},
+        {barrel_inference_server_cors_mw, undefined},
+        {barrel_inference_server_access_log_mw, undefined}
+    ].
 
 %% barrel_inference 0.4.0 reads `application:get_env(barrel_inference, thinking_signing_key)`
 %% to HMAC-sign extended-thinking blocks. We accept the key on our
@@ -148,7 +189,19 @@ prep_stop(State) ->
             application:get_env(barrel_inference_server, shutdown_timeout_ms, 5000),
     drain(Ref, DeadlineMs),
     _ = (catch cowboy:stop_listener(Ref)),
+    _ = stop_livery_listener(DeadlineMs),
     State.
+
+stop_livery_listener(DeadlineMs) ->
+    case persistent_term:get({?MODULE, livery_service_pid}, undefined) of
+        undefined ->
+            ok;
+        Pid when is_pid(Pid) ->
+            Remaining = max(0, DeadlineMs - erlang:monotonic_time(millisecond)),
+            _ = livery:drain(Pid, #{timeout => Remaining}),
+            persistent_term:erase({?MODULE, livery_service_pid}),
+            ok
+    end.
 
 drain(Ref, DeadlineMs) ->
     Conns = (catch ranch:info(Ref)),
