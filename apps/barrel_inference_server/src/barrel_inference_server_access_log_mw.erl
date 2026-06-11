@@ -23,11 +23,11 @@ call(Req, Next, _State) ->
             logger:notice(
                 "~s ~s ~p (~.2fms) ~s ~s",
                 [
-                    or_dash(livery_req:method(Req)),
-                    or_dash(livery_req:path(Req)),
+                    livery_req:method(Req),
+                    livery_req:path(Req),
                     livery_resp:status(Resp),
                     DurationUs / 1000.0,
-                    or_dash(livery_req:req_id(Req)),
+                    req_id_or_dash(livery_req:req_id(Req)),
                     fmt_peer(livery_req:peer(Req))
                 ]
             );
@@ -44,6 +44,9 @@ fmt_peer({Ip, Port}) ->
 fmt_peer(_) ->
     <<"-">>.
 
-or_dash(undefined) -> <<"-">>;
-or_dash(B) when is_binary(B) -> B;
-or_dash(L) when is_list(L) -> L.
+%% livery_req:req_id/1 returns <<>> before the request-id middleware
+%% has stamped one (an empty binary, not `undefined'). Treat empty
+%% binary as missing so the log line shows `-' instead of the empty
+%% field.
+req_id_or_dash(<<>>) -> <<"-">>;
+req_id_or_dash(B) when is_binary(B) -> B.

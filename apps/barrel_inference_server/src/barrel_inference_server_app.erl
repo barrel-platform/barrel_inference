@@ -35,13 +35,7 @@ maybe_start_livery_listener() ->
                 port => Port,
                 ip => application:get_env(barrel_inference_server, livery_ip, {0, 0, 0, 0}),
                 acceptors =>
-                    application:get_env(barrel_inference_server, livery_acceptors, 100),
-                idle_timeout =>
-                    application:get_env(
-                        barrel_inference_server,
-                        livery_idle_timeout_ms,
-                        1800000
-                    )
+                    application:get_env(barrel_inference_server, livery_acceptors, 100)
             },
             Config = #{http => HttpOpts, router => Router, middleware => Stack},
             {ok, ServicePid} = livery:start_service(Config),

@@ -14,6 +14,8 @@
 
 -export([cowboy_routes/0, livery_routes/0, not_yet_migrated/1]).
 
+-export_type([livery_route/0]).
+
 -spec cowboy_routes() -> cowboy_router:routes().
 cowboy_routes() ->
     [
