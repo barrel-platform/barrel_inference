@@ -11,7 +11,7 @@
 
 handle(_Req) ->
     barrel_inference_server_metrics:update_cache_gauges(),
-    Body = instrument_prometheus:format(),
+    Body = iolist_to_binary(instrument_prometheus:format()),
     livery_resp:text(
         200,
         [{<<"content-type">>, instrument_prometheus:content_type()}],
