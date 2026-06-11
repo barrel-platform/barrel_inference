@@ -1,21 +1,30 @@
 #!/usr/bin/env bash
 #
 # Launch the Barrel Inference MCP server over stdio for an MCP client
-# (Claude Code / Desktop). Prerequisite: the umbrella has been compiled
-# with `rebar3 compile` so the beams exist under _build/default/lib.
+# (Claude Code, Codex, Gemini CLI, Claude Desktop, ...). Prerequisite: the
+# umbrella has been compiled with `rebar3 compile` so the beams exist under
+# _build/default/lib.
 #
-# The repo root is three levels up: bin -> barrel-inference -> plugin -> repo.
-# BARREL_URL (passed by the MCP host, default http://localhost:8080) tells
-# the server where the barrel daemon is.
+# Build location resolution (first wins):
+#   1. BARREL_BUILD     explicit path to <checkout>/_build/default/lib.
+#                       Set this when the plugin/extension is installed in a
+#                       different location than your compiled barrel checkout
+#                       (e.g. a Gemini extension clone or a Codex config entry).
+#   2. <repo>/_build/default/lib, where <repo> is three levels up from this
+#      script: bin -> barrel-inference -> plugin -> repo.
+#
+# BARREL_URL (default http://localhost:8080) tells the server where the
+# barrel daemon is.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-BUILD="${REPO_ROOT}/_build/default/lib"
+BUILD="${BARREL_BUILD:-${REPO_ROOT}/_build/default/lib}"
 
 if [ ! -d "${BUILD}" ]; then
   echo "barrel-inference-mcp: no build found at ${BUILD}." >&2
-  echo "Run 'rebar3 compile' in ${REPO_ROOT} first." >&2
+  echo "Run 'rebar3 compile' in your barrel checkout, or set BARREL_BUILD to" >&2
+  echo "its _build/default/lib directory." >&2
   exit 1
 fi
 

@@ -1,13 +1,21 @@
-# MCP plugin (Claude Code)
+# MCP plugin (Claude Code, Codex, Gemini)
 
 Barrel ships an [MCP](https://modelcontextprotocol.io) server that exposes the
-running daemon to MCP clients (Claude Code, Claude Desktop, or any MCP host).
-It turns the engine into callable tools: run inference, list and tune models,
-and read cache/residency metrics, without leaving the chat.
+running daemon to MCP clients. It turns the engine into callable tools: run
+inference, list and tune models, and read cache/residency metrics, without
+leaving the chat.
 
-The repo doubles as a Claude Code **plugin marketplace**, so installation is two
-slash commands. The plugin bundles the MCP server plus an operating skill that
-teaches Claude how to use the tools well.
+One server, three hosts. MCP is the shared standard, so the same stdio launcher
+(`plugin/barrel-inference/bin/barrel-inference-mcp`) plugs into **Claude Code**,
+**OpenAI Codex**, and **Gemini CLI**; only the per-host config differs. Each host
+also gets the same operating guidance (residency tuning, context limits, session
+reuse, slow-generation diagnosis) as a skill or context file.
+
+| Host | MCP wiring | Operating guidance |
+|------|-----------|--------------------|
+| Claude Code | `.claude-plugin/marketplace.json` + `plugin/barrel-inference/.mcp.json` | `skills/operating-barrel/SKILL.md` |
+| OpenAI Codex | `~/.codex/config.toml` (`[mcp_servers.barrel_inference]`) | `.codex-plugin/plugin.json` -> skill |
+| Gemini CLI | `gemini-extension.json` (`mcpServers`) | `GEMINI.md` context file |
 
 ## What it exposes
 
@@ -56,6 +64,46 @@ setting `BARREL_URL` in that `.mcp.json` `env` block (default
 
 The barrel daemon must be running (see the [Quickstart](quickstart.md)); the
 MCP server connects to it over HTTP.
+
+## Install in Codex
+
+Codex loads MCP servers from `~/.codex/config.toml`. Add the server (use an
+absolute path to the launcher in your checkout):
+
+```sh
+codex mcp add barrel_inference \
+  --env BARREL_URL=http://localhost:8080 \
+  -- /ABS/PATH/barrel_inference/plugin/barrel-inference/bin/barrel-inference-mcp
+```
+
+or paste the equivalent block from
+[`plugin/barrel-inference/codex-config.toml`](https://github.com/barrel-platform/barrel_inference/blob/main/plugin/barrel-inference/codex-config.toml)
+into `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.barrel_inference]
+command = "/ABS/PATH/barrel_inference/plugin/barrel-inference/bin/barrel-inference-mcp"
+
+[mcp_servers.barrel_inference.env]
+BARREL_URL = "http://localhost:8080"
+```
+
+## Install in Gemini CLI
+
+The repo is a Gemini CLI extension (`gemini-extension.json` at the root, with a
+`GEMINI.md` context file). Install it from the repo or a local checkout:
+
+```sh
+gemini extensions install https://github.com/barrel-platform/barrel_inference.git
+# or, from a local clone:
+gemini extensions install /ABS/PATH/barrel_inference
+```
+
+Gemini starts the MCP server from `gemini-extension.json` (the launcher path is
+resolved via `${extensionPath}`) and loads `GEMINI.md` as context. If the
+extension is installed somewhere other than your compiled checkout, set
+`BARREL_BUILD` to `<checkout>/_build/default/lib` in the extension's
+`mcpServers.env` so the launcher finds the beams.
 
 ## Use it
 

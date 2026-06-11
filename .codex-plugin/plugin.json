@@ -1,0 +1,22 @@
+{
+  "name": "barrel-inference",
+  "version": "0.1.0",
+  "description": "Operate the local Barrel Inference engine from Codex: run inference, tune residency, inspect the KV cache.",
+  "author": {
+    "name": "Barrel"
+  },
+  "keywords": [
+    "barrel",
+    "inference",
+    "mcp",
+    "llama.cpp"
+  ],
+  "skills": "./plugin/barrel-inference/skills/",
+  "interface": {
+    "displayName": "Barrel Inference",
+    "shortDescription": "Run and tune the local Barrel Inference engine",
+    "longDescription": "MCP tools and an operating skill for the Barrel Inference engine: run inference, list/show/edit models, and read cache and weight-residency metrics. The MCP server is wired via ~/.codex/config.toml (see codex-config.toml).",
+    "developerName": "Barrel",
+    "category": "Coding"
+  }
+}

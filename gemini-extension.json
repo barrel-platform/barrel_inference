@@ -1,0 +1,14 @@
+{
+  "name": "barrel-inference",
+  "version": "0.1.0",
+  "description": "Operate the local Barrel Inference engine: run inference, tune residency, inspect the KV cache.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "barrel-inference": {
+      "command": "${extensionPath}/plugin/barrel-inference/bin/barrel-inference-mcp",
+      "env": {
+        "BARREL_URL": "http://localhost:8080"
+      }
+    }
+  }
+}

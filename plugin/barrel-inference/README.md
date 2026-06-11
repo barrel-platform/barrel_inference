@@ -1,27 +1,48 @@
-# barrel-inference (Claude Code plugin)
+# barrel-inference plugin (Claude Code, Codex, Gemini)
 
 Operate the local [Barrel Inference](https://github.com/barrel-platform/barrel_inference)
-engine from Claude. Bundles an MCP server (the engine as callable tools) plus an
-operating skill (how to use them).
+engine from an MCP host. Bundles one MCP server (the engine as callable tools)
+plus the operating guidance, wired for three hosts off the same stdio launcher.
 
 ## Install
+
+**Claude Code**
 
 ```text
 /plugin marketplace add https://github.com/barrel-platform/barrel_inference.git
 /plugin install barrel-inference@barrel-inference
 ```
 
-Prerequisites: the umbrella compiled (`rebar3 compile`) and the barrel daemon
-running (default `http://localhost:8080`; override with `BARREL_URL` in
-`.mcp.json`).
+**OpenAI Codex** — add the server to `~/.codex/config.toml`:
+
+```sh
+codex mcp add barrel_inference --env BARREL_URL=http://localhost:8080 \
+  -- /ABS/PATH/barrel_inference/plugin/barrel-inference/bin/barrel-inference-mcp
+```
+
+(see [`codex-config.toml`](codex-config.toml) for the full block).
+
+**Gemini CLI** — install the extension:
+
+```sh
+gemini extensions install https://github.com/barrel-platform/barrel_inference.git
+```
+
+Prerequisites (all hosts): the umbrella compiled (`rebar3 compile`) and the
+barrel daemon running (default `http://localhost:8080`; override with
+`BARREL_URL`). If a host runs from a different location than your compiled
+checkout, set `BARREL_BUILD` to its `_build/default/lib`.
 
 ## Contents
 
-- `.mcp.json` — starts the MCP server over stdio via `bin/barrel-inference-mcp`.
-- `bin/barrel-inference-mcp` — launcher; boots the `barrel_inference_mcp` app
-  against `_build/default/lib` and runs the stdio loop.
-- `skills/operating-barrel/SKILL.md` — residency tuning, context limits, session
-  reuse, and slow-generation diagnosis.
+- `.mcp.json` — Claude Code MCP wiring (stdio via `bin/barrel-inference-mcp`).
+- `codex-config.toml` — Codex `~/.codex/config.toml` snippet.
+- `bin/barrel-inference-mcp` — launcher shared by all hosts; boots the
+  `barrel_inference_mcp` app against the build and runs the stdio loop.
+- `skills/operating-barrel/SKILL.md` — operating guidance (Claude skill).
+
+Host manifests at the repo root: `.claude-plugin/marketplace.json`,
+`.codex-plugin/plugin.json`, `gemini-extension.json` + `GEMINI.md`.
 
 ## Tools
 
