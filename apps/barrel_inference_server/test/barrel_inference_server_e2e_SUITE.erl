@@ -377,4 +377,3 @@ http_collect(Url, Body) ->
     {ok, {{_, 200, _}, _Headers, RespBody}} =
         httpc:request(post, {Url, [], "application/json", Body}, HttpOpts, []),
     list_to_binary(RespBody).
-
