@@ -12,8 +12,19 @@
 -export([openai/1, legacy/1]).
 
 %% The receive-loop driven state mutates `ref' / `slot' / `pending_exec'
-%% through pipeline messages dialyzer can't trace through.
--dialyzer({nowarn_function, [cleanup/1, keepalive_release/1]}).
+%% through pipeline messages dialyzer can't trace through. The cleanup
+%% paths legitimately pattern-match both shapes; suppress narrowing.
+-dialyzer(
+    {nowarn_function, [
+        cleanup/1,
+        keepalive_release/1,
+        maybe_end_session/1,
+        record_session_committed/2,
+        release_slot/1,
+        drive_stream/4,
+        drive_buffered/3
+    ]}
+).
 
 -include("barrel_inference_server.hrl").
 
@@ -131,11 +142,12 @@ drive_stream(R, Requested, Api, Emit) ->
     {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
     State = init_state(R, Requested, Api, Worker, Mon, true),
     State1 = arm_total_timer(State),
-    try
-        stream_loop(State1, Emit)
-    after
-        cleanup(State1)
-    end,
+    _ =
+        try
+            stream_loop(State1, Emit)
+        after
+            cleanup(State1)
+        end,
     ok.
 
 drive_buffered(R, Requested, Api) ->
@@ -493,10 +505,8 @@ dispatch_buffered({pipeline, _, _} = M, S) -> on_pipeline_buffered(M, S);
 dispatch_buffered({pipeline, _, _, _} = M, S) -> on_pipeline_buffered(M, S);
 dispatch_buffered({barrel_inference_token, Ref, Tok}, S) ->
     S1 = learn_ref(S, Ref),
-    case handle_token_buffered(Tok, S1) of
-        {cont, S2} -> buffered_loop(rearm_idle(S2));
-        {done, _} = D -> D
-    end;
+    {cont, S2} = handle_token_buffered(Tok, S1),
+    buffered_loop(rearm_idle(S2));
 dispatch_buffered({barrel_inference_reasoning_token, Ref, Tok}, S) ->
     S1 = learn_ref(S, Ref),
     buffered_loop(rearm_idle(S1#st{buf_reason = [S1#st.buf_reason | Tok]}));
@@ -692,11 +702,9 @@ rearm_idle(S) ->
             S#st{idle_tref = erlang:send_after(Ms, self(), {idle_timeout, Ref})}
     end.
 
-arm_total_timer(S = #st{total_tref = undefined}) ->
-    Ms = total_ms(),
-    S#st{total_tref = erlang:send_after(Ms, self(), total_request_timeout)};
 arm_total_timer(S) ->
-    S.
+    Ms = total_ms(),
+    S#st{total_tref = erlang:send_after(Ms, self(), total_request_timeout)}.
 
 total_ms() ->
     case barrel_inference_server_config:total_ms() of
@@ -764,9 +772,12 @@ keepalive_release(#st{model = Model}) ->
         Model, barrel_inference_server_config:keep_alive_default_ms()
     ).
 
-record_session_committed(#st{session_id = undefined}, _) -> ok;
-record_session_committed(#st{model = Model, session_id = SessionId, prompt_token_ids = Prompt}, Stats) ->
-    barrel_inference_server_session_state:record(Model, SessionId, Prompt, Stats).
+record_session_committed(#st{session_id = undefined}, _) ->
+    ok;
+record_session_committed(S, Stats) ->
+    barrel_inference_server_session_state:record(
+        S#st.model, S#st.session_id, S#st.prompt_token_ids, Stats
+    ).
 
 accumulate_stats(S, Stats) ->
     S#st{agg_stats = merge_stats(S#st.agg_stats, Stats)}.
