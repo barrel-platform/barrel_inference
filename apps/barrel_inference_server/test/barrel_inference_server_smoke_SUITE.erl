@@ -168,7 +168,7 @@ init_per_suite(Config) ->
         }
     ),
     {ok, Started} = application:ensure_all_started(barrel_inference_server),
-    {ok, _} = application:ensure_all_started(inets),
+    {ok, _} = barrel_inference_server_http_test:ensure_started(),
     Url = io_lib:format("http://127.0.0.1:~p", [chosen_port()]),
     [
         {base, lists:flatten(Url)},
@@ -198,13 +198,13 @@ chosen_port() ->
 
 health_returns_200(Cfg) ->
     Url = ?config(base, Cfg) ++ "/health",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assertEqual(<<"ok">>, maps:get(<<"status">>, Decoded)).
 
 health_ready_returns_503_with_no_models(Cfg) ->
     Url = ?config(base, Cfg) ++ "/health/ready",
-    {ok, {{_, Code, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, Code, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assertEqual(503, Code),
     ?assertEqual(<<"not_ready">>, maps:get(<<"status">>, Decoded)),
@@ -212,14 +212,14 @@ health_ready_returns_503_with_no_models(Cfg) ->
 
 models_returns_openai_list_shape(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/models",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assertEqual(<<"list">>, maps:get(<<"object">>, Decoded)),
     ?assertMatch([_ | _], maps:get(<<"data">>, Decoded)).
 
 models_returns_aliases(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/models",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     Ids = [maps:get(<<"id">>, M) || M <- maps:get(<<"data">>, Decoded)],
     ?assert(lists:member(<<"alias-a">>, Ids)),
@@ -227,14 +227,14 @@ models_returns_aliases(Cfg) ->
 
 models_unknown_returns_404(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/models/no-such-model",
-    {ok, {{_, 404, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 404, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     Err = maps:get(<<"error">>, Decoded),
     ?assertEqual(<<"model_not_found">>, maps:get(<<"code">>, Err)).
 
 metrics_returns_prometheus_text(Cfg) ->
     Url = ?config(base, Cfg) ++ "/metrics",
-    {ok, {{_, 200, _}, Headers, _Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, Headers, _Body}} = barrel_inference_server_http_test:request(Url),
     %% Content-type starts with text/plain. Body may be empty if no
     %% counter has been observed yet (the suite order is not
     %% guaranteed across runs).
@@ -245,7 +245,9 @@ embeddings_unknown_model_returns_404(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/embeddings",
     Body = json:encode(#{<<"model">> => <<"nope">>, <<"input">> => <<"hi">>}),
     {ok, {{_, Code, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     %% No model is loaded; resolve_model is identity, ensure_loaded
     %% sees not_found from barrel_inference:model_info/1 (not loaded path).
     %% In practice this returns 503 from ensure_loaded {error, not_loaded}
@@ -256,7 +258,7 @@ embeddings_unknown_model_returns_404(Cfg) ->
 embeddings_invalid_json_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/embeddings",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(
+        barrel_inference_server_http_test:request(
             post,
             {Url, [], "application/json", "{not json"},
             [],
@@ -266,7 +268,7 @@ embeddings_invalid_json_returns_400(Cfg) ->
 chat_invalid_json_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(
+        barrel_inference_server_http_test:request(
             post,
             {Url, [], "application/json", "{nope"},
             [],
@@ -286,7 +288,9 @@ messages_streaming_unknown_model_emits_event_error(Cfg) ->
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
     }),
     {ok, {{_, Status, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Bin = list_to_binary(RespBody),
     %% Cowboy streams with HTTP 200; the error is conveyed via the
     %% SSE error event rather than an HTTP status. (200 is what
@@ -311,7 +315,9 @@ count_tokens_unknown_model_returns_529(Cfg) ->
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
     }),
     {ok, {{_, Status, _}, Headers, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     ?assertEqual(529, Status),
     {value, {_, Retry}} = lists:keysearch("retry-after", 1, Headers),
     ?assert(list_to_integer(Retry) >= 1),
@@ -324,7 +330,7 @@ count_tokens_unknown_model_returns_529(Cfg) ->
 count_tokens_invalid_json_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages/count_tokens",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(
+        barrel_inference_server_http_test:request(
             post,
             {Url, [], "application/json", "{not json"},
             [],
@@ -341,7 +347,7 @@ anthropic_version_header_echoed(Cfg) ->
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
     }),
     {ok, {{_, _, _}, Headers, _}} =
-        httpc:request(
+        barrel_inference_server_http_test:request(
             post,
             {Url, [{"anthropic-version", "2024-12-01"}], "application/json", Body},
             [],
@@ -358,7 +364,7 @@ accepts_body_above_one_mb(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
     Big = binary:copy(<<"x">>, 5 * 1024 * 1024),
     {ok, {{_, Status, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", Big}, [], []),
+        barrel_inference_server_http_test:request(post, {Url, [], "application/json", Big}, [], []),
     ?assertEqual(400, Status).
 
 %% Cowboy's default per-read `length' is 8 MB; the handler must loop
@@ -373,7 +379,7 @@ accepts_body_above_cowboy_default_length(Cfg) ->
     %% get a clean 400 from the handler.
     Big = binary:copy(<<"x">>, 9 * 1024 * 1024),
     {ok, {{_, Status, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", Big}, [], []),
+        barrel_inference_server_http_test:request(post, {Url, [], "application/json", Big}, [], []),
     ?assertEqual(400, Status).
 
 %% Anthropic SDKs read `request-id` (no x- prefix) into
@@ -388,7 +394,9 @@ messages_emits_request_id_header(Cfg) ->
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
     }),
     {ok, {{_, _, _}, Headers, _}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     {value, {_, AnthrId}} = lists:keysearch("request-id", 1, Headers),
     {value, {_, XReqId}} = lists:keysearch("x-request-id", 1, Headers),
     ?assertEqual(XReqId, AnthrId),
@@ -405,7 +413,7 @@ messages_no_allowlist_accepts_any_key(Cfg) ->
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
     }),
     {ok, {{_, Status, _}, _, _}} =
-        httpc:request(
+        barrel_inference_server_http_test:request(
             post,
             {Url, [{"x-api-key", "not-used"}], "application/json", Body},
             [],
@@ -436,7 +444,9 @@ messages_logs_user_id_in_event(Cfg) ->
                 #{<<"role">> => <<"user">>, <<"content">> => <<"x">>}
             ]
         }),
-        {ok, _} = httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        {ok, _} = barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
         receive
             {log_event, Report} ->
                 ?assertEqual(<<"u-test">>, maps:get(user_id, Report)),
@@ -482,7 +492,9 @@ messages_emits_ratelimit_headers(Cfg) ->
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
     }),
     {ok, {{_, _, _}, Headers, _}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     {value, {_, Limit}} =
         lists:keysearch("anthropic-ratelimit-requests-limit", 1, Headers),
     {value, {_, Remaining}} =
@@ -505,7 +517,9 @@ messages_error_body_carries_request_id(Cfg) ->
         <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"x">>}]
     }),
     {ok, {{_, 404, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Decoded = json:decode(list_to_binary(RespBody)),
     ?assertMatch(#{<<"request_id">> := <<"req_", _/binary>>}, Decoded).
 
@@ -517,7 +531,9 @@ messages_413_returns_request_too_large_type(Cfg) ->
     %% Suite cap is 12 MiB (init_per_suite); 13 MiB trips 413.
     Oversized = binary:copy(<<"x">>, 13 * 1024 * 1024),
     {ok, {{_, Status, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Oversized}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Oversized}, [], []
+        ),
     ?assertEqual(413, Status),
     Decoded = json:decode(list_to_binary(RespBody)),
     ?assertMatch(
@@ -529,7 +545,9 @@ chat_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
     Body = json:encode(#{<<"messages">> => []}),
     {ok, {{_, 400, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Decoded = json:decode(list_to_binary(RespBody)),
     ?assertMatch(#{<<"error">> := _}, Decoded).
 
@@ -542,7 +560,9 @@ chat_too_many_messages_returns_400(Cfg) ->
     ],
     Body = json:encode(#{<<"model">> => <<"x">>, <<"messages">> => Many}),
     {ok, {{_, 400, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Decoded = json:decode(list_to_binary(RespBody)),
     ?assertMatch(
         #{<<"error">> := #{<<"code">> := <<"too_many_messages">>}},
@@ -551,14 +571,16 @@ chat_too_many_messages_returns_400(Cfg) ->
 
 request_id_minted_when_absent(Cfg) ->
     Url = ?config(base, Cfg) ++ "/health",
-    {ok, {{_, 200, _}, Headers, _}} = httpc:request(Url),
+    {ok, {{_, 200, _}, Headers, _}} = barrel_inference_server_http_test:request(Url),
     {value, {_, Id}} = lists:keysearch("x-request-id", 1, Headers),
     ?assert(string:prefix(Id, "req_") =/= nomatch).
 
 request_id_echoed_when_present(Cfg) ->
     Url = ?config(base, Cfg) ++ "/health",
     {ok, {{_, 200, _}, Headers, _}} =
-        httpc:request(get, {Url, [{"x-request-id", "abc-123"}]}, [], []),
+        barrel_inference_server_http_test:request(
+            get, {Url, [{"x-request-id", "abc-123"}]}, [], []
+        ),
     {value, {_, Id}} = lists:keysearch("x-request-id", 1, Headers),
     ?assertEqual("abc-123", Id).
 
@@ -566,7 +588,7 @@ cors_disabled_by_default(Cfg) ->
     %% This suite enables CORS, so this test verifies that no Origin
     %% header skips the CORS branch entirely.
     Url = ?config(base, Cfg) ++ "/health",
-    {ok, {{_, 200, _}, Headers, _}} = httpc:request(Url),
+    {ok, {{_, 200, _}, Headers, _}} = barrel_inference_server_http_test:request(Url),
     %% No Origin header on the request -> no Access-Control-* on the
     %% response.
     ?assertEqual(false, lists:keymember("access-control-allow-origin", 1, Headers)).
@@ -579,7 +601,7 @@ cors_preflight_returns_204(Cfg) ->
         {"access-control-request-headers", "content-type"}
     ],
     {ok, {{_, 204, _}, RespHeaders, _}} =
-        httpc:request(options, {Url, Headers}, [], []),
+        barrel_inference_server_http_test:request(options, {Url, Headers}, [], []),
     {value, {_, AllowOrigin}} =
         lists:keysearch("access-control-allow-origin", 1, RespHeaders),
     ?assertEqual("*", AllowOrigin),
@@ -589,7 +611,9 @@ cors_preflight_returns_204(Cfg) ->
 cors_headers_present_on_response(Cfg) ->
     Url = ?config(base, Cfg) ++ "/health",
     {ok, {{_, 200, _}, Headers, _}} =
-        httpc:request(get, {Url, [{"origin", "http://example.com"}]}, [], []),
+        barrel_inference_server_http_test:request(
+            get, {Url, [{"origin", "http://example.com"}]}, [], []
+        ),
     ?assert(lists:keymember("access-control-allow-origin", 1, Headers)).
 
 %%====================================================================
@@ -599,7 +623,7 @@ cors_headers_present_on_response(Cfg) ->
 responses_invalid_json_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/responses",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(
+        barrel_inference_server_http_test:request(
             post,
             {Url, [], "application/json", "{not json"},
             [],
@@ -610,7 +634,9 @@ responses_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/responses",
     Body = json:encode(#{}),
     {ok, {{_, 400, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Decoded = json:decode(list_to_binary(RespBody)),
     ?assertMatch(#{<<"error">> := _}, Decoded).
 
@@ -622,7 +648,9 @@ responses_string_input_unknown_model_returns_404(Cfg) ->
         <<"max_output_tokens">> => 4
     }),
     {ok, {{_, Status, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     ?assertEqual(404, Status).
 
 %% Non-streaming responses include a `resp_<int>` id. We can't actually
@@ -638,7 +666,9 @@ responses_emits_response_id_header(Cfg) ->
         <<"max_output_tokens">> => 4
     }),
     {ok, {{_, Status, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     %% Endpoint is reachable; 404 (model resolution) or another non-405
     %% is acceptable. The point is that we don't route-miss.
     ?assert(Status =/= 405).
@@ -652,7 +682,9 @@ responses_streaming_unknown_model_emits_event_error(Cfg) ->
         <<"max_output_tokens">> => 8
     }),
     {ok, {{_, Status, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     %% On the streaming path the handler opens an SSE stream on the
     %% pipeline-error and emits a `response.failed` event. HTTP 200.
     Bin = list_to_binary(RespBody),
@@ -672,7 +704,9 @@ responses_413_returns_request_too_large_type(Cfg) ->
     %% Suite cap is 12 MiB (init_per_suite); 13 MiB trips 413.
     Oversized = binary:copy(<<"x">>, 13 * 1024 * 1024),
     {ok, {{_, Status, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Oversized}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Oversized}, [], []
+        ),
     ?assertEqual(413, Status),
     Decoded = json:decode(list_to_binary(RespBody)),
     ?assertMatch(#{<<"error">> := #{<<"code">> := <<"request_too_large">>}}, Decoded).
@@ -700,7 +734,9 @@ responses_codex_envelope_accepted(Cfg) ->
         <<"max_output_tokens">> => 8
     }),
     {ok, {{_, Status, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Bin = list_to_binary(RespBody),
     %% Not a 400: the array-input + instructions envelope parsed. An
     %% unknown model then fails at load, which on the streaming path
@@ -729,7 +765,9 @@ request_id_custom_header_name_echoed(Cfg) ->
     try
         Url = ?config(base, Cfg) ++ "/health",
         {ok, {{_, 200, _}, Headers, _}} =
-            httpc:request(get, {Url, [{"x-trace-id", "trace-abc"}]}, [], []),
+            barrel_inference_server_http_test:request(
+                get, {Url, [{"x-trace-id", "trace-abc"}]}, [], []
+            ),
         {value, {_, Id}} = lists:keysearch("x-trace-id", 1, Headers),
         ?assertEqual("trace-abc", Id),
         ?assertEqual(false, lists:keymember("x-request-id", 1, Headers))
@@ -776,12 +814,16 @@ method_not_allowed_sweep(Cfg) ->
 
 check_method_405(Base, Path, get) ->
     Url = Base ++ Path,
-    {ok, {{_, Status, _}, _, _}} = httpc:request(get, {Url, []}, [], []),
+    {ok, {{_, Status, _}, _, _}} = barrel_inference_server_http_test:request(
+        get, {Url, []}, [], []
+    ),
     ?assertEqual({Path, 405}, {Path, Status});
 check_method_405(Base, Path, post) ->
     Url = Base ++ Path,
     {ok, {{_, Status, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", <<"{}">>}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", <<"{}">>}, [], []
+        ),
     ?assertEqual({Path, 405}, {Path, Status}).
 
 %% OpenAI legacy completions (POST /v1/completions) is routed via the
@@ -790,13 +832,17 @@ check_method_405(Base, Path, post) ->
 completions_invalid_json_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/completions",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", "{not json"}, [], []
+        ).
 
 completions_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/completions",
     Body = json:encode(#{<<"prompt">> => <<"hello">>}),
     {ok, {{_, Status, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     ?assertEqual(400, Status).
 
 %% Ollama-shaped non-streaming GET endpoints. /api/version reports the
@@ -805,20 +851,20 @@ completions_missing_model_returns_400(Cfg) ->
 %% should all return 200 with a JSON body in the smoke baseline.
 api_version_returns_200(Cfg) ->
     Url = ?config(base, Cfg) ++ "/api/version",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assert(is_map(Decoded)),
     ?assert(maps:is_key(<<"version">>, Decoded)).
 
 api_tags_returns_200(Cfg) ->
     Url = ?config(base, Cfg) ++ "/api/tags",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assert(maps:is_key(<<"models">>, Decoded)).
 
 api_ps_returns_200(Cfg) ->
     Url = ?config(base, Cfg) ++ "/api/ps",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assert(maps:is_key(<<"models">>, Decoded)).
 
@@ -828,7 +874,9 @@ api_ps_returns_200(Cfg) ->
 api_search_invalid_json_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/api/search",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", "{not json"}, [], []
+        ).
 
 %% POST /api/pull is NDJSON-streaming. Even on a fast-failing spec
 %% (unknown model) the body must consist of `\n'-terminated parseable
@@ -838,7 +886,9 @@ api_pull_emits_ndjson_lines(Cfg) ->
     Url = ?config(base, Cfg) ++ "/api/pull",
     Body = json:encode(#{<<"model">> => <<"no-such-model:notag">>, <<"stream">> => true}),
     {ok, {{_, _Status, _}, Headers, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Bin = list_to_binary(RespBody),
     %% The Content-Type is application/x-ndjson on success and
     %% application/json on a synchronous error envelope; either is fine
@@ -873,13 +923,13 @@ api_pull_emits_ndjson_lines(Cfg) ->
 
 livery_listener_serves_health(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/health",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assertEqual(<<"ok">>, maps:get(<<"status">>, Decoded)).
 
 livery_listener_serves_metrics(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/metrics",
-    {ok, {{_, 200, _}, Headers, _Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, Headers, _Body}} = barrel_inference_server_http_test:request(Url),
     {value, {_, CT}} = lists:keysearch("content-type", 1, Headers),
     %% Status + content-type prove the route is wired. The actual body
     %% bytes are exercised by the cowboy metrics_returns_prometheus_text
@@ -890,7 +940,7 @@ livery_listener_serves_metrics(Cfg) ->
 
 livery_listener_serves_models_list(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/v1/models",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assertEqual(<<"list">>, maps:get(<<"object">>, Decoded)),
     ?assert(is_list(maps:get(<<"data">>, Decoded))).
@@ -906,7 +956,9 @@ livery_listener_echoes_request_id_header(Cfg) ->
     try
         Url = ?config(livery_base, Cfg) ++ "/health",
         {ok, {{_, 200, _}, Headers, _}} =
-            httpc:request(get, {Url, [{"x-trace-id", "abc-trace"}]}, [], []),
+            barrel_inference_server_http_test:request(
+                get, {Url, [{"x-trace-id", "abc-trace"}]}, [], []
+            ),
         {value, {_, Id}} = lists:keysearch("x-trace-id", 1, Headers),
         ?assertEqual("abc-trace", Id)
     after
@@ -922,12 +974,16 @@ livery_listener_echoes_request_id_header(Cfg) ->
 livery_ollama_generate_invalid_json_returns_400(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/generate",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", "{not json"}, [], []
+        ).
 
 livery_ollama_chat_invalid_json_returns_400(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/chat",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", "{not json"}, [], []
+        ).
 
 %% A streaming Ollama generate against an unknown model is the
 %% live-fire path: the handler enters the inference branch, the
@@ -937,28 +993,32 @@ livery_ollama_chat_invalid_json_returns_400(Cfg) ->
 livery_embeddings_openai_invalid_json_returns_400(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/v1/embeddings",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", "{not json"}, [], []
+        ).
 
 livery_embeddings_ollama_invalid_json_returns_400(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/embed",
     {ok, {{_, 400, _}, _, _}} =
-        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", "{not json"}, [], []
+        ).
 
 livery_api_tags_returns_200(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/tags",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assert(maps:is_key(<<"models">>, Decoded)).
 
 livery_api_version_returns_200(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/version",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assert(maps:is_key(<<"version">>, Decoded)).
 
 livery_api_ps_returns_200(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/ps",
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    {ok, {{_, 200, _}, _, Body}} = barrel_inference_server_http_test:request(Url),
     Decoded = json:decode(list_to_binary(Body)),
     ?assert(maps:is_key(<<"models">>, Decoded)).
 
@@ -970,7 +1030,9 @@ livery_ollama_generate_unknown_model_streams_ndjson(Cfg) ->
         <<"stream">> => true
     }),
     {ok, {{_, _Status, _}, Headers, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Bin = list_to_binary(RespBody),
     {value, {_, CT}} = lists:keysearch("content-type", 1, Headers),
     ?assert(string:str(CT, "x-ndjson") =/= 0 orelse string:str(CT, "json") =/= 0),

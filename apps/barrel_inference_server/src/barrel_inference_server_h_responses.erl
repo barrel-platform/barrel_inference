@@ -17,8 +17,10 @@
         maybe_end_session/1,
         record_session_committed/2,
         release_slot/1,
-        drive_stream/3,
-        drive_buffered/2
+        drive_stream_post_admit/2,
+        drive_buffered/2,
+        resolve_stream/2,
+        pre_admit_loop/1
     ]}
 ).
 
@@ -150,26 +152,80 @@ start_inference(R0) ->
     R1 = R0#barrel_inference_request{model_id = Real},
     case R1#barrel_inference_request.stream of
         true ->
-            livery_resp:stream(
-                200,
-                sse_headers(),
-                fun(Emit) -> drive_stream(R1, Requested, Emit) end
+            livery_resp:stream_deferred(
+                fun() -> resolve_stream(R1, Requested) end
             );
         false ->
             drive_buffered(R1, Requested)
     end.
 
-drive_stream(R, Requested, Emit) ->
+%% Sync pre-admit so pool_exhausted / not_loaded / etc surface as a
+%% real 4xx/5xx JSON envelope rather than `200 OK` + SSE error.
+resolve_stream(R, Requested) ->
     {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
     State = init_state(R, Requested, Worker, Mon, true),
     State1 = arm_total_timer(State),
+    case pre_admit_loop(State1) of
+        {admitted, State2} ->
+            {sse, 200, sse_headers(), fun(Emit) ->
+                drive_stream_post_admit(State2, Emit)
+            end};
+        {error, Status, Reason, State2} ->
+            cleanup(State2),
+            Body = json:encode(error_body(Reason, Status)),
+            {full, Status, json_headers(), Body}
+    end.
+
+drive_stream_post_admit(State, Emit) ->
     _ =
         try
-            stream_loop(State1, Emit)
+            stream_loop(State, Emit)
         after
-            cleanup(State1)
+            cleanup(State)
         end,
     ok.
+
+pre_admit_loop(S) ->
+    receive
+        {pipeline, error, Status, Reason} ->
+            {error, Status, Reason, S};
+        {pipeline, loading, _M} ->
+            pre_admit_loop(S);
+        {pipeline, loaded} when S#st.keepalive_begun ->
+            pre_admit_loop(S#st{phase = waiting_template});
+        {pipeline, loaded} ->
+            ok = barrel_inference_server_keepalive:request_begin(S#st.model),
+            pre_admit_loop(S#st{phase = waiting_template, keepalive_begun = true});
+        {pipeline, templated, Tokens, ParamsRef} ->
+            pre_admit_loop(S#st{
+                phase = waiting_queue,
+                prompt_token_ids = Tokens,
+                chat_params_ref = ParamsRef
+            });
+        {pipeline, queued} ->
+            pre_admit_loop(S#st{phase = waiting_admit});
+        {pipeline, admitted, Ref, Slot} ->
+            S1 = monitor_engine(
+                arm_prefill_timer(S#st{phase = running, ref = Ref, slot = Slot})
+            ),
+            {admitted, S1};
+        {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.engine_mon ->
+            {error, 500, model_crashed, S#st{engine_mon = undefined}};
+        {'DOWN', Mon, process, _Pid, normal} when Mon =:= S#st.worker_mon ->
+            pre_admit_loop(S#st{worker = undefined, worker_mon = undefined});
+        {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.worker_mon ->
+            {error, 500, pipeline_crashed, S#st{worker = undefined, worker_mon = undefined}};
+        _Other ->
+            pre_admit_loop(S)
+    after pre_admit_timeout() ->
+        {error, 504, prefill_timeout, S}
+    end.
+
+pre_admit_timeout() ->
+    barrel_inference_server_config:prefill_ms().
+
+json_headers() ->
+    [{<<"content-type">>, <<"application/json">>}].
 
 drive_buffered(R, Requested) ->
     {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
