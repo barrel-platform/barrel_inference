@@ -10,6 +10,12 @@
 
 -export([generate/1, chat/1]).
 
+%% The receive-loop driven state mutates `ref' and `slot' fields away
+%% from `undefined' through pipeline messages dialyzer can't trace
+%% through. Suppress narrowing on the cleanup paths that legitimately
+%% pattern-match both shapes.
+-dialyzer({nowarn_function, [cleanup/1, keepalive_release/3]}).
+
 -include("barrel_inference_server.hrl").
 
 -record(st, {
