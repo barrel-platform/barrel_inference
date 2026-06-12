@@ -61,11 +61,35 @@ read_cowboy_loop(Req0, Max, Acc, Size) ->
 %% Livery
 %%====================================================================
 
+%% livery delivers the body as `{stream, Reader}' on the request value.
+%% `livery_body:read_all/2' takes that reader and a timeout, drains the
+%% body, and returns the bytes. The body cap is enforced after the read
+%% rather than as a `max' option (livery_body doesn't expose a per-call
+%% cap; we accept the body and reject above the cap so the public
+%% `{too_large, Req}' shape is preserved).
 read_livery(Req, Max) ->
-    case livery_body:read_all(Req, #{max => Max}) of
-        {ok, Body, Req1} -> {ok, iolist_to_binary(Body), Req1};
-        {error, {limit, _Limit}, Req1} -> {too_large, Req1};
-        {error, _Other, Req1} -> {too_large, Req1}
+    case livery_req:body(Req) of
+        {stream, Reader} ->
+            case livery_body:read_all(Reader, 30000) of
+                {ok, Body, _Reader1} when byte_size(Body) > Max ->
+                    {too_large, Req};
+                {ok, Body, _Reader1} ->
+                    {ok, Body, Req};
+                {error, _Reason, _Reader1} ->
+                    {too_large, Req}
+            end;
+        {buffered, Body} when is_binary(Body), byte_size(Body) > Max ->
+            {too_large, Req};
+        {buffered, Body} when is_binary(Body) ->
+            {ok, Body, Req};
+        {buffered, Body} ->
+            Bin = iolist_to_binary(Body),
+            case byte_size(Bin) > Max of
+                true -> {too_large, Req};
+                false -> {ok, Bin, Req}
+            end;
+        empty ->
+            {ok, <<>>, Req}
     end.
 
 %%====================================================================

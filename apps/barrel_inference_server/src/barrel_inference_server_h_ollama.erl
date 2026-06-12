@@ -239,17 +239,7 @@ livery_stream_loop(S, Emit) ->
             S;
         {barrel_inference_token, Ref, Tok} ->
             S1 = livery_learn_ref(S, Ref),
-            Chunk =
-                case S1#st.op of
-                    generate ->
-                        barrel_inference_server_translate:internal_to_ollama_generate_chunk(
-                            Tok, S1#st.req_id, S1#st.model
-                        );
-                    chat ->
-                        barrel_inference_server_translate:internal_to_ollama_chat_chunk(
-                            Tok, S1#st.req_id, S1#st.model
-                        )
-                end,
+            Chunk = ollama_chunk(S1#st.op, Tok, S1#st.req_id, S1#st.model),
             case livery_emit_line(Emit, Chunk) of
                 ok ->
                     livery_stream_loop(S1#st{out_tokens = S1#st.out_tokens + 1}, Emit);
@@ -310,17 +300,7 @@ livery_buffered_loop(S) ->
             S1 = livery_learn_ref(S, Ref),
             Timings = compute_timings(S1),
             BodyBin = iolist_to_binary(S1#st.buf),
-            Body =
-                case S1#st.op of
-                    generate ->
-                        barrel_inference_server_translate:internal_to_ollama_generate_response(
-                            BodyBin, Stats, S1#st.model, Timings
-                        );
-                    chat ->
-                        barrel_inference_server_translate:internal_to_ollama_chat_response(
-                            BodyBin, Stats, S1#st.model, Timings
-                        )
-                end,
+            Body = ollama_full_response(S1#st.op, BodyBin, Stats, S1#st.model, Timings),
             livery_resp:json(200, Body);
         {barrel_inference_error, _Ref, Reason} ->
             livery_resp:json(error_status(Reason), json:encode(error_body(Reason)));
@@ -334,16 +314,7 @@ livery_buffered_loop(S) ->
 
 livery_final_chunk(S, Stats) ->
     Timings = compute_timings(S),
-    case S#st.op of
-        generate ->
-            barrel_inference_server_translate:internal_to_ollama_generate_final(
-                Stats, S#st.req_id, S#st.model, Timings
-            );
-        chat ->
-            barrel_inference_server_translate:internal_to_ollama_chat_final(
-                Stats, S#st.req_id, S#st.model, Timings
-            )
-    end.
+    ollama_final_chunk(S#st.op, Stats, S#st.req_id, S#st.model, Timings).
 
 livery_learn_ref(S = #st{ref = undefined}, Ref) ->
     S#st{phase = running, ref = Ref};
@@ -625,17 +596,7 @@ keepalive_release(Model, _Phase, KA) ->
 
 handle_token(Tok, Req, S = #st{stream = true, op = Op}) ->
     {Req1, S1} = ensure_stream(Req, S),
-    Chunk =
-        case Op of
-            generate ->
-                barrel_inference_server_translate:internal_to_ollama_generate_chunk(
-                    Tok, S1#st.req_id, S1#st.model
-                );
-            chat ->
-                barrel_inference_server_translate:internal_to_ollama_chat_chunk(
-                    Tok, S1#st.req_id, S1#st.model
-                )
-        end,
+    Chunk = ollama_chunk(Op, Tok, S1#st.req_id, S1#st.model),
     ndjson_line(Req1, Chunk),
     {ok, Req1, S1#st{out_tokens = S1#st.out_tokens + 1}, hibernate};
 handle_token(Tok, Req, S = #st{stream = false}) ->
@@ -643,17 +604,7 @@ handle_token(Tok, Req, S = #st{stream = false}) ->
 
 finish_ok(Req0, S = #st{stream = true, op = Op}, Stats) ->
     Timings = compute_timings(S),
-    Final =
-        case Op of
-            generate ->
-                barrel_inference_server_translate:internal_to_ollama_generate_final(
-                    Stats, S#st.req_id, S#st.model, Timings
-                );
-            chat ->
-                barrel_inference_server_translate:internal_to_ollama_chat_final(
-                    Stats, S#st.req_id, S#st.model, Timings
-                )
-        end,
+    Final = ollama_final_chunk(Op, Stats, S#st.req_id, S#st.model, Timings),
     {Req1, _S1} = ensure_stream(Req0, S),
     ndjson_line(Req1, Final),
     cowboy_req:stream_body(<<>>, fin, Req1),
@@ -661,19 +612,34 @@ finish_ok(Req0, S = #st{stream = true, op = Op}, Stats) ->
 finish_ok(Req0, S = #st{stream = false, op = Op}, Stats) ->
     Timings = compute_timings(S),
     BodyBin = iolist_to_binary(S#st.buf),
-    Body =
-        case Op of
-            generate ->
-                barrel_inference_server_translate:internal_to_ollama_generate_response(
-                    BodyBin, Stats, S#st.model, Timings
-                );
-            chat ->
-                barrel_inference_server_translate:internal_to_ollama_chat_response(
-                    BodyBin, Stats, S#st.model, Timings
-                )
-        end,
+    Body = ollama_full_response(Op, BodyBin, Stats, S#st.model, Timings),
     Req1 = cowboy_req:reply(200, json_headers(), Body, Req0),
     {stop, Req1, S}.
+
+%% Shared frame builders so the cowboy and livery code paths agree on
+%% the wire shape (and Elvis's dont_repeat_yourself rule stays happy).
+ollama_chunk(generate, Tok, ReqId, Model) ->
+    barrel_inference_server_translate:internal_to_ollama_generate_chunk(Tok, ReqId, Model);
+ollama_chunk(chat, Tok, ReqId, Model) ->
+    barrel_inference_server_translate:internal_to_ollama_chat_chunk(Tok, ReqId, Model).
+
+ollama_final_chunk(generate, Stats, ReqId, Model, Timings) ->
+    barrel_inference_server_translate:internal_to_ollama_generate_final(
+        Stats, ReqId, Model, Timings
+    );
+ollama_final_chunk(chat, Stats, ReqId, Model, Timings) ->
+    barrel_inference_server_translate:internal_to_ollama_chat_final(
+        Stats, ReqId, Model, Timings
+    ).
+
+ollama_full_response(generate, BodyBin, Stats, Model, Timings) ->
+    barrel_inference_server_translate:internal_to_ollama_generate_response(
+        BodyBin, Stats, Model, Timings
+    );
+ollama_full_response(chat, BodyBin, Stats, Model, Timings) ->
+    barrel_inference_server_translate:internal_to_ollama_chat_response(
+        BodyBin, Stats, Model, Timings
+    ).
 
 finish_err(Req0, S = #st{stream_started = true}, Reason) ->
     ndjson_line(Req0, json:encode(error_body(Reason))),
