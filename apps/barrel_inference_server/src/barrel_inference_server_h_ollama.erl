@@ -115,28 +115,67 @@ ok_preload(Op, Model, KeepAlive, MonoStart) ->
     apply_keep_alive(Model, KeepAlive),
     livery_resp:json(200, Body).
 
-%% Streaming returns livery_resp:stream with the NDJSON producer fun;
-%% non-streaming buffers tokens and returns a one-shot json.
+%% Streaming uses livery_resp:stream_deferred so pool_exhausted /
+%% not_loaded / etc surface as a real 4xx/5xx JSON response instead
+%% of `200 OK` + an NDJSON error line; non-streaming buffers tokens.
 inference(Op, R, KeepAlive) ->
     case R#barrel_inference_request.stream of
         true ->
-            livery_resp:stream(
-                200,
-                [{<<"content-type">>, <<"application/x-ndjson">>}],
-                fun(Emit) -> drive(Op, R, KeepAlive, Emit) end
+            livery_resp:stream_deferred(
+                fun() -> resolve_stream(Op, R, KeepAlive) end
             );
         false ->
             drive_buffered(Op, R, KeepAlive)
     end.
 
-drive(Op, R, KeepAlive, Emit) ->
+resolve_stream(Op, R, KeepAlive) ->
     {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
     State = init_state(Op, R, KeepAlive, Worker, Mon),
+    case pre_admit_loop(State) of
+        {admitted, State1} ->
+            {ndjson, 200, [{<<"content-type">>, <<"application/x-ndjson">>}], fun(Emit) ->
+                drive_post_admit(State1, Emit)
+            end};
+        {error, Status, Reason, State1} ->
+            cleanup(State1),
+            Body = json:encode(error_body(Reason)),
+            {full, Status, [{<<"content-type">>, <<"application/json">>}], Body}
+    end.
+
+drive_post_admit(State, Emit) ->
     try
         stream_loop(State, Emit)
     after
         cleanup(State)
     end.
+
+pre_admit_loop(S) ->
+    receive
+        {pipeline, error, Status, Reason} ->
+            {error, Status, Reason, S};
+        {pipeline, loading, _M} ->
+            pre_admit_loop(S);
+        {pipeline, loaded} ->
+            ok = barrel_inference_server_keepalive:request_begin(S#st.model),
+            pre_admit_loop(S#st{phase = waiting_template, mono_loaded = mono_ms()});
+        {pipeline, templated, _Tokens, _ParamsRef} ->
+            pre_admit_loop(S#st{phase = waiting_queue});
+        {pipeline, queued} ->
+            pre_admit_loop(S#st{phase = waiting_admit});
+        {pipeline, admitted, Ref, Slot} ->
+            {admitted, on_admit(S, Ref, Slot)};
+        {'DOWN', Mon, process, _Pid, normal} when Mon =:= S#st.worker_mon ->
+            pre_admit_loop(S#st{worker = undefined, worker_mon = undefined});
+        {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.worker_mon ->
+            {error, 500, pipeline_crashed, S#st{worker = undefined, worker_mon = undefined}};
+        _Other ->
+            pre_admit_loop(S)
+    after pre_admit_timeout() ->
+        {error, 504, prefill_timeout, S}
+    end.
+
+pre_admit_timeout() ->
+    barrel_inference_server_config:prefill_ms().
 
 drive_buffered(Op, R, KeepAlive) ->
     {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),

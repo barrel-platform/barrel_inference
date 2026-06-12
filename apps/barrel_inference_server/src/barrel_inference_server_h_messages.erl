@@ -16,8 +16,10 @@
         maybe_end_session/1,
         record_session_committed/2,
         release_slot/1,
-        drive_stream/2,
-        drive_buffered/1
+        drive_stream_post_admit/2,
+        drive_buffered/1,
+        resolve_stream/3,
+        pre_admit_loop/1
     ]}
 ).
 
@@ -216,21 +218,38 @@ start_inference(R0, ExtraHeaders0) ->
     ExtraHeaders = ExtraHeaders0 ++ ratelimit_headers(Real),
     case R1#barrel_inference_request.stream of
         true ->
-            livery_resp:stream(
-                200,
-                sse_headers() ++ ExtraHeaders,
-                fun(Emit) -> drive_stream(make_init(R1, Requested, ExtraHeaders), Emit) end
+            livery_resp:stream_deferred(
+                fun() -> resolve_stream(R1, Requested, ExtraHeaders) end
             );
         false ->
             drive_buffered(make_init(R1, Requested, ExtraHeaders))
+    end.
+
+%% Sync pre-admit: emit a real 4xx/5xx status when admission fails
+%% before any SSE frame is written; otherwise hand the admitted state
+%% off to the streaming producer.
+resolve_stream(R, Requested, ExtraHeaders) ->
+    State = arm_total_timer(make_init(R, Requested, ExtraHeaders)),
+    case pre_admit_loop(State) of
+        {admitted, State1} ->
+            {sse, 200, sse_headers() ++ ExtraHeaders, fun(Emit) ->
+                drive_stream_post_admit(State1, Emit)
+            end};
+        {error, Status0, Reason, State1} ->
+            cleanup(State1),
+            %% Honour the 503 -> 529 + Retry-After Anthropic remap on
+            %% the pre-admit error path the same way the buffered
+            %% response path does it via anthropic_json_reply_h.
+            {Status, BodyStatus, Headers} = anthropic_overload_remap(Status0, ExtraHeaders),
+            Body = json:encode(anthropic_error_body_h(BodyStatus, Reason, Headers)),
+            {full, Status, Headers ++ json_headers(), Body}
     end.
 
 make_init(R, Requested, ExtraHeaders) ->
     {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
     init_state(R, Requested, Worker, Mon, ExtraHeaders).
 
-drive_stream(State0, Emit) ->
-    State = arm_total_timer(State0),
+drive_stream_post_admit(State, Emit) ->
     _ =
         try
             stream_loop(State, Emit)
@@ -238,6 +257,49 @@ drive_stream(State0, Emit) ->
             cleanup(State)
         end,
     ok.
+
+pre_admit_loop(S) ->
+    receive
+        {pipeline, error, Status, Reason} ->
+            {error, Status, Reason, S};
+        {pipeline, loading, _M} ->
+            pre_admit_loop(S);
+        {pipeline, loaded} when S#st.keepalive_begun ->
+            pre_admit_loop(S#st{phase = waiting_template});
+        {pipeline, loaded} ->
+            ok = barrel_inference_server_keepalive:request_begin(S#st.model),
+            pre_admit_loop(S#st{phase = waiting_template, keepalive_begun = true});
+        {pipeline, templated, Tokens, ParamsRef} ->
+            pre_admit_loop(S#st{
+                phase = waiting_queue,
+                prompt_tokens = length(Tokens),
+                prompt_token_ids = Tokens,
+                chat_params_ref = ParamsRef
+            });
+        {pipeline, queued} ->
+            pre_admit_loop(S#st{phase = waiting_admit});
+        {pipeline, admitted, Ref, Slot} ->
+            S1 = monitor_engine(
+                arm_prefill(S#st{phase = running, ref = Ref, slot = Slot})
+            ),
+            {admitted, S1};
+        {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.engine_mon ->
+            {error, 500, model_crashed, S#st{engine_mon = undefined}};
+        {'DOWN', Mon, process, _Pid, normal} when Mon =:= S#st.worker_mon ->
+            pre_admit_loop(S#st{worker = undefined, worker_mon = undefined});
+        {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.worker_mon ->
+            {error, 500, pipeline_crashed, S#st{worker = undefined, worker_mon = undefined}};
+        _Other ->
+            pre_admit_loop(S)
+    after pre_admit_timeout() ->
+        {error, 504, prefill_timeout, S}
+    end.
+
+pre_admit_timeout() ->
+    barrel_inference_server_config:prefill_ms().
+
+json_headers() ->
+    [{<<"content-type">>, <<"application/json">>}].
 
 drive_buffered(State0) ->
     State = arm_total_timer(State0),
