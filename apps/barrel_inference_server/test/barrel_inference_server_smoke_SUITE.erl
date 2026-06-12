@@ -906,8 +906,8 @@ livery_listener_returns_503_for_unmigrated_route(_Cfg) ->
     Body = livery_resp:body(Resp),
     BodyBin =
         case Body of
-            {full, B} -> B;
-            B when is_binary(B) -> B
+            {full, B} -> iolist_to_binary(B);
+            B -> iolist_to_binary(B)
         end,
     Decoded = json:decode(BodyBin),
     ?assertEqual(
