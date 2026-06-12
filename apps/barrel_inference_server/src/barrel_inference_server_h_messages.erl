@@ -157,7 +157,10 @@ translate(Map, Req, Op, Version) ->
             R2 = R1#barrel_inference_request{
                 session_id = barrel_inference_server_session:derive(Req, R1)
             },
-            ReqId = R2#barrel_inference_request.request_id,
+            %% Mirror the middleware-set x-request-id (req_*) on the
+            %% literal `request-id' header. Anthropic SDKs read this into
+            %% `message._request_id'.
+            ReqId = livery_req:req_id(Req),
             ExtraHeaders = base_response_headers(Version, ReqId),
             dispatch(R2, Op, ExtraHeaders, Req);
         {error, Reason} ->

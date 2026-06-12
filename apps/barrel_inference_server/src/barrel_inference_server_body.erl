@@ -18,7 +18,12 @@ read(Req) ->
 read(Req, Max) ->
     case livery_req:body(Req) of
         {stream, Reader} ->
-            case livery_body:read_all(Reader, 30000) of
+            %% Pass our cap as `Max' so livery's default 16 MiB ceiling
+            %% does not pre-empt the configured `max_request_body_bytes'
+            %% (defaults to 256 MiB). Beyond `Max' livery returns
+            %% `{error, {limit, max_size}, _}' which maps to 413 the same
+            %% way our post-read cap did.
+            case livery_body:read_all(Reader, 30000, Max + 1) of
                 {ok, Body, _Reader1} when byte_size(Body) > Max ->
                     {too_large, Req};
                 {ok, Body, _Reader1} ->
