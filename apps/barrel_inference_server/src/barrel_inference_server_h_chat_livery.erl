@@ -203,9 +203,12 @@ stream_loop(S, Emit) ->
     after stream_idle_timeout() -> S
     end.
 
-dispatch_stream({pipeline, _} = M, S, Emit) -> on_pipeline_stream(M, S, Emit);
-dispatch_stream({pipeline, _, _} = M, S, Emit) -> on_pipeline_stream(M, S, Emit);
-dispatch_stream({pipeline, _, _, _} = M, S, Emit) -> on_pipeline_stream(M, S, Emit);
+dispatch_stream({pipeline, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
+dispatch_stream({pipeline, _, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
+dispatch_stream({pipeline, _, _, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
 dispatch_stream({barrel_inference_token, Ref, Tok}, S, Emit) ->
     on_stream_token(S, Ref, Tok, Emit);
 dispatch_stream({barrel_inference_reasoning_token, Ref, Tok}, S, Emit) ->
@@ -286,9 +289,10 @@ on_stream_token(S0, Ref, Tok, Emit) ->
 handle_token_stream(Tok, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
     case is_tool_first_byte(Tok) of
         true ->
-            {buffer, first_token(S#st{
-                mode = tool_buffer, buf_text = [Tok], out_tokens = 1
-            })};
+            {buffer,
+                first_token(S#st{
+                    mode = tool_buffer, buf_text = [Tok], out_tokens = 1
+                })};
         false ->
             stream_text_first(Tok, first_token(S))
     end;
@@ -360,7 +364,9 @@ finish_stream_ok(S = #st{mode = text}, Stats, Emit) ->
         Stats, S#st.req_id, S#st.requested
     ),
     Frames = [
-        <<"data: ">>, Final, <<"\n\n">>,
+        <<"data: ">>,
+        Final,
+        <<"\n\n">>,
         usage_chunk(S, Stats),
         <<"data: [DONE]\n\n">>
     ],
@@ -374,8 +380,12 @@ finish_stream_ok(S = #st{mode = tool_buffer}, Stats, Emit) ->
         ToolStats, S#st.req_id, S#st.requested
     ),
     Frames = [
-        <<"data: ">>, First, <<"\n\n">>,
-        <<"data: ">>, Stop, <<"\n\n">>,
+        <<"data: ">>,
+        First,
+        <<"\n\n">>,
+        <<"data: ">>,
+        Stop,
+        <<"\n\n">>,
         usage_chunk(S, ToolStats),
         <<"data: [DONE]\n\n">>
     ],
@@ -390,8 +400,12 @@ finish_with_tool_calls_stream(S, Calls, Emit) ->
         ToolStats, S#st.req_id, S#st.requested
     ),
     Frames = [
-        <<"data: ">>, First, <<"\n\n">>,
-        <<"data: ">>, Stop, <<"\n\n">>,
+        <<"data: ">>,
+        First,
+        <<"\n\n">>,
+        <<"data: ">>,
+        Stop,
+        <<"\n\n">>,
         usage_chunk(S, ToolStats),
         <<"data: [DONE]\n\n">>
     ],
@@ -426,8 +440,10 @@ on_tool_results(Outcome, S0, Emit, true) ->
             Stats = maps:put(finish_reason, length, S#st.agg_stats),
             finish_stream_ok(
                 S#st{
-                    received_done = true, tool_iter = Iter,
-                    mode = text, buf_text = []
+                    received_done = true,
+                    tool_iter = Iter,
+                    mode = text,
+                    buf_text = []
                 },
                 Stats,
                 Emit
@@ -500,9 +516,12 @@ buffered_loop(S) ->
         livery_resp:json(504, json:encode(error_body(idle_timeout, 504)))
     end.
 
-dispatch_buffered({pipeline, _} = M, S) -> on_pipeline_buffered(M, S);
-dispatch_buffered({pipeline, _, _} = M, S) -> on_pipeline_buffered(M, S);
-dispatch_buffered({pipeline, _, _, _} = M, S) -> on_pipeline_buffered(M, S);
+dispatch_buffered({pipeline, _} = M, S) ->
+    on_pipeline_buffered(M, S);
+dispatch_buffered({pipeline, _, _} = M, S) ->
+    on_pipeline_buffered(M, S);
+dispatch_buffered({pipeline, _, _, _} = M, S) ->
+    on_pipeline_buffered(M, S);
 dispatch_buffered({barrel_inference_token, Ref, Tok}, S) ->
     S1 = learn_ref(S, Ref),
     {cont, S2} = handle_token_buffered(Tok, S1),
@@ -546,7 +565,8 @@ dispatch_buffered(total_request_timeout, S) ->
 dispatch_buffered(_Other, S) ->
     buffered_loop(S).
 
-on_pipeline_buffered({pipeline, loading, _M}, S) -> buffered_loop(S);
+on_pipeline_buffered({pipeline, loading, _M}, S) ->
+    buffered_loop(S);
 on_pipeline_buffered({pipeline, loaded}, S = #st{keepalive_begun = true}) ->
     buffered_loop(S#st{phase = waiting_template});
 on_pipeline_buffered({pipeline, loaded}, S) ->
@@ -567,18 +587,21 @@ on_pipeline_buffered({pipeline, error, Status, Reason}, _S) ->
 handle_token_buffered(Tok, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
     case is_tool_first_byte(Tok) of
         true ->
-            {cont, first_token(S#st{
-                mode = tool_buffer, buf_text = [Tok], out_tokens = 1
-            })};
+            {cont,
+                first_token(S#st{
+                    mode = tool_buffer, buf_text = [Tok], out_tokens = 1
+                })};
         false ->
-            {cont, first_token(S#st{
-                buf_text = [S#st.buf_text | Tok], out_tokens = 1
-            })}
+            {cont,
+                first_token(S#st{
+                    buf_text = [S#st.buf_text | Tok], out_tokens = 1
+                })}
     end;
 handle_token_buffered(Tok, S = #st{out_tokens = 0}) ->
-    {cont, first_token(S#st{
-        buf_text = [S#st.buf_text | Tok], out_tokens = 1
-    })};
+    {cont,
+        first_token(S#st{
+            buf_text = [S#st.buf_text | Tok], out_tokens = 1
+        })};
 handle_token_buffered(Tok, S) ->
     {cont, S#st{
         buf_text = [S#st.buf_text | Tok], out_tokens = S#st.out_tokens + 1
@@ -712,8 +735,11 @@ total_ms() ->
         _ -> 1800000
     end.
 
-cancel_timer(undefined) -> ok;
-cancel_timer(Ref) -> _ = erlang:cancel_timer(Ref), ok.
+cancel_timer(undefined) ->
+    ok;
+cancel_timer(Ref) ->
+    _ = erlang:cancel_timer(Ref),
+    ok.
 
 monitor_engine(S = #st{engine_mon = Mon}) when is_reference(Mon) -> S;
 monitor_engine(S = #st{model = Model}) ->
@@ -752,11 +778,12 @@ cleanup(S) ->
     barrel_inference_server_metrics:dec_active_streams(S#st.model).
 
 release_slot(#st{slot = undefined}) -> ok;
-release_slot(#st{model = Model, slot = Slot}) ->
-    barrel_inference_server_queue:release(Model, Slot).
+release_slot(#st{model = Model, slot = Slot}) -> barrel_inference_server_queue:release(Model, Slot).
 
-maybe_end_session(#st{received_done = true}) -> ok;
-maybe_end_session(#st{session_id = undefined}) -> ok;
+maybe_end_session(#st{received_done = true}) ->
+    ok;
+maybe_end_session(#st{session_id = undefined}) ->
+    ok;
 maybe_end_session(#st{model = Model, session_id = SessionId}) ->
     try
         barrel_inference:end_session(Model, SessionId)
@@ -766,7 +793,8 @@ maybe_end_session(#st{model = Model, session_id = SessionId}) ->
     barrel_inference_server_session_state:delete(Model, SessionId),
     ok.
 
-keepalive_release(#st{keepalive_begun = false}) -> ok;
+keepalive_release(#st{keepalive_begun = false}) ->
+    ok;
 keepalive_release(#st{model = Model}) ->
     barrel_inference_server_keepalive:request_end(
         Model, barrel_inference_server_config:keep_alive_default_ms()
@@ -864,8 +892,7 @@ round_pair(CallId, FullBin, ResultJson) ->
 
 result_json({ok, Json}) when is_map(Json) -> iolist_to_binary(json:encode(Json));
 result_json({ok, Bin}) when is_binary(Bin) -> Bin;
-result_json({error, Reason}) ->
-    iolist_to_binary(json:encode(#{<<"error">> => to_bin(Reason)})).
+result_json({error, Reason}) -> iolist_to_binary(json:encode(#{<<"error">> => to_bin(Reason)})).
 
 exec_timeout_ms() ->
     barrel_inference_server_config:generation_idle_ms().
@@ -1037,28 +1064,34 @@ error_body({context_overflow, Tokens, Ctx}, _Status) ->
     Msg = iolist_to_binary(
         io_lib:format("prompt is too long: ~B tokens > ~B maximum", [Tokens, Ctx])
     ),
-    #{<<"error">> => #{
-        <<"message">> => Msg,
-        <<"type">> => <<"invalid_request_error">>,
-        <<"code">> => <<"context_length_exceeded">>
-    }};
+    #{
+        <<"error">> => #{
+            <<"message">> => Msg,
+            <<"type">> => <<"invalid_request_error">>,
+            <<"code">> => <<"context_length_exceeded">>
+        }
+    };
 error_body({error, {decode_failed, _}}, Status) ->
     error_body(decode_failed, Status);
 error_body({decode_failed, _}, Status) ->
     error_body(decode_failed, Status);
 error_body(decode_failed, _Status) ->
-    #{<<"error">> => #{
-        <<"message">> =>
-            <<"the model was overloaded and could not process this request; please retry">>,
-        <<"type">> => <<"server_error">>,
-        <<"code">> => <<"server_overloaded">>
-    }};
+    #{
+        <<"error">> => #{
+            <<"message">> =>
+                <<"the model was overloaded and could not process this request; please retry">>,
+            <<"type">> => <<"server_error">>,
+            <<"code">> => <<"server_overloaded">>
+        }
+    };
 error_body(Reason, Status) ->
-    #{<<"error">> => #{
-        <<"message">> => to_bin(Reason),
-        <<"type">> => error_type(Status),
-        <<"code">> => to_bin(Reason)
-    }}.
+    #{
+        <<"error">> => #{
+            <<"message">> => to_bin(Reason),
+            <<"type">> => error_type(Status),
+            <<"code">> => to_bin(Reason)
+        }
+    }.
 
 error_type(400) -> <<"invalid_request_error">>;
 error_type(404) -> <<"invalid_request_error">>;
