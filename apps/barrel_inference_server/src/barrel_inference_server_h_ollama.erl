@@ -19,10 +19,6 @@
 
 -export([init/2, info/3, terminate/3]).
 
-%% livery entry points (one per route binding in
-%% barrel_inference_server_routes:livery_routes/0).
--export([generate/1, chat/1]).
-
 -include("barrel_inference_server.hrl").
 
 -record(st, {
@@ -54,279 +50,6 @@
 }).
 
 %%====================================================================
-%% Livery entry (route handlers per
-%% barrel_inference_server_routes:livery_routes/0). Coexists with the
-%% cowboy init/2 below; the routes table picks which one a request
-%% lands on depending on which listener answered.
-%%====================================================================
-
-generate(Req) ->
-    handle_livery(Req, generate).
-
-chat(Req) ->
-    handle_livery(Req, chat).
-
-handle_livery(Req, Op) ->
-    case livery_req:method(Req) of
-        <<"POST">> -> handle_livery_post(Req, Op);
-        _ -> livery_resp:json(405, json:encode(#{<<"error">> => <<"method_not_allowed">>}))
-    end.
-
-handle_livery_post(Req, Op) ->
-    case barrel_inference_server_body:read(Req) of
-        {ok, Body, _Req1} ->
-            livery_fast_phase(Body, Op);
-        {too_large, _Req1} ->
-            livery_resp:json(413, json:encode(#{<<"error">> => <<"request_too_large">>}))
-    end.
-
-livery_fast_phase(Body, Op) ->
-    case decode(Body) of
-        {ok, Map} -> livery_translate(Map, Op);
-        error -> livery_resp:json(400, json:encode(#{<<"error">> => <<"invalid_json">>}))
-    end.
-
-livery_translate(Map, Op) ->
-    case ollama_to_internal(Op, Map) of
-        {ok, R} -> livery_start(R, Op);
-        {error, Reason} -> livery_resp:json(400, json:encode(error_body(Reason)))
-    end.
-
-livery_start(R0, Op) ->
-    Requested = R0#barrel_inference_request.model_id,
-    Real = barrel_inference_server_config:resolve_model(Requested),
-    R1 = R0#barrel_inference_request{model_id = Real},
-    KeepAlive = effective_keep_alive(R1#barrel_inference_request.keep_alive_ms),
-    case R1#barrel_inference_request.is_preload of
-        true -> livery_preload(Op, R1, KeepAlive);
-        false -> livery_inference(Op, R1, KeepAlive)
-    end.
-
-%% Preload short-circuit on the livery side: the handler process owns
-%% the load-progress receive itself (no separate worker), so this is a
-%% straight receive loop ending in a one-shot livery_resp:json response.
-livery_preload(Op, R, KeepAlive) ->
-    Model = R#barrel_inference_request.model_id,
-    MonoStart = mono_ms(),
-    case barrel_inference_server_config:ensure_loaded_async(Model, self(), preload_deadline()) of
-        ok ->
-            livery_wait_preload(Op, Model, KeepAlive, MonoStart);
-        {error, Reason} ->
-            livery_resp:json(error_status(Reason), json:encode(error_body(Reason)))
-    end.
-
-livery_wait_preload(Op, Model, KeepAlive, MonoStart) ->
-    receive
-        {barrel_inference_load_progress, Model} ->
-            livery_wait_preload(Op, Model, KeepAlive, MonoStart);
-        {barrel_inference_load_done, Model, ok} ->
-            NowMs = mono_ms(),
-            LoadDurationNs = (NowMs - MonoStart) * 1_000_000,
-            Reason =
-                case KeepAlive of
-                    0 -> <<"unload">>;
-                    _ -> <<"load">>
-                end,
-            Timings = #{
-                total_duration_ns => LoadDurationNs,
-                load_duration_ns => LoadDurationNs
-            },
-            Body = barrel_inference_server_translate:ollama_preload_response(
-                Op, Reason, Model, Timings
-            ),
-            apply_keep_alive(Model, KeepAlive),
-            livery_resp:json(200, Body);
-        {barrel_inference_load_done, Model, {error, Reason}} ->
-            livery_resp:json(error_status(Reason), json:encode(error_body(Reason)))
-    after preload_recv_timeout() ->
-        livery_resp:json(504, json:encode(#{<<"error">> => <<"model_load_timeout">>}))
-    end.
-
-%% Inference: streaming returns livery_resp:stream/3 with the NDJSON
-%% producer fun; non-streaming buffers tokens internally and returns a
-%% one-shot livery_resp:json.
-livery_inference(Op, R, KeepAlive) ->
-    case R#barrel_inference_request.stream of
-        true ->
-            livery_resp:stream(
-                200,
-                [{<<"content-type">>, <<"application/x-ndjson">>}],
-                fun(Emit) -> livery_drive(Op, R, KeepAlive, Emit) end
-            );
-        false ->
-            livery_drive_buffered(Op, R, KeepAlive)
-    end.
-
-livery_drive(Op, R, KeepAlive, Emit) ->
-    {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
-    State = livery_init_state(Op, R, KeepAlive, Worker, Mon),
-    try
-        livery_stream_loop(State, Emit)
-    after
-        cleanup(State)
-    end.
-
-livery_drive_buffered(Op, R, KeepAlive) ->
-    {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
-    State = livery_init_state(Op, R, KeepAlive, Worker, Mon),
-    try
-        livery_buffered_loop(State)
-    after
-        cleanup(State)
-    end.
-
-livery_init_state(Op, R, KeepAlive, Worker, Mon) ->
-    #st{
-        op = Op,
-        req_id = R#barrel_inference_request.request_id,
-        model = R#barrel_inference_request.model_id,
-        requested = R#barrel_inference_request.model_id,
-        stream = R#barrel_inference_request.stream,
-        is_preload = false,
-        keep_alive_ms = KeepAlive,
-        phase = waiting_load,
-        worker = Worker,
-        worker_mon = Mon,
-        ref = undefined,
-        slot = undefined,
-        mono_start = mono_ms(),
-        mono_loaded = undefined,
-        buf = [],
-        stream_started = true,
-        out_tokens = 0
-    }.
-
-%% Streaming receive loop. Each Emit/1 return value is checked: when
-%% the peer disconnects livery surfaces `{error, closed}' and we bail
-%% out so the `after cleanup' clause runs.
-livery_stream_loop(S, Emit) ->
-    receive
-        {pipeline, loading, _ModelId} ->
-            Line = json:encode(#{
-                <<"model">> => S#st.model,
-                <<"created_at">> => iso8601_now(),
-                <<"status">> => <<"loading">>,
-                <<"done">> => false
-            }),
-            case livery_emit_line(Emit, Line) of
-                ok -> livery_stream_loop(S, Emit);
-                closed -> S
-            end;
-        {pipeline, loaded} ->
-            ok = barrel_inference_server_keepalive:request_begin(S#st.model),
-            livery_stream_loop(
-                S#st{phase = waiting_template, mono_loaded = mono_ms()},
-                Emit
-            );
-        {pipeline, templated, _Tokens, _ParamsRef} ->
-            livery_stream_loop(S#st{phase = waiting_queue}, Emit);
-        {pipeline, queued} ->
-            livery_stream_loop(S#st{phase = waiting_admit}, Emit);
-        {pipeline, admitted, Ref, Slot} ->
-            S1 = on_admit(S, Ref, Slot),
-            livery_stream_loop(S1, Emit);
-        {pipeline, error, _Status, Reason} ->
-            _ = livery_emit_line(Emit, json:encode(error_body(Reason))),
-            S;
-        {barrel_inference_token, Ref, Tok} ->
-            S1 = livery_learn_ref(S, Ref),
-            Chunk = ollama_chunk(S1#st.op, Tok, S1#st.req_id, S1#st.model),
-            case livery_emit_line(Emit, Chunk) of
-                ok ->
-                    livery_stream_loop(S1#st{out_tokens = S1#st.out_tokens + 1}, Emit);
-                closed ->
-                    S1
-            end;
-        {barrel_inference_reasoning_token, Ref, _Tok} ->
-            livery_stream_loop(livery_learn_ref(S, Ref), Emit);
-        {barrel_inference_done, Ref, Stats} ->
-            S1 = livery_learn_ref(S, Ref),
-            Final = livery_final_chunk(S1, Stats),
-            _ = livery_emit_line(Emit, Final),
-            S1;
-        {barrel_inference_error, Ref, Reason} ->
-            S1 = livery_learn_ref(S, Ref),
-            _ = livery_emit_line(Emit, json:encode(error_body(Reason))),
-            S1;
-        {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.worker_mon ->
-            livery_stream_loop(S#st{worker = undefined, worker_mon = undefined}, Emit);
-        {barrel_inference_token_id, _Ref, _Id} ->
-            livery_stream_loop(S, Emit);
-        _Other ->
-            livery_stream_loop(S, Emit)
-    end.
-
-%% Buffered (non-stream) receive loop. Accumulates the token text and
-%% returns a single livery_resp:json response on done.
-livery_buffered_loop(S) ->
-    receive
-        {pipeline, loading, _ModelId} ->
-            livery_buffered_loop(S);
-        {pipeline, loaded} ->
-            ok = barrel_inference_server_keepalive:request_begin(S#st.model),
-            livery_buffered_loop(
-                S#st{phase = waiting_template, mono_loaded = mono_ms()}
-            );
-        {pipeline, templated, _Tokens, _ParamsRef} ->
-            livery_buffered_loop(S#st{phase = waiting_queue});
-        {pipeline, queued} ->
-            livery_buffered_loop(S#st{phase = waiting_admit});
-        {pipeline, admitted, Ref, Slot} ->
-            S1 = on_admit(S, Ref, Slot),
-            livery_buffered_loop(S1);
-        {pipeline, error, Status, Reason} ->
-            livery_resp:json(Status, json:encode(error_body(Reason)));
-        {barrel_inference_token, Ref, Tok} ->
-            S1 = livery_learn_ref(S, Ref),
-            livery_buffered_loop(
-                S1#st{buf = [S1#st.buf, Tok], out_tokens = S1#st.out_tokens + 1}
-            );
-        {barrel_inference_reasoning_token, Ref, _Tok} ->
-            livery_buffered_loop(livery_learn_ref(S, Ref));
-        {barrel_inference_done, Ref, Stats} ->
-            S1 = livery_learn_ref(S, Ref),
-            Timings = compute_timings(S1),
-            BodyBin = iolist_to_binary(S1#st.buf),
-            Body = ollama_full_response(S1#st.op, BodyBin, Stats, S1#st.model, Timings),
-            livery_resp:json(200, Body);
-        {barrel_inference_error, _Ref, Reason} ->
-            livery_resp:json(error_status(Reason), json:encode(error_body(Reason)));
-        {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.worker_mon ->
-            livery_buffered_loop(S#st{worker = undefined, worker_mon = undefined});
-        {barrel_inference_token_id, _Ref, _Id} ->
-            livery_buffered_loop(S);
-        _Other ->
-            livery_buffered_loop(S)
-    end.
-
-livery_final_chunk(S, Stats) ->
-    Timings = compute_timings(S),
-    ollama_final_chunk(S#st.op, Stats, S#st.req_id, S#st.model, Timings).
-
-livery_learn_ref(S = #st{ref = undefined}, Ref) ->
-    S#st{phase = running, ref = Ref};
-livery_learn_ref(S, _Ref) ->
-    S.
-
-%% pipeline admit can land before or after the first token. When it
-%% lands first, record both ref and slot. When the first token learned
-%% the ref ahead of the admit, only the slot is new.
-on_admit(S = #st{ref = undefined}, Ref, Slot) ->
-    S#st{phase = running, ref = Ref, slot = Slot};
-on_admit(S, _Ref, Slot) ->
-    S#st{slot = Slot}.
-
-%% Emit one NDJSON line. The terminator is a single LF per the Ollama
-%% on-wire convention. Returns ok on success, `closed' if the peer
-%% disconnected so the caller can stop the receive loop.
-livery_emit_line(Emit, Body) ->
-    case Emit([Body, <<"\n">>]) of
-        ok -> ok;
-        {error, closed} -> closed;
-        {error, _} -> closed
-    end.
-
-%%====================================================================
 %% Cowboy entry
 %%====================================================================
 
@@ -356,15 +79,15 @@ fast_phase(Body, Req0, Opts, Op) ->
     end.
 
 translate(Map, Req0, Opts, Op) ->
-    case ollama_to_internal(Op, Map) of
+    Translated =
+        case Op of
+            generate -> barrel_inference_server_translate:ollama_generate_to_internal(Map);
+            chat -> barrel_inference_server_translate:ollama_chat_to_internal(Map)
+        end,
+    case Translated of
         {ok, R} -> start(R, Req0, Opts, Op);
         {error, Reason} -> reply_json(400, error_body(Reason), Req0, Opts)
     end.
-
-ollama_to_internal(generate, Map) ->
-    barrel_inference_server_translate:ollama_generate_to_internal(Map);
-ollama_to_internal(chat, Map) ->
-    barrel_inference_server_translate:ollama_chat_to_internal(Map).
 
 start(R0, Req0, Opts, Op) ->
     Requested = R0#barrel_inference_request.model_id,
@@ -591,7 +314,17 @@ keepalive_release(Model, _Phase, KA) ->
 
 handle_token(Tok, Req, S = #st{stream = true, op = Op}) ->
     {Req1, S1} = ensure_stream(Req, S),
-    Chunk = ollama_chunk(Op, Tok, S1#st.req_id, S1#st.model),
+    Chunk =
+        case Op of
+            generate ->
+                barrel_inference_server_translate:internal_to_ollama_generate_chunk(
+                    Tok, S1#st.req_id, S1#st.model
+                );
+            chat ->
+                barrel_inference_server_translate:internal_to_ollama_chat_chunk(
+                    Tok, S1#st.req_id, S1#st.model
+                )
+        end,
     ndjson_line(Req1, Chunk),
     {ok, Req1, S1#st{out_tokens = S1#st.out_tokens + 1}, hibernate};
 handle_token(Tok, Req, S = #st{stream = false}) ->
@@ -599,7 +332,17 @@ handle_token(Tok, Req, S = #st{stream = false}) ->
 
 finish_ok(Req0, S = #st{stream = true, op = Op}, Stats) ->
     Timings = compute_timings(S),
-    Final = ollama_final_chunk(Op, Stats, S#st.req_id, S#st.model, Timings),
+    Final =
+        case Op of
+            generate ->
+                barrel_inference_server_translate:internal_to_ollama_generate_final(
+                    Stats, S#st.req_id, S#st.model, Timings
+                );
+            chat ->
+                barrel_inference_server_translate:internal_to_ollama_chat_final(
+                    Stats, S#st.req_id, S#st.model, Timings
+                )
+        end,
     {Req1, _S1} = ensure_stream(Req0, S),
     ndjson_line(Req1, Final),
     cowboy_req:stream_body(<<>>, fin, Req1),
@@ -607,34 +350,19 @@ finish_ok(Req0, S = #st{stream = true, op = Op}, Stats) ->
 finish_ok(Req0, S = #st{stream = false, op = Op}, Stats) ->
     Timings = compute_timings(S),
     BodyBin = iolist_to_binary(S#st.buf),
-    Body = ollama_full_response(Op, BodyBin, Stats, S#st.model, Timings),
+    Body =
+        case Op of
+            generate ->
+                barrel_inference_server_translate:internal_to_ollama_generate_response(
+                    BodyBin, Stats, S#st.model, Timings
+                );
+            chat ->
+                barrel_inference_server_translate:internal_to_ollama_chat_response(
+                    BodyBin, Stats, S#st.model, Timings
+                )
+        end,
     Req1 = cowboy_req:reply(200, json_headers(), Body, Req0),
     {stop, Req1, S}.
-
-%% Shared frame builders so the cowboy and livery code paths agree on
-%% the wire shape (and Elvis's dont_repeat_yourself rule stays happy).
-ollama_chunk(generate, Tok, ReqId, Model) ->
-    barrel_inference_server_translate:internal_to_ollama_generate_chunk(Tok, ReqId, Model);
-ollama_chunk(chat, Tok, ReqId, Model) ->
-    barrel_inference_server_translate:internal_to_ollama_chat_chunk(Tok, ReqId, Model).
-
-ollama_final_chunk(generate, Stats, ReqId, Model, Timings) ->
-    barrel_inference_server_translate:internal_to_ollama_generate_final(
-        Stats, ReqId, Model, Timings
-    );
-ollama_final_chunk(chat, Stats, ReqId, Model, Timings) ->
-    barrel_inference_server_translate:internal_to_ollama_chat_final(
-        Stats, ReqId, Model, Timings
-    ).
-
-ollama_full_response(generate, BodyBin, Stats, Model, Timings) ->
-    barrel_inference_server_translate:internal_to_ollama_generate_response(
-        BodyBin, Stats, Model, Timings
-    );
-ollama_full_response(chat, BodyBin, Stats, Model, Timings) ->
-    barrel_inference_server_translate:internal_to_ollama_chat_response(
-        BodyBin, Stats, Model, Timings
-    ).
 
 finish_err(Req0, S = #st{stream_started = true}, Reason) ->
     ndjson_line(Req0, json:encode(error_body(Reason))),
