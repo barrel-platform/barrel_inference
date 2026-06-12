@@ -63,7 +63,10 @@
     livery_ollama_chat_invalid_json_returns_400/1,
     livery_ollama_generate_unknown_model_streams_ndjson/1,
     livery_embeddings_openai_invalid_json_returns_400/1,
-    livery_embeddings_ollama_invalid_json_returns_400/1
+    livery_embeddings_ollama_invalid_json_returns_400/1,
+    livery_api_tags_returns_200/1,
+    livery_api_version_returns_200/1,
+    livery_api_ps_returns_200/1
 ]).
 
 suite() -> [{timetrap, {seconds, 30}}].
@@ -122,7 +125,10 @@ all() ->
         livery_ollama_chat_invalid_json_returns_400,
         livery_ollama_generate_unknown_model_streams_ndjson,
         livery_embeddings_openai_invalid_json_returns_400,
-        livery_embeddings_ollama_invalid_json_returns_400
+        livery_embeddings_ollama_invalid_json_returns_400,
+        livery_api_tags_returns_200,
+        livery_api_version_returns_200,
+        livery_api_ps_returns_200
     ].
 
 init_per_suite(Config) ->
@@ -951,6 +957,24 @@ livery_embeddings_ollama_invalid_json_returns_400(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/embed",
     {ok, {{_, 400, _}, _, _}} =
         httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+
+livery_api_tags_returns_200(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/tags",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(maps:is_key(<<"models">>, Decoded)).
+
+livery_api_version_returns_200(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/version",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(maps:is_key(<<"version">>, Decoded)).
+
+livery_api_ps_returns_200(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/ps",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(maps:is_key(<<"models">>, Decoded)).
 
 livery_ollama_generate_unknown_model_streams_ndjson(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/generate",
