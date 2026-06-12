@@ -61,7 +61,9 @@
     livery_listener_echoes_request_id_header/1,
     livery_ollama_generate_invalid_json_returns_400/1,
     livery_ollama_chat_invalid_json_returns_400/1,
-    livery_ollama_generate_unknown_model_streams_ndjson/1
+    livery_ollama_generate_unknown_model_streams_ndjson/1,
+    livery_embeddings_openai_invalid_json_returns_400/1,
+    livery_embeddings_ollama_invalid_json_returns_400/1
 ]).
 
 suite() -> [{timetrap, {seconds, 30}}].
@@ -118,7 +120,9 @@ all() ->
         livery_listener_echoes_request_id_header,
         livery_ollama_generate_invalid_json_returns_400,
         livery_ollama_chat_invalid_json_returns_400,
-        livery_ollama_generate_unknown_model_streams_ndjson
+        livery_ollama_generate_unknown_model_streams_ndjson,
+        livery_embeddings_openai_invalid_json_returns_400,
+        livery_embeddings_ollama_invalid_json_returns_400
     ].
 
 init_per_suite(Config) ->
@@ -938,6 +942,16 @@ livery_ollama_chat_invalid_json_returns_400(Cfg) ->
 %% pipeline worker fails to load, and the receive loop emits an NDJSON
 %% error frame before falling out of the stream. Proves Emit/1 is
 %% wired and the cancel-via-fall-out cleanup runs without crashing.
+livery_embeddings_openai_invalid_json_returns_400(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/v1/embeddings",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+
+livery_embeddings_ollama_invalid_json_returns_400(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/embed",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+
 livery_ollama_generate_unknown_model_streams_ndjson(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/generate",
     Body = json:encode(#{
