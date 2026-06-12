@@ -57,11 +57,7 @@ delete(Req) ->
     end).
 
 delete_run(Name) ->
-    case barrel_inference_server_models:delete(Name) of
-        ok -> livery_resp:json(200, <<>>);
-        {error, not_found} -> err(404, <<"model_not_found">>);
-        {error, Reason} -> err(500, reason_string(Reason))
-    end.
+    handle_ok_or_error(barrel_inference_server_models:delete(Name)).
 
 copy(Req) ->
     with_json_body(Req, fun(Body) ->
@@ -72,11 +68,16 @@ copy(Req) ->
     end).
 
 copy_run(Src, Dst) ->
-    case barrel_inference_server_models:copy(Src, Dst) of
-        ok -> livery_resp:json(200, <<>>);
-        {error, not_found} -> err(404, <<"model_not_found">>);
-        {error, Reason} -> err(500, reason_string(Reason))
-    end.
+    handle_ok_or_error(barrel_inference_server_models:copy(Src, Dst)).
+
+%% Common reply shape for ops that return ok (200 empty body) or one of
+%% the standard error tuples.
+handle_ok_or_error(ok) ->
+    livery_resp:json(200, <<>>);
+handle_ok_or_error({error, not_found}) ->
+    err(404, <<"model_not_found">>);
+handle_ok_or_error({error, Reason}) ->
+    err(500, reason_string(Reason)).
 
 edit(Req) ->
     with_json_body(Req, fun(Body) ->
