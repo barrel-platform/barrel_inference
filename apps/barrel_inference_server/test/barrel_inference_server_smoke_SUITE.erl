@@ -151,6 +151,11 @@ init_per_suite(Config) ->
         }}
     ),
     application:set_env(barrel_inference_server, max_messages, 4),
+    %% Lower the body cap so the 413 tests can trip it with a body
+    %% small enough not to RST the connection under livery's
+    %% read-and-reply semantics (cowboy waited for the full body,
+    %% livery aborts on cap).
+    application:set_env(barrel_inference_server, max_request_body_bytes, 12 * 1024 * 1024),
     application:set_env(
         barrel_inference_server,
         cors,
@@ -362,7 +367,11 @@ accepts_body_above_one_mb(Cfg) ->
 %% to force at least two reads even on a fast localhost socket.
 accepts_body_above_cowboy_default_length(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
-    Big = binary:copy(<<"x">>, 10 * 1024 * 1024),
+    %% 9 MiB: under the 12 MiB suite cap so the body is accepted, but
+    %% well above the legacy 8 MiB cowboy default we used to read in
+    %% one chunk. JSON decode fails on the all-`x` body so we should
+    %% get a clean 400 from the handler.
+    Big = binary:copy(<<"x">>, 9 * 1024 * 1024),
     {ok, {{_, Status, _}, _, _}} =
         httpc:request(post, {Url, [], "application/json", Big}, [], []),
     ?assertEqual(400, Status).
@@ -505,8 +514,8 @@ messages_error_body_carries_request_id(Cfg) ->
 %% retry behaviour.
 messages_413_returns_request_too_large_type(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
-    %% Default body cap is 256 MiB; send 257 MiB to trip the 413 path.
-    Oversized = binary:copy(<<"x">>, 257 * 1024 * 1024),
+    %% Suite cap is 12 MiB (init_per_suite); 13 MiB trips 413.
+    Oversized = binary:copy(<<"x">>, 13 * 1024 * 1024),
     {ok, {{_, Status, _}, _, RespBody}} =
         httpc:request(post, {Url, [], "application/json", Oversized}, [], []),
     ?assertEqual(413, Status),

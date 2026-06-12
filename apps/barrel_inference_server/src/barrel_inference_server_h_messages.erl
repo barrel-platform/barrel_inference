@@ -878,6 +878,7 @@ on_pipeline_buffered({pipeline, admitted, Ref, Slot}, S) ->
     ),
     buffered_loop(S1);
 on_pipeline_buffered({pipeline, error, Status, Reason}, S) ->
+    record_metrics(S, Status),
     anthropic_json_reply_h(Status, Reason, S#st.extra_headers).
 
 handle_token_buffered(Tok, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
