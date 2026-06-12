@@ -173,23 +173,12 @@ stream_loop(S, Emit) ->
     after stream_idle_timeout() -> S
     end.
 
-dispatch_stream({pipeline, loading, _Model}, S, Emit) ->
-    case emit_line(Emit, loading_line(S)) of
-        ok -> stream_loop(S, Emit);
-        closed -> S
-    end;
-dispatch_stream({pipeline, loaded}, S, Emit) ->
-    ok = barrel_inference_server_keepalive:request_begin(S#st.model),
-    stream_loop(S#st{phase = waiting_template, mono_loaded = mono_ms()}, Emit);
-dispatch_stream({pipeline, templated, _Tokens, _ParamsRef}, S, Emit) ->
-    stream_loop(S#st{phase = waiting_queue}, Emit);
-dispatch_stream({pipeline, queued}, S, Emit) ->
-    stream_loop(S#st{phase = waiting_admit}, Emit);
-dispatch_stream({pipeline, admitted, Ref, Slot}, S, Emit) ->
-    stream_loop(on_admit(S, Ref, Slot), Emit);
-dispatch_stream({pipeline, error, _Status, Reason}, S, Emit) ->
-    _ = emit_line(Emit, json:encode(error_body(Reason))),
-    S;
+dispatch_stream({pipeline, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
+dispatch_stream({pipeline, _, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
+dispatch_stream({pipeline, _, _, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
 dispatch_stream({barrel_inference_token, Ref, Tok}, S, Emit) ->
     on_token(S, Ref, Tok, Emit);
 dispatch_stream({barrel_inference_reasoning_token, Ref, _Tok}, S, Emit) ->
@@ -212,6 +201,24 @@ on_token(S, Ref, Tok, Emit) ->
         ok -> stream_loop(S1#st{out_tokens = S1#st.out_tokens + 1}, Emit);
         closed -> S1
     end.
+
+on_pipeline_stream({pipeline, loading, _Model}, S, Emit) ->
+    case emit_line(Emit, loading_line(S)) of
+        ok -> stream_loop(S, Emit);
+        closed -> S
+    end;
+on_pipeline_stream({pipeline, loaded}, S, Emit) ->
+    ok = barrel_inference_server_keepalive:request_begin(S#st.model),
+    stream_loop(S#st{phase = waiting_template, mono_loaded = mono_ms()}, Emit);
+on_pipeline_stream({pipeline, templated, _Tokens, _ParamsRef}, S, Emit) ->
+    stream_loop(S#st{phase = waiting_queue}, Emit);
+on_pipeline_stream({pipeline, queued}, S, Emit) ->
+    stream_loop(S#st{phase = waiting_admit}, Emit);
+on_pipeline_stream({pipeline, admitted, Ref, Slot}, S, Emit) ->
+    stream_loop(on_admit(S, Ref, Slot), Emit);
+on_pipeline_stream({pipeline, error, _Status, Reason}, S, Emit) ->
+    _ = emit_line(Emit, json:encode(error_body(Reason))),
+    S.
 
 on_engine_error(S, Ref, Reason, Emit) ->
     S1 = learn_ref(S, Ref),
