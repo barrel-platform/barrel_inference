@@ -87,12 +87,7 @@ livery_fast_phase(Body, Op) ->
     end.
 
 livery_translate(Map, Op) ->
-    Translated =
-        case Op of
-            generate -> barrel_inference_server_translate:ollama_generate_to_internal(Map);
-            chat -> barrel_inference_server_translate:ollama_chat_to_internal(Map)
-        end,
-    case Translated of
+    case ollama_to_internal(Op, Map) of
         {ok, R} -> livery_start(R, Op);
         {error, Reason} -> livery_resp:json(400, json:encode(error_body(Reason)))
     end.
@@ -228,11 +223,7 @@ livery_stream_loop(S, Emit) ->
         {pipeline, queued} ->
             livery_stream_loop(S#st{phase = waiting_admit}, Emit);
         {pipeline, admitted, Ref, Slot} ->
-            S1 =
-                case S#st.ref of
-                    undefined -> S#st{phase = running, ref = Ref, slot = Slot};
-                    _ -> S#st{slot = Slot}
-                end,
+            S1 = on_admit(S, Ref, Slot),
             livery_stream_loop(S1, Emit);
         {pipeline, error, _Status, Reason} ->
             _ = livery_emit_line(Emit, json:encode(error_body(Reason))),
@@ -281,11 +272,7 @@ livery_buffered_loop(S) ->
         {pipeline, queued} ->
             livery_buffered_loop(S#st{phase = waiting_admit});
         {pipeline, admitted, Ref, Slot} ->
-            S1 =
-                case S#st.ref of
-                    undefined -> S#st{phase = running, ref = Ref, slot = Slot};
-                    _ -> S#st{slot = Slot}
-                end,
+            S1 = on_admit(S, Ref, Slot),
             livery_buffered_loop(S1);
         {pipeline, error, Status, Reason} ->
             livery_resp:json(Status, json:encode(error_body(Reason)));
@@ -320,6 +307,14 @@ livery_learn_ref(S = #st{ref = undefined}, Ref) ->
     S#st{phase = running, ref = Ref};
 livery_learn_ref(S, _Ref) ->
     S.
+
+%% pipeline admit can land before or after the first token. When it
+%% lands first, record both ref and slot. When the first token learned
+%% the ref ahead of the admit, only the slot is new.
+on_admit(S = #st{ref = undefined}, Ref, Slot) ->
+    S#st{phase = running, ref = Ref, slot = Slot};
+on_admit(S, _Ref, Slot) ->
+    S#st{slot = Slot}.
 
 %% Emit one NDJSON line. The terminator is a single LF per the Ollama
 %% on-wire convention. Returns ok on success, `closed' if the peer
@@ -361,15 +356,15 @@ fast_phase(Body, Req0, Opts, Op) ->
     end.
 
 translate(Map, Req0, Opts, Op) ->
-    Translated =
-        case Op of
-            generate -> barrel_inference_server_translate:ollama_generate_to_internal(Map);
-            chat -> barrel_inference_server_translate:ollama_chat_to_internal(Map)
-        end,
-    case Translated of
+    case ollama_to_internal(Op, Map) of
         {ok, R} -> start(R, Req0, Opts, Op);
         {error, Reason} -> reply_json(400, error_body(Reason), Req0, Opts)
     end.
+
+ollama_to_internal(generate, Map) ->
+    barrel_inference_server_translate:ollama_generate_to_internal(Map);
+ollama_to_internal(chat, Map) ->
+    barrel_inference_server_translate:ollama_chat_to_internal(Map).
 
 start(R0, Req0, Opts, Op) ->
     Requested = R0#barrel_inference_request.model_id,
