@@ -143,16 +143,16 @@ handle_post(Req0, Op, Version) ->
 fast_phase(Body, Req, Op, Version) ->
     case decode(Body) of
         {ok, Map} ->
-            translate(Map, Req, Op, Body, Version);
+            translate(Map, Req, Op, Version);
         error ->
             anthropic_json_reply(400, invalid_json, Req, version_headers(Version))
     end.
 
-translate(Map, Req, Op, Body, Version) ->
+translate(Map, Req, Op, Version) ->
     case barrel_inference_server_translate:anthropic_messages_to_internal(Map) of
         {ok, R0} ->
             R1 = R0#barrel_inference_request{
-                anthropic_betas = collect_betas(Req, Body)
+                anthropic_betas = collect_betas(Req, Map)
             },
             R2 = R1#barrel_inference_request{
                 session_id = barrel_inference_server_session:derive(Req, R1)
