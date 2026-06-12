@@ -6,6 +6,18 @@
 
 -export([init/2]).
 
+%% livery entry point.
+-export([handle/1]).
+
+handle(_Req) ->
+    barrel_inference_server_metrics:update_cache_gauges(),
+    Body = iolist_to_binary(instrument_prometheus:format()),
+    livery_resp:text(
+        200,
+        [{<<"content-type">>, instrument_prometheus:content_type()}],
+        Body
+    ).
+
 init(Req0, Opts) ->
     case cowboy_req:method(Req0) of
         <<"GET">> ->

@@ -13,6 +13,10 @@
 
 -export([init/2]).
 
+%% livery entry points (one per route binding in
+%% barrel_inference_server_routes:livery_routes/0).
+-export([liveness/1, readiness/1]).
+
 init(Req0, #{kind := Kind} = Opts) ->
     case cowboy_req:method(Req0) of
         <<"GET">> ->
@@ -28,6 +32,14 @@ init(Req0, #{kind := Kind} = Opts) ->
             Req1 = cowboy_req:reply(405, #{}, <<>>, Req0),
             {ok, Req1, Opts}
     end.
+
+liveness(_Req) ->
+    {Status, Body} = probe(liveness),
+    livery_resp:json(Status, json:encode(Body)).
+
+readiness(_Req) ->
+    {Status, Body} = probe(readiness),
+    livery_resp:json(Status, json:encode(Body)).
 
 probe(liveness) ->
     case is_pid(whereis(barrel_inference_server_sup)) of

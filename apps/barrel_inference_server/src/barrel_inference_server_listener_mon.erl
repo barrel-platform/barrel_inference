@@ -74,7 +74,7 @@ start_listener(S) ->
     Acceptors = app_env(num_acceptors, 100),
     BaseSocketOpts = [{port, Port}, {ip, Ip}],
     ProtocolOpts = #{
-        env => #{dispatch => cowboy_router:compile(routes())},
+        env => #{dispatch => cowboy_router:compile(barrel_inference_server_routes:cowboy_routes())},
         middlewares => [
             barrel_inference_server_middleware,
             cowboy_router,
@@ -107,37 +107,6 @@ start_listener(S) ->
         end,
     Mon = monitor(process, Pid),
     S#state{listener_pid = Pid, monitor = Mon}.
-
-routes() ->
-    [
-        {'_', [
-            {"/v1/chat/completions", barrel_inference_server_h_chat, #{api => openai}},
-            {"/v1/completions", barrel_inference_server_h_chat, #{api => openai_legacy}},
-            {"/v1/responses", barrel_inference_server_h_responses, #{api => openai}},
-            {"/v1/messages", barrel_inference_server_h_messages, #{}},
-            {"/v1/messages/count_tokens", barrel_inference_server_h_messages, #{op => count_tokens}},
-            {"/v1/embeddings", barrel_inference_server_h_embeddings, #{}},
-            {"/v1/models", barrel_inference_server_h_models, #{}},
-            {"/v1/models/:model_id", barrel_inference_server_h_models, #{}},
-            {"/health", barrel_inference_server_h_health, #{kind => liveness}},
-            {"/health/ready", barrel_inference_server_h_health, #{kind => readiness}},
-            {"/metrics", barrel_inference_server_h_metrics, #{}},
-            {"/api/tags", barrel_inference_server_h_api, #{op => tags}},
-            {"/api/pull", barrel_inference_server_h_api, #{op => pull}},
-            {"/api/show", barrel_inference_server_h_api, #{op => show}},
-            {"/api/delete", barrel_inference_server_h_api, #{op => delete}},
-            {"/api/copy", barrel_inference_server_h_api, #{op => copy}},
-            {"/api/edit", barrel_inference_server_h_api, #{op => edit}},
-            {"/api/create", barrel_inference_server_h_api, #{op => create}},
-            {"/api/search", barrel_inference_server_h_api, #{op => search}},
-            {"/api/generate", barrel_inference_server_h_ollama, #{op => generate}},
-            {"/api/chat", barrel_inference_server_h_ollama, #{op => chat}},
-            {"/api/version", barrel_inference_server_h_api, #{op => version}},
-            {"/api/ps", barrel_inference_server_h_api, #{op => ps}},
-            {"/api/embed", barrel_inference_server_h_embeddings, #{api => ollama}},
-            {"/api/embeddings", barrel_inference_server_h_embeddings, #{api => ollama_legacy}}
-        ]}
-    ].
 
 app_env(Key, Default) ->
     application:get_env(?APP, Key, Default).
