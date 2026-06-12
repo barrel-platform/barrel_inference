@@ -138,7 +138,7 @@ search(Req) ->
 %%====================================================================
 
 pull(Req) ->
-    with_json_body(Req, fun(Body) -> pull_dispatch(Body) end).
+    with_json_body(Req, fun pull_dispatch/1).
 
 pull_dispatch(Body) ->
     case maps:find(<<"name">>, Body) of
@@ -216,7 +216,13 @@ stream_pull_loop(Emit, Spec, Coord, LastProgress) ->
     receive
         {pull_event, Coord, Event} ->
             handle_pull_event(Event, Emit, Spec, Coord, LastProgress)
+    after pull_idle_timeout() ->
+        _ = emit_line(Emit, #{<<"error">> => <<"pull_idle_timeout">>}),
+        ok
     end.
+
+pull_idle_timeout() ->
+    application:get_env(barrel_inference_server, pull_idle_timeout_ms, 1800000).
 
 handle_pull_event({progress, Bytes, Total}, Emit, Spec, Coord, LastProgress) ->
     Now = erlang:monotonic_time(millisecond),
