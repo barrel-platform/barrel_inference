@@ -17,6 +17,11 @@
 
 -export([init/2, info/3, terminate/3]).
 
+%% Pure helpers reused by barrel_inference_server_h_api_livery during
+%% the cowboy → livery migration window. Once the migration completes
+%% these go back to being private.
+-export([parse_modelfile/1, split_name_tag/1]).
+
 -record(pull, {
     name :: binary(),
     tag :: binary(),
