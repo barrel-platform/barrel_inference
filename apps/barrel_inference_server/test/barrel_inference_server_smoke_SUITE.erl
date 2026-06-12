@@ -63,7 +63,10 @@
     livery_ollama_chat_invalid_json_returns_400/1,
     livery_ollama_generate_unknown_model_streams_ndjson/1,
     livery_embeddings_openai_invalid_json_returns_400/1,
-    livery_embeddings_ollama_invalid_json_returns_400/1
+    livery_embeddings_ollama_invalid_json_returns_400/1,
+    livery_api_tags_returns_200/1,
+    livery_api_version_returns_200/1,
+    livery_api_ps_returns_200/1
 ]).
 
 suite() -> [{timetrap, {seconds, 30}}].
@@ -122,7 +125,10 @@ all() ->
         livery_ollama_chat_invalid_json_returns_400,
         livery_ollama_generate_unknown_model_streams_ndjson,
         livery_embeddings_openai_invalid_json_returns_400,
-        livery_embeddings_ollama_invalid_json_returns_400
+        livery_embeddings_ollama_invalid_json_returns_400,
+        livery_api_tags_returns_200,
+        livery_api_version_returns_200,
+        livery_api_ps_returns_200
     ].
 
 init_per_suite(Config) ->
@@ -895,8 +901,12 @@ livery_listener_serves_models_list(Cfg) ->
 %% returns 503 with an explanatory JSON body so the target=livery
 %% CT group can identify routes still pending migration.
 livery_listener_returns_503_for_unmigrated_route(Cfg) ->
-    Url = ?config(livery_base, Cfg) ++ "/api/version",
-    {ok, {{_, 503, _}, _, Body}} = httpc:request(Url),
+    %% Pick a route that's still on the not_yet_migrated stub. As γ
+    %% PRs convert more handlers, swap this to any path still wired
+    %% to the stub in barrel_inference_server_routes:livery_routes/0.
+    Url = ?config(livery_base, Cfg) ++ "/api/show",
+    {ok, {{_, 503, _}, _, Body}} =
+        httpc:request(post, {Url, [], "application/json", "{}"}, [], []),
     Decoded = json:decode(list_to_binary(Body)),
     ?assertEqual(
         <<"not_migrated_to_livery">>,
@@ -951,6 +961,24 @@ livery_embeddings_ollama_invalid_json_returns_400(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/embed",
     {ok, {{_, 400, _}, _, _}} =
         httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+
+livery_api_tags_returns_200(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/tags",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(maps:is_key(<<"models">>, Decoded)).
+
+livery_api_version_returns_200(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/version",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(maps:is_key(<<"version">>, Decoded)).
+
+livery_api_ps_returns_200(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/ps",
+    {ok, {{_, 200, _}, _, Body}} = httpc:request(Url),
+    Decoded = json:decode(list_to_binary(Body)),
+    ?assert(maps:is_key(<<"models">>, Decoded)).
 
 livery_ollama_generate_unknown_model_streams_ndjson(Cfg) ->
     Url = ?config(livery_base, Cfg) ++ "/api/generate",

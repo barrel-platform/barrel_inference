@@ -70,7 +70,7 @@ livery_routes() ->
         {<<"POST">>, <<"/v1/messages">>, Stub},
         {<<"POST">>, <<"/v1/messages/count_tokens">>, Stub},
         {<<"POST">>, <<"/v1/embeddings">>, {barrel_inference_server_h_embeddings, openai}},
-        {<<"GET">>, <<"/api/tags">>, Stub},
+        {<<"GET">>, <<"/api/tags">>, {barrel_inference_server_h_api_livery, tags}},
         {<<"POST">>, <<"/api/pull">>, Stub},
         {<<"POST">>, <<"/api/show">>, Stub},
         {<<"DELETE">>, <<"/api/delete">>, Stub},
@@ -80,8 +80,8 @@ livery_routes() ->
         {<<"POST">>, <<"/api/search">>, Stub},
         {<<"POST">>, <<"/api/generate">>, {barrel_inference_server_h_ollama_livery, generate}},
         {<<"POST">>, <<"/api/chat">>, {barrel_inference_server_h_ollama_livery, chat}},
-        {<<"GET">>, <<"/api/version">>, Stub},
-        {<<"GET">>, <<"/api/ps">>, Stub},
+        {<<"GET">>, <<"/api/version">>, {barrel_inference_server_h_api_livery, version}},
+        {<<"GET">>, <<"/api/ps">>, {barrel_inference_server_h_api_livery, ps}},
         {<<"POST">>, <<"/api/embed">>, {barrel_inference_server_h_embeddings, ollama}},
         {<<"POST">>, <<"/api/embeddings">>, {barrel_inference_server_h_embeddings, ollama_legacy}}
     ].
