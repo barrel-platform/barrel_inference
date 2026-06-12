@@ -896,18 +896,20 @@ livery_listener_serves_models_list(Cfg) ->
     ?assertEqual(<<"list">>, maps:get(<<"object">>, Decoded)),
     ?assert(is_list(maps:get(<<"data">>, Decoded))).
 
-%% Routes whose cowboy handler has not been ported to a livery
-%% `handle/1` yet are wired to the not_yet_migrated stub. The stub
-%% returns 503 with an explanatory JSON body so the target=livery
-%% CT group can identify routes still pending migration.
-livery_listener_returns_503_for_unmigrated_route(Cfg) ->
-    %% Pick a route that's still on the not_yet_migrated stub. As γ
-    %% PRs convert more handlers, swap this to any path still wired
-    %% to the stub in barrel_inference_server_routes:livery_routes/0.
-    Url = ?config(livery_base, Cfg) ++ "/v1/messages",
-    {ok, {{_, 503, _}, _, Body}} =
-        httpc:request(post, {Url, [], "application/json", "{}"}, [], []),
-    Decoded = json:decode(list_to_binary(Body)),
+%% After γ5 every HTTP route is wired to a real livery handler; the
+%% catch-all `not_yet_migrated/1` stub stays exported (and unit-tested
+%% in-process) until Phase δ removes it, but no route reaches it any
+%% more.
+livery_listener_returns_503_for_unmigrated_route(_Cfg) ->
+    Resp = barrel_inference_server_routes:not_yet_migrated(undefined),
+    ?assertEqual(503, livery_resp:status(Resp)),
+    Body = livery_resp:body(Resp),
+    BodyBin =
+        case Body of
+            {full, B} -> iolist_to_binary(B);
+            B -> iolist_to_binary(B)
+        end,
+    Decoded = json:decode(BodyBin),
     ?assertEqual(
         <<"not_migrated_to_livery">>,
         maps:get(<<"error">>, Decoded)

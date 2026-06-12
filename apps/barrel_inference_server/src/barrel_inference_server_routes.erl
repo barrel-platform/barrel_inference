@@ -57,7 +57,11 @@ cowboy_routes() ->
 %% streaming entry points and replace the placeholders in lockstep.
 -spec livery_routes() -> [livery_route()].
 livery_routes() ->
-    Stub = {barrel_inference_server_routes, not_yet_migrated},
+    %% Stub kept as the fallback for `not_yet_migrated/1` (returns 503
+    %% with the JSON migration hint) even though every route currently
+    %% points at a real livery handler. Phase δ removes both this
+    %% variable and the `not_yet_migrated/1' export.
+    _Stub = {barrel_inference_server_routes, not_yet_migrated},
     [
         {<<"GET">>, <<"/health">>, {barrel_inference_server_h_health, liveness}},
         {<<"GET">>, <<"/health/ready">>, {barrel_inference_server_h_health, readiness}},
@@ -67,8 +71,9 @@ livery_routes() ->
         {<<"POST">>, <<"/v1/chat/completions">>, {barrel_inference_server_h_chat_livery, openai}},
         {<<"POST">>, <<"/v1/completions">>, {barrel_inference_server_h_chat_livery, legacy}},
         {<<"POST">>, <<"/v1/responses">>, {barrel_inference_server_h_responses_livery, openai}},
-        {<<"POST">>, <<"/v1/messages">>, Stub},
-        {<<"POST">>, <<"/v1/messages/count_tokens">>, Stub},
+        {<<"POST">>, <<"/v1/messages">>, {barrel_inference_server_h_messages_livery, messages}},
+        {<<"POST">>, <<"/v1/messages/count_tokens">>,
+            {barrel_inference_server_h_messages_livery, count_tokens}},
         {<<"POST">>, <<"/v1/embeddings">>, {barrel_inference_server_h_embeddings, openai}},
         {<<"GET">>, <<"/api/tags">>, {barrel_inference_server_h_api_livery, tags}},
         {<<"POST">>, <<"/api/pull">>, {barrel_inference_server_h_api_livery, pull}},
