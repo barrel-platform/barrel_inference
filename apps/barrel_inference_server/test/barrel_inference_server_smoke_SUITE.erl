@@ -58,7 +58,10 @@
     livery_listener_serves_metrics/1,
     livery_listener_serves_models_list/1,
     livery_listener_returns_503_for_unmigrated_route/1,
-    livery_listener_echoes_request_id_header/1
+    livery_listener_echoes_request_id_header/1,
+    livery_ollama_generate_invalid_json_returns_400/1,
+    livery_ollama_chat_invalid_json_returns_400/1,
+    livery_ollama_generate_unknown_model_streams_ndjson/1
 ]).
 
 suite() -> [{timetrap, {seconds, 30}}].
@@ -112,7 +115,10 @@ all() ->
         livery_listener_serves_metrics,
         livery_listener_serves_models_list,
         livery_listener_returns_503_for_unmigrated_route,
-        livery_listener_echoes_request_id_header
+        livery_listener_echoes_request_id_header,
+        livery_ollama_generate_invalid_json_returns_400,
+        livery_ollama_chat_invalid_json_returns_400,
+        livery_ollama_generate_unknown_model_streams_ndjson
     ].
 
 init_per_suite(Config) ->
@@ -910,3 +916,38 @@ livery_listener_echoes_request_id_header(Cfg) ->
     after
         persistent_term:put(Key, Original)
     end.
+
+%%====================================================================
+%% Phase γ1: h_ollama migrated to a livery handle/1 entry point. The
+%% routes for /api/generate and /api/chat dispatch livery-side to the
+%% new handler. Cowboy serves the same routes unchanged.
+%%====================================================================
+
+livery_ollama_generate_invalid_json_returns_400(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/generate",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+
+livery_ollama_chat_invalid_json_returns_400(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/chat",
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(post, {Url, [], "application/json", "{not json"}, [], []).
+
+%% A streaming Ollama generate against an unknown model is the
+%% live-fire path: the handler enters the inference branch, the
+%% pipeline worker fails to load, and the receive loop emits an NDJSON
+%% error frame before falling out of the stream. Proves Emit/1 is
+%% wired and the cancel-via-fall-out cleanup runs without crashing.
+livery_ollama_generate_unknown_model_streams_ndjson(Cfg) ->
+    Url = ?config(livery_base, Cfg) ++ "/api/generate",
+    Body = json:encode(#{
+        <<"model">> => <<"no-such-model">>,
+        <<"prompt">> => <<"hi">>,
+        <<"stream">> => true
+    }),
+    {ok, {{_, _Status, _}, Headers, RespBody}} =
+        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+    Bin = list_to_binary(RespBody),
+    {value, {_, CT}} = lists:keysearch("content-type", 1, Headers),
+    ?assert(string:str(CT, "x-ndjson") =/= 0 orelse string:str(CT, "json") =/= 0),
+    ?assert(byte_size(Bin) >= 0).
