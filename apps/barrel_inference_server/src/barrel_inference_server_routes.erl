@@ -71,7 +71,7 @@ livery_routes() ->
         {<<"POST">>, <<"/v1/messages/count_tokens">>, Stub},
         {<<"POST">>, <<"/v1/embeddings">>, {barrel_inference_server_h_embeddings, openai}},
         {<<"GET">>, <<"/api/tags">>, {barrel_inference_server_h_api_livery, tags}},
-        {<<"POST">>, <<"/api/pull">>, Stub},
+        {<<"POST">>, <<"/api/pull">>, {barrel_inference_server_h_api_livery, pull}},
         {<<"POST">>, <<"/api/show">>, {barrel_inference_server_h_api_livery, show}},
         {<<"DELETE">>, <<"/api/delete">>, {barrel_inference_server_h_api_livery, delete}},
         {<<"POST">>, <<"/api/copy">>, {barrel_inference_server_h_api_livery, copy}},
