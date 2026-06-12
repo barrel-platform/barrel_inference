@@ -214,36 +214,39 @@ stream_pull_drive(Emit, Spec, Name, Tag) ->
 
 stream_pull_loop(Emit, Spec, Coord, LastProgress) ->
     receive
-        {pull_event, Coord, {progress, Bytes, Total}} ->
-            Now = erlang:monotonic_time(millisecond),
-            case Now - LastProgress >= 100 of
-                true ->
-                    case
-                        emit_line(Emit, #{
-                            <<"status">> => digest_status(Spec),
-                            <<"digest">> => Spec,
-                            <<"total">> => or_null(Total),
-                            <<"completed">> => Bytes
-                        })
-                    of
-                        ok -> stream_pull_loop(Emit, Spec, Coord, Now);
-                        closed -> ok
-                    end;
-                false ->
-                    stream_pull_loop(Emit, Spec, Coord, LastProgress)
-            end;
-        {pull_event, Coord, {phase, Phase}} ->
-            _ = emit_line(Emit, #{<<"status">> => atom_to_binary(Phase, utf8)}),
-            stream_pull_loop(Emit, Spec, Coord, LastProgress);
-        {pull_event, Coord, {status, Status}} ->
-            _ = emit_line(Emit, #{<<"status">> => Status}),
-            stream_pull_loop(Emit, Spec, Coord, LastProgress);
-        {pull_event, Coord, {success, _Manifest}} ->
-            _ = emit_line(Emit, #{<<"status">> => <<"success">>}),
-            ok;
-        {pull_event, Coord, {error, Reason}} ->
-            _ = emit_line(Emit, #{<<"error">> => reason_string(Reason)}),
-            ok
+        {pull_event, Coord, Event} ->
+            handle_pull_event(Event, Emit, Spec, Coord, LastProgress)
+    end.
+
+handle_pull_event({progress, Bytes, Total}, Emit, Spec, Coord, LastProgress) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Now - LastProgress >= 100 of
+        true -> emit_progress_and_loop(Emit, Spec, Coord, Now, Bytes, Total);
+        false -> stream_pull_loop(Emit, Spec, Coord, LastProgress)
+    end;
+handle_pull_event({phase, Phase}, Emit, Spec, Coord, LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => atom_to_binary(Phase, utf8)}),
+    stream_pull_loop(Emit, Spec, Coord, LastProgress);
+handle_pull_event({status, Status}, Emit, Spec, Coord, LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => Status}),
+    stream_pull_loop(Emit, Spec, Coord, LastProgress);
+handle_pull_event({success, _Manifest}, Emit, _Spec, _Coord, _LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => <<"success">>}),
+    ok;
+handle_pull_event({error, Reason}, Emit, _Spec, _Coord, _LastProgress) ->
+    _ = emit_line(Emit, #{<<"error">> => reason_string(Reason)}),
+    ok.
+
+emit_progress_and_loop(Emit, Spec, Coord, Now, Bytes, Total) ->
+    Line = #{
+        <<"status">> => digest_status(Spec),
+        <<"digest">> => Spec,
+        <<"total">> => or_null(Total),
+        <<"completed">> => Bytes
+    },
+    case emit_line(Emit, Line) of
+        ok -> stream_pull_loop(Emit, Spec, Coord, Now);
+        closed -> ok
     end.
 
 digest_status(Spec) ->
