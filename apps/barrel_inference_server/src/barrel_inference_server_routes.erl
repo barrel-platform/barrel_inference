@@ -69,7 +69,7 @@ livery_routes() ->
         {<<"POST">>, <<"/v1/responses">>, Stub},
         {<<"POST">>, <<"/v1/messages">>, Stub},
         {<<"POST">>, <<"/v1/messages/count_tokens">>, Stub},
-        {<<"POST">>, <<"/v1/embeddings">>, Stub},
+        {<<"POST">>, <<"/v1/embeddings">>, {barrel_inference_server_h_embeddings, openai}},
         {<<"GET">>, <<"/api/tags">>, Stub},
         {<<"POST">>, <<"/api/pull">>, Stub},
         {<<"POST">>, <<"/api/show">>, Stub},
@@ -82,8 +82,8 @@ livery_routes() ->
         {<<"POST">>, <<"/api/chat">>, {barrel_inference_server_h_ollama_livery, chat}},
         {<<"GET">>, <<"/api/version">>, Stub},
         {<<"GET">>, <<"/api/ps">>, Stub},
-        {<<"POST">>, <<"/api/embed">>, Stub},
-        {<<"POST">>, <<"/api/embeddings">>, Stub}
+        {<<"POST">>, <<"/api/embed">>, {barrel_inference_server_h_embeddings, ollama}},
+        {<<"POST">>, <<"/api/embeddings">>, {barrel_inference_server_h_embeddings, ollama_legacy}}
     ].
 
 -type livery_route() :: {binary(), binary(), {module(), atom()}}.

@@ -12,6 +12,132 @@
 
 -export([init/2]).
 
+%% livery entry points (one per route binding in
+%% barrel_inference_server_routes:livery_routes/0).
+-export([openai/1, ollama/1, ollama_legacy/1]).
+
+openai(Req) -> livery_handle(Req, openai).
+ollama(Req) -> livery_handle(Req, ollama).
+ollama_legacy(Req) -> livery_handle(Req, ollama_legacy).
+
+livery_handle(Req, Api) ->
+    case livery_req:method(Req) of
+        <<"POST">> -> livery_post(Req, Api);
+        _ -> livery_resp:json(405, json:encode(#{<<"error">> => <<"method_not_allowed">>}))
+    end.
+
+livery_post(Req, Api) ->
+    case barrel_inference_server_body:read(Req) of
+        {ok, Body, _Req1} ->
+            case decode(Body) of
+                {ok, Map} -> livery_translate(Map, Api);
+                error -> livery_error(400, invalid_json, Api)
+            end;
+        {too_large, _Req1} ->
+            livery_error(413, request_too_large, Api)
+    end.
+
+livery_translate(Map, Api) ->
+    case do_translate(Map, Api) of
+        {ok, Parsed = #{model := Requested, inputs := Inputs}} ->
+            KeepAlive = maps:get(keep_alive_ms, Parsed, undefined),
+            livery_run(Requested, Inputs, Api, KeepAlive);
+        {error, Reason} ->
+            livery_error(400, Reason, Api)
+    end.
+
+livery_run(Requested, Inputs, Api, KeepAlive) ->
+    Started = erlang:monotonic_time(millisecond),
+    case length(Inputs) > barrel_inference_server_config:max_embedding_inputs() of
+        true ->
+            livery_error(400, too_many_inputs, Api);
+        false ->
+            Real = barrel_inference_server_config:resolve_model(Requested),
+            case barrel_inference_server_config:ensure_loaded(Real) of
+                ok -> livery_do_embed(Real, Requested, Inputs, Started, Api, KeepAlive);
+                {error, not_found} -> livery_error(404, model_not_found, Api);
+                {error, Reason} -> livery_error(503, Reason, Api)
+            end
+    end.
+
+livery_do_embed(Real, Requested, Inputs, Started, Api, KeepAlive) ->
+    Timeout = queue_timeout(Real),
+    case barrel_inference_server_queue:acquire(Real, Timeout) of
+        {ok, Slot} ->
+            ok = barrel_inference_server_keepalive:request_begin(Real),
+            try
+                livery_run_embed(Real, Requested, Inputs, Started, Api)
+            after
+                barrel_inference_server_queue:release(Real, Slot),
+                barrel_inference_server_keepalive:request_end(
+                    Real, effective_keep_alive(KeepAlive)
+                )
+            end;
+        {error, pool_exhausted} ->
+            barrel_inference_server_metrics:inc_pool_exhausted(Real),
+            record_metrics(api_endpoint(Api), Requested, 429, Started),
+            livery_error(429, pool_exhausted, Api);
+        {error, queue_timeout} ->
+            record_metrics(api_endpoint(Api), Requested, 504, Started),
+            livery_error(504, queue_timeout, Api)
+    end.
+
+livery_run_embed(Real, Requested, Inputs, Started, Api) ->
+    case embed_each(Real, Inputs) of
+        {ok, Vectors, PromptTokens} ->
+            Body = livery_build_response(Api, Vectors, PromptTokens, Requested, Started),
+            record_metrics(api_endpoint(Api), Requested, 200, Started),
+            barrel_inference_server_metrics:inc_prompt_tokens(Requested, PromptTokens),
+            livery_resp:json(200, Body);
+        {error, Reason} ->
+            Status = embed_status(Reason),
+            record_metrics(api_endpoint(Api), Requested, Status, Started),
+            livery_error(Status, Reason, Api)
+    end.
+
+livery_build_response(Api, Vectors, PromptTokens, Requested, Started) ->
+    Now = erlang:monotonic_time(millisecond),
+    Timings = #{
+        total_duration_ns => (Now - Started) * 1_000_000,
+        load_duration_ns => 0
+    },
+    case Api of
+        ollama ->
+            barrel_inference_server_translate:internal_to_ollama_embed_response(
+                Requested, Vectors, PromptTokens, Timings
+            );
+        ollama_legacy ->
+            [Vec | _] = Vectors,
+            barrel_inference_server_translate:internal_to_ollama_embeddings_legacy_response(
+                Requested, Vec, Timings
+            );
+        _ ->
+            json:encode(
+                barrel_inference_server_translate:internal_to_openai_embedding_response(
+                    Vectors, PromptTokens, Requested
+                )
+            )
+    end.
+
+livery_error(Status, Reason, _Api) ->
+    Body = openai_error(
+        reason_message(Reason),
+        error_type(Status),
+        reason_code(Reason)
+    ),
+    livery_resp:json(Status, json:encode(Body)).
+
+do_translate(Map, openai) ->
+    barrel_inference_server_translate:openai_embeddings_to_internal(Map);
+do_translate(Map, ollama) ->
+    barrel_inference_server_translate:ollama_embed_to_internal(Map);
+do_translate(Map, ollama_legacy) ->
+    barrel_inference_server_translate:ollama_embeddings_legacy_to_internal(Map).
+
+api_endpoint(ollama) -> <<"/api/embed">>;
+api_endpoint(ollama_legacy) -> <<"/api/embeddings">>;
+api_endpoint(_) -> <<"/v1/embeddings">>.
+
 init(Req0, Opts) ->
     case cowboy_req:method(Req0) of
         <<"POST">> -> handle_post(Req0, Opts);
