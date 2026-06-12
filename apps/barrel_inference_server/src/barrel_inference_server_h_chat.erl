@@ -1,58 +1,39 @@
-%%% OpenAI /v1/chat/completions and /v1/completions handler.
+%%% Livery-side handler for /v1/chat/completions and /v1/completions.
 %%%
-%%% Pattern: cowboy_loop in both modes (streaming and non-streaming).
-%%% Inference is async (barrel_inference:infer/4 sends `{barrel_inference_token, _, _}`),
-%%% so the handler must sit in info/3.
+%%% Coexists with `barrel_inference_server_h_chat' during the cowboy →
+%%% livery migration. Mirrors the request/response shape exactly; only
+%%% the framework call surface differs.
 %%%
-%%% Lifecycle:
-%%%
-%%%   init/2
-%%%     -> read body, json:decode, translate, resolve_model
-%%%     (fast phase; failures land as JSON 4xx via cowboy_req:reply)
-%%%
-%%%   spawn pipeline worker
-%%%   return {cowboy_loop, Req, State#st{phase = waiting_load}}
-%%%
-%%%   info/3 clauses
-%%%     {pipeline, loaded}                  -> phase = waiting_template
-%%%     {pipeline, templated, _}            -> phase = waiting_queue
-%%%     {pipeline, queued}                  -> phase = waiting_admit
-%%%     {pipeline, admitted, Ref, Slot}     -> phase = running
-%%%                                            (stream=true: stream_reply 200)
-%%%     {pipeline, error, Status, Reason}   -> JSON reply, stop
-%%%     {barrel_inference_token, Ref, Bin}           -> emit chunk OR buffer (tool_buffer mode)
-%%%     {barrel_inference_reasoning_token, Ref, Bin} -> emit reasoning chunk
-%%%     {barrel_inference_done, Ref, Stats}          -> emit final + [DONE], stop
-%%%     {barrel_inference_error, Ref, Reason}        -> emit error event, stop
-%%%     {prefill_timeout|idle_timeout|total_timeout, Ref}
-%%%                                         -> cancel + error
-%%%
-%%%   terminate/3
-%%%     kill the pipeline worker, cancel any in-flight Ref, release
-%%%     any held queue slot. Triggered on normal exit AND on TCP close.
+%%% Uses `livery_resp:stream/3' with manual SSE framing for full
+%%% control over comments, multi-frame finishes, and `[DONE]'.
 
 -module(barrel_inference_server_h_chat).
--behaviour(cowboy_handler).
 
--export([init/2, info/3, terminate/3]).
+-export([openai/1, legacy/1]).
 
-%% The catch-all `info(_Msg, ...)` clause is reachable in production
-%% (stale messages from a previous request can land in the mailbox)
-%% but dialyzer narrows the state record's phase too aggressively to
-%% see it. Same applies to the catch-all in barrel_inference_server_h_messages.
--dialyzer({nowarn_function, info/3}).
+%% The receive-loop driven state mutates `ref' / `slot' / `pending_exec'
+%% through pipeline messages dialyzer can't trace through. The cleanup
+%% paths legitimately pattern-match both shapes; suppress narrowing.
+-dialyzer(
+    {nowarn_function, [
+        cleanup/1,
+        keepalive_release/1,
+        maybe_end_session/1,
+        record_session_committed/2,
+        release_slot/1,
+        drive_stream/4,
+        drive_buffered/3
+    ]}
+).
 
 -include("barrel_inference_server.hrl").
 
 -record(st, {
-    %% identity
     req_id :: binary(),
     model :: binary(),
-    %% client-facing model name (alias kept)
     requested :: binary(),
     api :: openai | openai_legacy,
     stream :: boolean(),
-    %% pipeline
     phase ::
         waiting_load
         | waiting_template
@@ -61,55 +42,27 @@
         | running,
     worker :: pid() | undefined,
     worker_mon :: reference() | undefined,
-    %% Engine gen_statem monitor; armed on admit, cleared on
-    %% barrel_inference_done / barrel_inference_error / terminate. See the matching
-    %% comment in barrel_inference_server_h_messages.
     engine_mon :: reference() | undefined,
-    %% admission outputs
     ref :: reference() | undefined,
     slot :: barrel_inference_server_queue:slot() | undefined,
-    %% timers
     started_mono :: integer(),
     first_token_at :: integer() | undefined,
     prefill_tref :: reference() | undefined,
     idle_tref :: reference() | undefined,
     total_tref :: reference() | undefined,
-    %% accounting
     out_tokens :: non_neg_integer(),
-    %% buffers (non-streaming or tool buffering)
     buf_text :: iodata(),
     buf_reason :: iodata(),
-    %% mode (text vs tool-call buffering)
     mode :: text | tool_buffer,
     grammar_set :: boolean(),
-    %% OpenAI stream_options.include_usage: when true, the streaming
-    %% finish emits a trailing usage-only chunk before [DONE].
     include_usage = false :: boolean(),
-    %% true once stream_reply/3 has fired. Separate from `ref` because
-    %% a loading keepalive can open the stream before admission.
     stream_started = false :: boolean(),
-    %% Mirrors barrel_inference_server_h_messages: tracks whether we observed
-    %% the engine's barrel_inference_done so cleanup can decide whether to
-    %% end_session (cancelled mid-flight) or leave the pinned session
-    %% alive (cross-turn reuse).
     received_done = false :: boolean(),
     session_id = undefined :: undefined | binary(),
-    %% llama.cpp autoparser params_ref built by the pipeline at admit
-    %% time and carried admit -> done. Used by maybe_autoparser_extract
-    %% to call chat_parse/3 on buf_text. undefined for raw-prompt
-    %% requests OR when the backend doesn't support chat_apply.
     chat_params_ref = undefined :: undefined | barrel_inference_nif:chat_params_ref(),
-    %% Autoparser-extracted tool calls accumulated at done; dispatched
-    %% once via dispatch_done.
     captured_calls = [] ::
         [#{id := binary(), name := binary(), input := map(), full_bin := binary()}],
-    %% Built-in tools the server executes in-process, keyed by the
-    %% model-facing name. Empty unless an executor is registered.
     server_tools = #{} :: #{binary() => barrel_inference_server_tool_executor:spec()},
-    %% Agentic continue-loop state (engages only on a server_tools hit):
-    %% run the executors server-side and re-invoke with the results
-    %% appended, until the model answers without a server tool or the
-    %% cap is hit. Mirrors barrel_inference_server_h_responses.
     tool_iter = 0 :: non_neg_integer(),
     max_tool_iter = 5 :: pos_integer(),
     loop_request = undefined :: undefined | #barrel_inference_request{},
@@ -123,40 +76,36 @@
     exec_mon = undefined :: undefined | reference(),
     exec_tref = undefined :: undefined | reference(),
     agg_stats = #{} :: map(),
-    %% keepalive request_begin is refcounted; each loop round re-emits
-    %% {pipeline, loaded}, so only the first round begins.
     keepalive_begun = false :: boolean(),
-    %% Rendered prompt token ids for the current round, captured from
-    %% {pipeline, templated, _}. With Stats.generated on barrel_inference_done
-    %% they form the session's committed token-id list for the
-    %% byte-exact continuation path.
     prompt_token_ids = [] :: [non_neg_integer()]
 }).
 
 %%====================================================================
-%% init
+%% Entry points
 %%====================================================================
 
-init(Req0, Opts) ->
-    case cowboy_req:method(Req0) of
-        <<"POST">> -> handle_post(Req0, Opts);
-        _ -> reply_405(Req0)
+openai(Req) -> handle(Req, openai).
+legacy(Req) -> handle(Req, openai_legacy).
+
+handle(Req, Api) ->
+    case livery_req:method(Req) of
+        <<"POST">> -> handle_post(Req, Api);
+        _ -> livery_resp:json(405, json:encode(error_body(method_not_allowed, 405)))
     end.
 
-handle_post(Req0, Opts) ->
-    case barrel_inference_server_body:read(Req0) of
-        {ok, Body, Req1} -> fast_phase(Body, Req1, Opts);
-        {too_large, Req1} -> reply_json_error(413, request_too_large, Req1)
+handle_post(Req, Api) ->
+    case barrel_inference_server_body:read(Req) of
+        {ok, Body, Req1} -> fast_phase(Body, Api, Req1);
+        {too_large, _Req1} -> livery_resp:json(413, json:encode(error_body(request_too_large, 413)))
     end.
 
-fast_phase(Body, Req0, Opts) ->
-    Api = maps:get(api, Opts, openai),
+fast_phase(Body, Api, Req) ->
     case decode(Body) of
-        {ok, Map} -> translate(Map, Api, Req0);
-        error -> reply_json_error(400, invalid_json, Req0)
+        {ok, Map} -> translate(Map, Api, Req);
+        error -> livery_resp:json(400, json:encode(error_body(invalid_json, 400)))
     end.
 
-translate(Map, Api, Req0) ->
+translate(Map, Api, Req) ->
     Translated =
         case Api of
             openai_legacy ->
@@ -165,30 +114,53 @@ translate(Map, Api, Req0) ->
                 barrel_inference_server_translate:openai_chat_to_internal(Map)
         end,
     case Translated of
-        {ok, R} ->
-            R1 = R#barrel_inference_request{
-                session_id = barrel_inference_server_session:derive(Req0, R)
+        {ok, R0} ->
+            R1 = R0#barrel_inference_request{
+                session_id = barrel_inference_server_session:derive(Req, R0)
             },
-            start_pipeline(R1, Api, Req0);
+            start_inference(R1, Api);
         {error, Reason} ->
-            reply_json_error(400, Reason, Req0)
+            livery_resp:json(400, json:encode(error_body(Reason, 400)))
     end.
 
-start_pipeline(R0, Api, Req0) ->
+start_inference(R0, Api) ->
     Requested = R0#barrel_inference_request.model_id,
     Real = barrel_inference_server_config:resolve_model(Requested),
     R1 = R0#barrel_inference_request{model_id = Real},
-    {WorkerPid, Mon} = barrel_inference_server_pipeline:start_link(self(), R1),
-    State0 = init_state(R1, Requested, Api, WorkerPid, Mon),
-    State = arm_total_timer(State0),
-    {cowboy_loop, Req0, State, hibernate}.
+    case R1#barrel_inference_request.stream of
+        true ->
+            livery_resp:stream(
+                200,
+                sse_headers(),
+                fun(Emit) -> drive_stream(R1, Requested, Api, Emit) end
+            );
+        false ->
+            drive_buffered(R1, Requested, Api)
+    end.
 
-init_state(R, Requested, Api, Worker, Mon) ->
-    Stream =
-        case Api of
-            openai_legacy -> R#barrel_inference_request.stream;
-            _ -> R#barrel_inference_request.stream
+drive_stream(R, Requested, Api, Emit) ->
+    {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
+    State = init_state(R, Requested, Api, Worker, Mon, true),
+    State1 = arm_total_timer(State),
+    _ =
+        try
+            stream_loop(State1, Emit)
+        after
+            cleanup(State1)
         end,
+    ok.
+
+drive_buffered(R, Requested, Api) ->
+    {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
+    State = init_state(R, Requested, Api, Worker, Mon, false),
+    State1 = arm_total_timer(State),
+    try
+        buffered_loop(State1)
+    after
+        cleanup(State1)
+    end.
+
+init_state(R, Requested, Api, Worker, Mon, Stream) ->
     barrel_inference_server_metrics:inc_active_streams(R#barrel_inference_request.model_id),
     #st{
         req_id = R#barrel_inference_request.request_id,
@@ -199,14 +171,7 @@ init_state(R, Requested, Api, Worker, Mon) ->
         phase = waiting_load,
         worker = Worker,
         worker_mon = Mon,
-        engine_mon = undefined,
-        ref = undefined,
-        slot = undefined,
         started_mono = mono_ms(),
-        first_token_at = undefined,
-        prefill_tref = undefined,
-        idle_tref = undefined,
-        total_tref = undefined,
         out_tokens = 0,
         buf_text = [],
         buf_reason = [],
@@ -220,10 +185,6 @@ init_state(R, Requested, Api, Worker, Mon) ->
         loop_messages = R#barrel_inference_request.messages
     }.
 
-%% Whether the pipeline is going to install a grammar for this
-%% request. Determined by the presence of a non-empty tools array
-%% and a non-`none` tool_choice. Read at handler-init time, before
-%% the pipeline has actually built the GBNF.
 grammar_active(#barrel_inference_request{tools = Tools, tool_choice = TC}) ->
     case {Tools, TC} of
         {undefined, _} -> false;
@@ -233,168 +194,565 @@ grammar_active(#barrel_inference_request{tools = Tools, tool_choice = TC}) ->
     end.
 
 %%====================================================================
-%% info/3
+%% Streaming receive loop
 %%====================================================================
 
-%% --- pipeline progress ---
-info({pipeline, loading, _ModelId}, Req0, S0 = #st{stream = true}) ->
-    %% Long load: emit an SSE comment keepalive every tick. Opens
-    %% the stream on the first tick so cowboy + downstream clients
-    %% keep the connection alive.
-    {Req1, S1} = ensure_stream(Req0, S0),
-    ok = sse_comment(Req1, <<"loading">>),
-    {ok, Req1, S1, hibernate};
-info({pipeline, loading, _ModelId}, Req, S) ->
-    %% Non-streaming request: nothing to write yet; cowboy
-    %% idle_timeout (configured at the listener) is the safety net.
-    {ok, Req, S, hibernate};
-info({pipeline, loaded}, Req, S = #st{keepalive_begun = true}) ->
-    %% Later loop round re-loading; keepalive already counted.
-    {ok, Req, S#st{phase = waiting_template}, hibernate};
-info({pipeline, loaded}, Req, S) ->
-    ok = barrel_inference_server_keepalive:request_begin(S#st.model),
-    {ok, Req, S#st{phase = waiting_template, keepalive_begun = true}, hibernate};
-info({pipeline, templated, Tokens, ParamsRef}, Req, S) ->
-    {ok, Req,
-        S#st{
-            phase = waiting_queue,
-            prompt_token_ids = Tokens,
-            chat_params_ref = ParamsRef
-        },
-        hibernate};
-info({pipeline, queued}, Req, S) ->
-    {ok, Req, S#st{phase = waiting_admit}, hibernate};
-info({pipeline, admitted, Ref, Slot}, Req0, S0) ->
-    %% learn_ref/3 may have arrived ahead of us via a token message;
-    %% in that case phase/ref are already set and we just attach the
-    %% queue slot. Otherwise this is the canonical admit point.
-    S1 =
-        case S0#st.ref of
-            undefined -> arm_prefill_timer(S0#st{phase = running, ref = Ref});
-            _ -> S0
-        end,
-    S2 = monitor_engine(S1#st{slot = Slot}),
-    case S2#st.stream of
-        true ->
-            {Req1, S3} = ensure_stream(Req0, S2),
-            {ok, Req1, S3, hibernate};
-        false ->
-            {ok, Req0, S2, hibernate}
-    end;
-info({pipeline, error, Status, Reason}, Req0, S = #st{stream_started = true}) ->
-    %% Post-stream error: stream_reply has already gone out (loading
-    %% keepalive opened it). Emit an SSE error frame instead of JSON,
-    %% close the body, terminate the handler.
-    record_metrics(S, Status),
-    sse_event(Req0, <<"error">>, error_payload(Status, Reason)),
-    cowboy_req:stream_body(<<>>, fin, Req0),
-    {stop, Req0, S};
-info({pipeline, error, Status, Reason}, Req0, S) ->
-    record_metrics(S, Status),
-    Req1 = json_error(Status, Reason, Req0),
-    {stop, Req1, S};
-info(
-    {'DOWN', Mon, process, _Pid, _Reason},
-    Req0,
-    S = #st{engine_mon = Mon}
-) ->
-    %% Engine gen_statem crashed mid-inference. Same handling as
-    %% the messages handler: reroute to the pipeline-error path so
-    %% the client sees 500 model_crashed.
-    self() ! {pipeline, error, 500, model_crashed},
-    {ok, Req0, S#st{engine_mon = undefined}, hibernate};
-info(
-    {'DOWN', Mon, process, Worker, _Reason},
-    Req0,
-    S = #st{worker = Worker, worker_mon = Mon}
-) ->
-    case S#st.phase of
-        running ->
-            %% Worker exits normally right after sending
-            %% {pipeline, admitted}. The DOWN here is expected;
-            %% inference continues independently.
-            {ok, Req0, S#st{worker = undefined, worker_mon = undefined}, hibernate};
-        _ ->
-            Req1 = json_error(500, pipeline_crashed, Req0),
-            {stop, Req1, S}
-    end;
-%% --- token messages ---
-%% Token messages may arrive BEFORE {pipeline, admitted, ...} because
-%% the pipeline worker calls barrel_inference:infer/4 (which immediately
-%% starts decoding) and *then* sends `admitted` to the handler.
-%% Because the handler is per-request, any token message in our
-%% mailbox is necessarily ours; we don't need to match on Ref.
-info({barrel_inference_token, Ref, Tok}, Req0, S0) ->
-    {S, Req} = learn_ref(S0, Req0, Ref),
-    handle_token(Tok, Req, S);
-info({barrel_inference_reasoning_token, Ref, Tok}, Req0, S0) ->
-    {S, Req} = learn_ref(S0, Req0, Ref),
-    handle_reasoning(Tok, Req, S);
-info({barrel_inference_done, Ref, Stats}, Req0, S0) ->
-    {S, Req} = learn_ref(S0, Req0, Ref),
-    record_session_committed(S, Stats),
-    S1 = accumulate_stats(S, Stats),
-    case S1#st.pending_exec of
-        undefined ->
-            %% llama.cpp's autoparser (common_chat_parse) extracts
-            %% structured tool calls from the buffered response text
-            %% at done. Server-targeted calls continue the loop;
-            %% client-only calls finish with a tool_calls frame.
-            S2 = maybe_autoparser_extract(demonitor_engine(S1)),
-            dispatch_done(Req, S2);
-        _ ->
-            {ok, Req, demonitor_engine(S1), hibernate}
-    end;
-info({tool_exec_batch_result, Ref, Results}, Req, S = #st{pending_exec = #{batch_ref := Ref}}) ->
-    continue_after_tools(Results, Req, S);
-info({tool_exec_batch_result, _, _}, Req, S) ->
-    {ok, Req, S, hibernate};
-info({exec_timeout, Ref}, Req, S = #st{pending_exec = #{batch_ref := Ref}}) ->
-    continue_after_tools({error, executor_timeout}, Req, S);
-info({exec_timeout, _}, Req, S) ->
-    {ok, Req, S, hibernate};
-info({'DOWN', Mon, process, _Pid, normal}, Req, S = #st{exec_mon = Mon}) ->
-    {ok, Req, S#st{exec_mon = undefined}, hibernate};
-info({'DOWN', Mon, process, _Pid, Reason}, Req, S = #st{exec_mon = Mon, pending_exec = P}) when
-    P =/= undefined
+stream_loop(S, Emit) ->
+    receive
+        Msg -> dispatch_stream(Msg, S, Emit)
+    after stream_idle_timeout() -> S
+    end.
+
+dispatch_stream({pipeline, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
+dispatch_stream({pipeline, _, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
+dispatch_stream({pipeline, _, _, _} = M, S, Emit) ->
+    on_pipeline_stream(M, S, Emit);
+dispatch_stream({barrel_inference_token, Ref, Tok}, S, Emit) ->
+    on_stream_token(S, Ref, Tok, Emit);
+dispatch_stream({barrel_inference_reasoning_token, Ref, Tok}, S, Emit) ->
+    on_stream_reasoning(S, Ref, Tok, Emit);
+dispatch_stream({barrel_inference_done, Ref, Stats}, S, Emit) ->
+    on_stream_done(S, Ref, Stats, Emit);
+dispatch_stream({barrel_inference_error, Ref, Reason}, S, Emit) ->
+    on_stream_engine_error(S, Ref, Reason, Emit);
+dispatch_stream({tool_exec_batch_result, BR, Results}, S, Emit) when
+    is_map(S#st.pending_exec), map_get(batch_ref, S#st.pending_exec) =:= BR
 ->
-    continue_after_tools({error, {executor_crashed, Reason}}, Req, S);
-info({barrel_inference_error, Ref, Reason}, Req0, S0) ->
-    {S, Req} = learn_ref(S0, Req0, Ref),
-    finish_err(Req, demonitor_engine(S#st{received_done = true}), Reason);
-%% --- timeouts ---
-info({prefill_timeout, Ref}, Req, S = #st{ref = Ref}) ->
+    on_tool_results(Results, S, Emit, true);
+dispatch_stream({exec_timeout, BR}, S, Emit) when
+    is_map(S#st.pending_exec), map_get(batch_ref, S#st.pending_exec) =:= BR
+->
+    on_tool_results({error, executor_timeout}, S, Emit, true);
+dispatch_stream({'DOWN', Mon, process, _Pid, Reason}, S, Emit) when
+    Mon =:= S#st.engine_mon
+->
+    finish_stream_err(S#st{engine_mon = undefined}, model_crashed_from(Reason), Emit);
+dispatch_stream({'DOWN', Mon, process, _Pid, normal}, S, Emit) when
+    Mon =:= S#st.worker_mon
+->
+    stream_loop(S#st{worker = undefined, worker_mon = undefined}, Emit);
+dispatch_stream({'DOWN', Mon, process, _Pid, _Reason}, S, Emit) when
+    Mon =:= S#st.exec_mon
+->
+    stream_loop(S#st{exec_mon = undefined}, Emit);
+dispatch_stream({prefill_timeout, Ref}, S, Emit) when S#st.ref =:= Ref ->
     barrel_inference:cancel(Ref),
-    finish_err(Req, S, prefill_timeout);
-info({idle_timeout, Ref}, Req, S = #st{ref = Ref}) ->
+    finish_stream_err(S, prefill_timeout, Emit);
+dispatch_stream({idle_timeout, Ref}, S, Emit) when S#st.ref =:= Ref ->
     barrel_inference:cancel(Ref),
-    finish_err(Req, S, generation_idle_timeout);
-info(total_request_timeout, Req, S = #st{phase = running, ref = Ref}) when is_reference(Ref) ->
+    finish_stream_err(S, generation_idle_timeout, Emit);
+dispatch_stream(total_request_timeout, S, Emit) ->
+    on_total_timeout(S, Emit);
+dispatch_stream(_Other, S, Emit) ->
+    stream_loop(S, Emit).
+
+on_pipeline_stream({pipeline, loading, _M}, S, Emit) ->
+    case emit_raw(Emit, [<<": loading\n\n">>]) of
+        ok -> stream_loop(S#st{stream_started = true}, Emit);
+        closed -> S
+    end;
+on_pipeline_stream({pipeline, loaded}, S = #st{keepalive_begun = true}, Emit) ->
+    stream_loop(S#st{phase = waiting_template}, Emit);
+on_pipeline_stream({pipeline, loaded}, S, Emit) ->
+    ok = barrel_inference_server_keepalive:request_begin(S#st.model),
+    stream_loop(S#st{phase = waiting_template, keepalive_begun = true}, Emit);
+on_pipeline_stream({pipeline, templated, Tokens, ParamsRef}, S, Emit) ->
+    stream_loop(
+        S#st{phase = waiting_queue, prompt_token_ids = Tokens, chat_params_ref = ParamsRef},
+        Emit
+    );
+on_pipeline_stream({pipeline, queued}, S, Emit) ->
+    stream_loop(S#st{phase = waiting_admit}, Emit);
+on_pipeline_stream({pipeline, admitted, Ref, Slot}, S, Emit) ->
+    S1 = monitor_engine(arm_prefill_timer(S#st{phase = running, ref = Ref, slot = Slot})),
+    stream_loop(S1, Emit);
+on_pipeline_stream({pipeline, error, Status, Reason}, S, Emit) ->
+    record_metrics(S, Status),
+    Err = json:encode(error_body(Reason, Status)),
+    _ = emit_raw(Emit, [<<"data: ">>, Err, <<"\n\n">>, <<"data: [DONE]\n\n">>]),
+    S.
+
+on_stream_token(S0, Ref, Tok, Emit) ->
+    S = learn_ref(S0, Ref),
+    case handle_token_stream(Tok, S) of
+        {emit, Out, S1} ->
+            case emit_raw(Emit, Out) of
+                ok -> stream_loop(rearm_idle(S1), Emit);
+                closed -> S1
+            end;
+        {buffer, S1} ->
+            stream_loop(rearm_idle(S1), Emit)
+    end.
+
+handle_token_stream(Tok, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
+    case is_tool_first_byte(Tok) of
+        true ->
+            {buffer,
+                first_token(S#st{
+                    mode = tool_buffer, buf_text = [Tok], out_tokens = 1
+                })};
+        false ->
+            stream_text_first(Tok, first_token(S))
+    end;
+handle_token_stream(Tok, S = #st{mode = tool_buffer}) ->
+    {buffer, S#st{
+        buf_text = [S#st.buf_text | Tok],
+        out_tokens = S#st.out_tokens + 1
+    }};
+handle_token_stream(Tok, S = #st{out_tokens = 0}) ->
+    stream_text_first(Tok, first_token(S));
+handle_token_stream(Tok, S) ->
+    stream_text_more(Tok, S).
+
+stream_text_first(Tok, S) -> stream_text_more(Tok, S).
+stream_text_more(Tok, S) ->
+    Iolist = barrel_inference_server_translate:internal_to_openai_chat_chunk(
+        Tok, S#st.req_id, S#st.requested
+    ),
+    {emit, [<<"data: ">>, Iolist, <<"\n\n">>], S#st{out_tokens = S#st.out_tokens + 1}}.
+
+on_stream_reasoning(S0, Ref, Tok, Emit) ->
+    S = learn_ref(S0, Ref),
+    Iolist = barrel_inference_server_translate:internal_to_openai_reasoning_chunk(
+        Tok, S#st.req_id, S#st.requested
+    ),
+    case emit_raw(Emit, [<<"data: ">>, Iolist, <<"\n\n">>]) of
+        ok -> stream_loop(rearm_idle(S), Emit);
+        closed -> S
+    end.
+
+on_stream_done(S0, Ref, Stats, Emit) ->
+    S = learn_ref(S0, Ref),
+    record_session_committed(S, Stats),
+    S1 = demonitor_engine(accumulate_stats(S, Stats)),
+    S2 = maybe_autoparser_extract(S1),
+    dispatch_done_stream(S2, Emit).
+
+dispatch_done_stream(S = #st{captured_calls = []}, Emit) ->
+    maybe_legacy_tool_stream(S, Emit);
+dispatch_done_stream(S = #st{captured_calls = Calls0}, Emit) ->
+    Calls = cap_parallel(S, Calls0),
+    {ServerCalls, ClientCalls} = partition_calls(Calls, S#st.server_tools),
+    case ServerCalls of
+        [] -> finish_with_tool_calls_stream(S#st{received_done = true}, ClientCalls, Emit);
+        _ -> begin_server_tools_stream(ServerCalls, S, Emit)
+    end.
+
+maybe_legacy_tool_stream(S = #st{mode = tool_buffer, server_tools = ST}, Emit) when
+    map_size(ST) > 0
+->
+    {Name, Input} = parse_tool_call_to_map(iolist_to_binary(S#st.buf_text)),
+    case maps:find(Name, ST) of
+        {ok, _} ->
+            Call = #{
+                id => barrel_inference_server_translate:make_id(<<"call_">>),
+                name => Name,
+                input => Input,
+                full_bin => iolist_to_binary(S#st.buf_text)
+            },
+            begin_server_tools_stream([Call], S, Emit);
+        error ->
+            finish_stream_ok(S#st{received_done = true}, S#st.agg_stats, Emit)
+    end;
+maybe_legacy_tool_stream(S, Emit) ->
+    finish_stream_ok(S#st{received_done = true}, S#st.agg_stats, Emit).
+
+finish_stream_ok(S = #st{mode = text}, Stats, Emit) ->
+    Final = barrel_inference_server_translate:internal_to_openai_chat_final(
+        Stats, S#st.req_id, S#st.requested
+    ),
+    Frames = [
+        <<"data: ">>,
+        Final,
+        <<"\n\n">>,
+        usage_chunk(S, Stats),
+        <<"data: [DONE]\n\n">>
+    ],
+    _ = emit_raw(Emit, Frames),
+    record_success(S, Stats),
+    S;
+finish_stream_ok(S = #st{mode = tool_buffer}, Stats, Emit) ->
+    ToolStats = maps:put(finish_reason, tool_call, Stats),
+    First = openai_tool_call_chunk(S, iolist_to_binary(S#st.buf_text)),
+    Stop = barrel_inference_server_translate:internal_to_openai_chat_final(
+        ToolStats, S#st.req_id, S#st.requested
+    ),
+    Frames = [
+        <<"data: ">>,
+        First,
+        <<"\n\n">>,
+        <<"data: ">>,
+        Stop,
+        <<"\n\n">>,
+        usage_chunk(S, ToolStats),
+        <<"data: [DONE]\n\n">>
+    ],
+    _ = emit_raw(Emit, Frames),
+    record_success(S, Stats),
+    S.
+
+finish_with_tool_calls_stream(S, Calls, Emit) ->
+    ToolStats = maps:put(finish_reason, tool_call, S#st.agg_stats),
+    First = openai_tool_calls_chunk(S, Calls),
+    Stop = barrel_inference_server_translate:internal_to_openai_chat_final(
+        ToolStats, S#st.req_id, S#st.requested
+    ),
+    Frames = [
+        <<"data: ">>,
+        First,
+        <<"\n\n">>,
+        <<"data: ">>,
+        Stop,
+        <<"\n\n">>,
+        usage_chunk(S, ToolStats),
+        <<"data: [DONE]\n\n">>
+    ],
+    _ = emit_raw(Emit, Frames),
+    record_success(S, ToolStats),
+    S.
+
+finish_stream_err(S, Reason, Emit) ->
+    Status = http_status(Reason),
+    Err = json:encode(error_body(Reason, Status)),
+    _ = emit_raw(Emit, [<<"data: ">>, Err, <<"\n\n">>, <<"data: [DONE]\n\n">>]),
+    record_error(S, Reason),
+    S.
+
+on_stream_engine_error(S0, Ref, Reason, Emit) ->
+    S = learn_ref(S0, Ref),
+    finish_stream_err(demonitor_engine(S#st{received_done = true}), Reason, Emit).
+
+on_total_timeout(S = #st{ref = Ref}, Emit) when is_reference(Ref) ->
     barrel_inference:cancel(Ref),
-    finish_err(Req, S, total_timeout);
-info(total_request_timeout, Req0, S) ->
-    %% Fired before admission. No SSE has started; reply with a JSON
-    %% 504 and let terminate/3 clean up the worker.
-    Req1 = json_error(504, total_timeout, Req0),
-    record_metrics(S, 504),
-    {stop, Req1, S};
-%% barrel_inference 0.2.0 emits a token-id message alongside every token text
-%% message. We do not consume it.
-info({barrel_inference_token_id, _Ref, _Id}, Req, S) ->
-    {ok, Req, S, hibernate};
-%% --- catch-all (stale messages from a previous request, etc) ---
-info(_Msg, Req, S) ->
-    {ok, Req, S, hibernate}.
+    finish_stream_err(S, total_timeout, Emit);
+on_total_timeout(S, Emit) ->
+    finish_stream_err(S, total_timeout, Emit).
+
+%% Re-enter inference for the continue-loop on the same handler process.
+on_tool_results(Outcome, S0, Emit, true) ->
+    #{calls := Calls} = S0#st.pending_exec,
+    S = clear_pending(S0),
+    Iter = S#st.tool_iter + 1,
+    case Iter >= S#st.max_tool_iter of
+        true ->
+            Stats = maps:put(finish_reason, length, S#st.agg_stats),
+            finish_stream_ok(
+                S#st{
+                    received_done = true,
+                    tool_iter = Iter,
+                    mode = text,
+                    buf_text = []
+                },
+                Stats,
+                Emit
+            );
+        false ->
+            S1 = restart_round(Calls, Outcome, S),
+            stream_loop(S1, Emit)
+    end.
+
+restart_round(Calls, Outcome, S) ->
+    NewMessages = S#st.loop_messages ++ tool_round_messages(Calls, Outcome),
+    ContReq = (S#st.loop_request)#barrel_inference_request{messages = NewMessages},
+    release_slot(S),
+    {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), ContReq),
+    S#st{
+        tool_iter = S#st.tool_iter + 1,
+        loop_messages = NewMessages,
+        worker = Worker,
+        worker_mon = Mon,
+        phase = waiting_load,
+        ref = undefined,
+        slot = undefined,
+        mode = text,
+        buf_text = [],
+        out_tokens = 0,
+        captured_calls = [],
+        first_token_at = undefined
+    }.
+
+begin_server_tools_stream(ServerCalls, S, Emit) ->
+    S1 = begin_server_tools_common(ServerCalls, S),
+    stream_loop(S1, Emit).
+
+begin_server_tools_common(ServerCalls, S) ->
+    Ctx = #{
+        model => S#st.model,
+        request_id => S#st.req_id,
+        session_id => S#st.session_id
+    },
+    Batch = [
+        #{
+            call_id => Id,
+            spec => maps:get(Name, S#st.server_tools),
+            name => Name,
+            args => Input,
+            full_bin => FullBin
+        }
+     || #{id := Id, name := Name, input := Input, full_bin := FullBin} <- ServerCalls
+    ],
+    {_Pid, Mon, BatchRef} = barrel_inference_server_tool_batch:spawn_batch(Batch, Ctx),
+    TRef = erlang:send_after(exec_timeout_ms(), self(), {exec_timeout, BatchRef}),
+    Pending = #{batch_ref => BatchRef, calls => Batch},
+    cancel_timer(S#st.idle_tref),
+    S#st{
+        pending_exec = Pending,
+        exec_mon = Mon,
+        exec_tref = TRef,
+        idle_tref = undefined,
+        captured_calls = []
+    }.
 
 %%====================================================================
-%% terminate
+%% Buffered (non-stream) receive loop
 %%====================================================================
 
-terminate(_Reason, _Req, S = #st{}) ->
-    cleanup(S),
+buffered_loop(S) ->
+    receive
+        Msg -> dispatch_buffered(Msg, S)
+    after stream_idle_timeout() ->
+        livery_resp:json(504, json:encode(error_body(idle_timeout, 504)))
+    end.
+
+dispatch_buffered({pipeline, _} = M, S) ->
+    on_pipeline_buffered(M, S);
+dispatch_buffered({pipeline, _, _} = M, S) ->
+    on_pipeline_buffered(M, S);
+dispatch_buffered({pipeline, _, _, _} = M, S) ->
+    on_pipeline_buffered(M, S);
+dispatch_buffered({barrel_inference_token, Ref, Tok}, S) ->
+    S1 = learn_ref(S, Ref),
+    {cont, S2} = handle_token_buffered(Tok, S1),
+    buffered_loop(rearm_idle(S2));
+dispatch_buffered({barrel_inference_reasoning_token, Ref, Tok}, S) ->
+    S1 = learn_ref(S, Ref),
+    buffered_loop(rearm_idle(S1#st{buf_reason = [S1#st.buf_reason | Tok]}));
+dispatch_buffered({barrel_inference_done, Ref, Stats}, S) ->
+    on_done_buffered(learn_ref(S, Ref), Stats);
+dispatch_buffered({barrel_inference_error, _Ref, Reason}, S) ->
+    record_error(S, Reason),
+    finish_err_buffered(Reason);
+dispatch_buffered({tool_exec_batch_result, BR, Results}, S) when
+    is_map(S#st.pending_exec), map_get(batch_ref, S#st.pending_exec) =:= BR
+->
+    on_tool_results_buffered(Results, S);
+dispatch_buffered({exec_timeout, BR}, S) when
+    is_map(S#st.pending_exec), map_get(batch_ref, S#st.pending_exec) =:= BR
+->
+    on_tool_results_buffered({error, executor_timeout}, S);
+dispatch_buffered({'DOWN', Mon, process, _Pid, normal}, S) when
+    Mon =:= S#st.worker_mon
+->
+    buffered_loop(S#st{worker = undefined, worker_mon = undefined});
+dispatch_buffered({'DOWN', Mon, process, _Pid, _R}, S) when
+    Mon =:= S#st.exec_mon
+->
+    buffered_loop(S#st{exec_mon = undefined});
+dispatch_buffered({prefill_timeout, Ref}, S) when S#st.ref =:= Ref ->
+    barrel_inference:cancel(Ref),
+    finish_err_buffered(prefill_timeout);
+dispatch_buffered({idle_timeout, Ref}, S) when S#st.ref =:= Ref ->
+    barrel_inference:cancel(Ref),
+    finish_err_buffered(generation_idle_timeout);
+dispatch_buffered(total_request_timeout, S) ->
+    case S#st.ref of
+        Ref when is_reference(Ref) -> barrel_inference:cancel(Ref);
+        _ -> ok
+    end,
+    finish_err_buffered(total_timeout);
+dispatch_buffered(_Other, S) ->
+    buffered_loop(S).
+
+on_pipeline_buffered({pipeline, loading, _M}, S) ->
+    buffered_loop(S);
+on_pipeline_buffered({pipeline, loaded}, S = #st{keepalive_begun = true}) ->
+    buffered_loop(S#st{phase = waiting_template});
+on_pipeline_buffered({pipeline, loaded}, S) ->
+    ok = barrel_inference_server_keepalive:request_begin(S#st.model),
+    buffered_loop(S#st{phase = waiting_template, keepalive_begun = true});
+on_pipeline_buffered({pipeline, templated, Tokens, ParamsRef}, S) ->
+    buffered_loop(S#st{
+        phase = waiting_queue, prompt_token_ids = Tokens, chat_params_ref = ParamsRef
+    });
+on_pipeline_buffered({pipeline, queued}, S) ->
+    buffered_loop(S#st{phase = waiting_admit});
+on_pipeline_buffered({pipeline, admitted, Ref, Slot}, S) ->
+    S1 = monitor_engine(arm_prefill_timer(S#st{phase = running, ref = Ref, slot = Slot})),
+    buffered_loop(S1);
+on_pipeline_buffered({pipeline, error, Status, Reason}, _S) ->
+    livery_resp:json(Status, json:encode(error_body(Reason, Status))).
+
+handle_token_buffered(Tok, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
+    case is_tool_first_byte(Tok) of
+        true ->
+            {cont,
+                first_token(S#st{
+                    mode = tool_buffer, buf_text = [Tok], out_tokens = 1
+                })};
+        false ->
+            {cont,
+                first_token(S#st{
+                    buf_text = [S#st.buf_text | Tok], out_tokens = 1
+                })}
+    end;
+handle_token_buffered(Tok, S = #st{out_tokens = 0}) ->
+    {cont,
+        first_token(S#st{
+            buf_text = [S#st.buf_text | Tok], out_tokens = 1
+        })};
+handle_token_buffered(Tok, S) ->
+    {cont, S#st{
+        buf_text = [S#st.buf_text | Tok], out_tokens = S#st.out_tokens + 1
+    }}.
+
+on_done_buffered(S0, Stats) ->
+    record_session_committed(S0, Stats),
+    S1 = demonitor_engine(accumulate_stats(S0, Stats)),
+    S2 = maybe_autoparser_extract(S1),
+    dispatch_done_buffered(S2).
+
+dispatch_done_buffered(S = #st{captured_calls = []}) ->
+    maybe_legacy_tool_buffered(S);
+dispatch_done_buffered(S = #st{captured_calls = Calls0}) ->
+    Calls = cap_parallel(S, Calls0),
+    {ServerCalls, ClientCalls} = partition_calls(Calls, S#st.server_tools),
+    case ServerCalls of
+        [] -> finish_with_tool_calls_buffered(S#st{received_done = true}, ClientCalls);
+        _ -> begin_server_tools_buffered(ServerCalls, S)
+    end.
+
+maybe_legacy_tool_buffered(S = #st{mode = tool_buffer, server_tools = ST}) when
+    map_size(ST) > 0
+->
+    {Name, Input} = parse_tool_call_to_map(iolist_to_binary(S#st.buf_text)),
+    case maps:find(Name, ST) of
+        {ok, _} ->
+            Call = #{
+                id => barrel_inference_server_translate:make_id(<<"call_">>),
+                name => Name,
+                input => Input,
+                full_bin => iolist_to_binary(S#st.buf_text)
+            },
+            begin_server_tools_buffered([Call], S);
+        error ->
+            finish_ok_buffered(S#st{received_done = true}, S#st.agg_stats)
+    end;
+maybe_legacy_tool_buffered(S) ->
+    finish_ok_buffered(S#st{received_done = true}, S#st.agg_stats).
+
+finish_ok_buffered(S = #st{api = Api}, Stats) ->
+    Text = iolist_to_binary(S#st.buf_text),
+    Body =
+        case Api of
+            openai_legacy ->
+                barrel_inference_server_translate:internal_to_openai_completion_response(
+                    Text, Stats, S#st.requested
+                );
+            _ ->
+                barrel_inference_server_translate:internal_to_openai_chat_response(
+                    Text, Stats, S#st.requested
+                )
+        end,
+    record_success(S, Stats),
+    livery_resp:json(200, json:encode(Body)).
+
+finish_with_tool_calls_buffered(S, Calls) ->
+    Stats = maps:put(finish_reason, tool_call, S#st.agg_stats),
+    Body = barrel_inference_server_translate:internal_to_openai_chat_tool_calls_response(
+        Calls, Stats, S#st.requested
+    ),
+    record_success(S, Stats),
+    livery_resp:json(200, json:encode(Body)).
+
+finish_err_buffered(Reason) ->
+    Status = http_status(Reason),
+    livery_resp:json(Status, json:encode(error_body(Reason, Status))).
+
+begin_server_tools_buffered(ServerCalls, S) ->
+    S1 = begin_server_tools_common(ServerCalls, S),
+    buffered_loop(S1).
+
+on_tool_results_buffered(Outcome, S0) ->
+    #{calls := Calls} = S0#st.pending_exec,
+    S = clear_pending(S0),
+    Iter = S#st.tool_iter + 1,
+    case Iter >= S#st.max_tool_iter of
+        true ->
+            Stats = maps:put(finish_reason, length, S#st.agg_stats),
+            finish_ok_buffered(
+                S#st{received_done = true, tool_iter = Iter, mode = text, buf_text = []},
+                Stats
+            );
+        false ->
+            buffered_loop(restart_round(Calls, Outcome, S))
+    end.
+
+%%====================================================================
+%% Shared helpers
+%%====================================================================
+
+learn_ref(S = #st{ref = undefined}, Ref) ->
+    arm_prefill_timer(S#st{phase = running, ref = Ref});
+learn_ref(S, _Ref) ->
+    S.
+
+first_token(S = #st{first_token_at = undefined}) ->
+    Now = mono_ms(),
+    PrefillSec = (Now - S#st.started_mono) / 1000.0,
+    barrel_inference_server_metrics:observe_prefill(S#st.model, PrefillSec),
+    cancel_timer(S#st.prefill_tref),
+    arm_idle_timer(S#st{first_token_at = Now, prefill_tref = undefined});
+first_token(S) ->
+    rearm_idle(S).
+
+arm_prefill_timer(S = #st{ref = undefined}) ->
+    S;
+arm_prefill_timer(S = #st{ref = Ref}) ->
+    Ms = barrel_inference_server_config:prefill_ms(),
+    S#st{prefill_tref = erlang:send_after(Ms, self(), {prefill_timeout, Ref})}.
+
+arm_idle_timer(S) -> rearm_idle(S).
+
+rearm_idle(S) ->
+    cancel_timer(S#st.idle_tref),
+    case S#st.ref of
+        undefined ->
+            S;
+        Ref ->
+            Ms = barrel_inference_server_config:generation_idle_ms(),
+            S#st{idle_tref = erlang:send_after(Ms, self(), {idle_timeout, Ref})}
+    end.
+
+arm_total_timer(S) ->
+    Ms = total_ms(),
+    S#st{total_tref = erlang:send_after(Ms, self(), total_request_timeout)}.
+
+total_ms() ->
+    case barrel_inference_server_config:total_ms() of
+        N when is_integer(N), N > 0 -> N;
+        _ -> 1800000
+    end.
+
+cancel_timer(undefined) ->
     ok;
-terminate(_Reason, _Req, _) ->
+cancel_timer(Ref) ->
+    _ = erlang:cancel_timer(Ref),
     ok.
+
+monitor_engine(S = #st{engine_mon = Mon}) when is_reference(Mon) -> S;
+monitor_engine(S = #st{model = Model}) ->
+    case barrel_inference_registry:whereis_name(Model) of
+        undefined -> S;
+        Pid when is_pid(Pid) -> S#st{engine_mon = erlang:monitor(process, Pid)}
+    end.
+
+demonitor_engine(S = #st{engine_mon = Mon}) when is_reference(Mon) ->
+    _ = erlang:demonitor(Mon, [flush]),
+    S#st{engine_mon = undefined};
+demonitor_engine(S) ->
+    S.
 
 cleanup(S) ->
     cancel_timer(S#st.prefill_tref),
@@ -414,23 +772,13 @@ cleanup(S) ->
         Ref when is_reference(Ref) -> barrel_inference:cancel(Ref);
         _ -> ok
     end,
-    case S#st.slot of
-        undefined -> ok;
-        Slot -> barrel_inference_server_queue:release(S#st.model, Slot)
-    end,
-    case S#st.grammar_set of
-        %% cleared by barrel_inference_model on finish_request
-        true -> ok;
-        false -> ok
-    end,
-    %% Cancelled mid-flight: free the pinned session so the next
-    %% request can admit. Naturally-completed turns leave the session
-    %% alive for cross-turn KV reuse. Mirrors barrel_inference_server_h_messages.
+    release_slot(S),
     maybe_end_session(S),
-    %% Decrement the keepalive active count. If this was the last
-    %% request, the model enters the keep-alive grace window.
     keepalive_release(S),
     barrel_inference_server_metrics:dec_active_streams(S#st.model).
+
+release_slot(#st{slot = undefined}) -> ok;
+release_slot(#st{model = Model, slot = Slot}) -> barrel_inference_server_queue:release(Model, Slot).
 
 maybe_end_session(#st{received_done = true}) ->
     ok;
@@ -445,16 +793,6 @@ maybe_end_session(#st{model = Model, session_id = SessionId}) ->
     barrel_inference_server_session_state:delete(Model, SessionId),
     ok.
 
-record_session_committed(#st{session_id = undefined}, _) ->
-    ok;
-record_session_committed(
-    #st{model = Model, session_id = SessionId, prompt_token_ids = Prompt}, Stats
-) ->
-    barrel_inference_server_session_state:record(Model, SessionId, Prompt, Stats).
-
-%% Balance request_begin iff it ran. Keying off `keepalive_begun`
-%% (not phase) is correct under the loop, where a re-load round resets
-%% phase to waiting_load while the begin is still outstanding.
 keepalive_release(#st{keepalive_begun = false}) ->
     ok;
 keepalive_release(#st{model = Model}) ->
@@ -462,537 +800,48 @@ keepalive_release(#st{model = Model}) ->
         Model, barrel_inference_server_config:keep_alive_default_ms()
     ).
 
-%%====================================================================
-%% Token handling
-%%====================================================================
-
-handle_token(Tok, Req, S = #st{out_tokens = 0, mode = text, grammar_set = true}) ->
-    %% First token of a grammar-mode request. If it starts with `{`,
-    %% switch to tool_buffer mode so the JSON output is emitted as a
-    %% single tool_calls chunk at the end rather than streamed as
-    %% assistant text.
-    case is_tool_first_byte(Tok) of
-        true ->
-            S1 = first_token(S),
-            {ok, Req,
-                rearm_idle(S1#st{
-                    mode = tool_buffer,
-                    buf_text = [Tok],
-                    out_tokens = 1
-                }), hibernate};
-        false ->
-            emit_text(Tok, Req, first_token(S))
-    end;
-handle_token(Tok, Req, S = #st{mode = tool_buffer}) ->
-    %% Continue buffering JSON. No flush.
-    {ok, Req,
-        rearm_idle(S#st{
-            buf_text = [S#st.buf_text | Tok],
-            out_tokens = S#st.out_tokens + 1
-        }), hibernate};
-handle_token(Tok, Req, S = #st{mode = text, out_tokens = 0}) ->
-    emit_text(Tok, Req, first_token(S));
-handle_token(Tok, Req, S = #st{mode = text}) ->
-    emit_text(Tok, Req, S).
-
-emit_text(Tok, Req, S) ->
-    {ok, Req, rearm_idle(stream_text(Tok, Req, S)), hibernate}.
-
-%% Emit one text fragment (chunk or buffer) and return the updated state -
-%% the reusable core of emit_text, also used for the scanner's {text,_}.
-stream_text(<<>>, _Req, S) ->
-    S;
-stream_text(Tok, Req, S = #st{stream = true}) ->
-    Iolist = barrel_inference_server_translate:internal_to_openai_chat_chunk(
-        Tok, S#st.req_id, S#st.requested
-    ),
-    cowboy_req:stream_body([<<"data: ">>, Iolist, <<"\n\n">>], nofin, Req),
-    S#st{out_tokens = S#st.out_tokens + 1};
-stream_text(Tok, _Req, S = #st{stream = false}) ->
-    S#st{buf_text = [S#st.buf_text | Tok], out_tokens = S#st.out_tokens + 1}.
-
-handle_reasoning(Tok, Req, S = #st{stream = true}) ->
-    Iolist = barrel_inference_server_translate:internal_to_openai_reasoning_chunk(
-        Tok, S#st.req_id, S#st.requested
-    ),
-    cowboy_req:stream_body([<<"data: ">>, Iolist, <<"\n\n">>], nofin, Req),
-    {ok, Req, rearm_idle(S), hibernate};
-handle_reasoning(Tok, Req, S = #st{stream = false}) ->
-    {ok, Req, rearm_idle(S#st{buf_reason = [S#st.buf_reason | Tok]}), hibernate}.
-
-%%====================================================================
-%% Finish
-%%====================================================================
-
-finish_ok(Req0, S = #st{stream = true, mode = text}, Stats) ->
-    Final = barrel_inference_server_translate:internal_to_openai_chat_final(
-        Stats, S#st.req_id, S#st.requested
-    ),
-    cowboy_req:stream_body(
-        [<<"data: ">>, Final, <<"\n\n">>, usage_chunk(S, Stats), <<"data: [DONE]\n\n">>],
-        fin,
-        Req0
-    ),
-    record_success(S, Stats),
-    {stop, Req0, S};
-finish_ok(Req0, S = #st{stream = true, mode = tool_buffer}, Stats) ->
-    %% Emit one chat.completion.chunk with tool_calls populated, then
-    %% [DONE]. v0.1 packs the entire JSON into a single delta entry.
-    ToolStats = maps:put(finish_reason, tool_call, Stats),
-    Final = openai_tool_call_chunk(S, iolist_to_binary(S#st.buf_text)),
-    Stop = barrel_inference_server_translate:internal_to_openai_chat_final(
-        ToolStats,
-        S#st.req_id,
-        S#st.requested
-    ),
-    cowboy_req:stream_body(
-        [
-            <<"data: ">>,
-            Final,
-            <<"\n\n">>,
-            <<"data: ">>,
-            Stop,
-            <<"\n\n">>,
-            usage_chunk(S, ToolStats),
-            <<"data: [DONE]\n\n">>
-        ],
-        fin,
-        Req0
-    ),
-    record_success(S, Stats),
-    {stop, Req0, S};
-finish_ok(Req0, S = #st{stream = false, api = Api}, Stats) ->
-    Text = iolist_to_binary(S#st.buf_text),
-    Body =
-        case Api of
-            openai_legacy ->
-                barrel_inference_server_translate:internal_to_openai_completion_response(
-                    Text, Stats, S#st.requested
-                );
-            _ ->
-                barrel_inference_server_translate:internal_to_openai_chat_response(
-                    Text, Stats, S#st.requested
-                )
-        end,
-    Req1 = cowboy_req:reply(
-        200,
-        #{<<"content-type">> => <<"application/json">>},
-        json:encode(Body),
-        Req0
-    ),
-    record_success(S, Stats),
-    {stop, Req1, S}.
-
-finish_err(Req0, S = #st{stream = true}, Reason) ->
-    %% Route through the same status/type/code mapping as the non-stream
-    %% path so a recovered decode_failed surfaces as a retryable error
-    %% (not a generic server_error).
-    Err = json:encode(#{
-        <<"error">> => #{
-            <<"message">> => error_message(Reason),
-            <<"type">> => error_type(http_status(Reason)),
-            <<"code">> => error_code(Reason)
-        }
-    }),
-    cowboy_req:stream_body(
-        [<<"data: ">>, Err, <<"\n\n">>, <<"data: [DONE]\n\n">>],
-        fin,
-        Req0
-    ),
-    record_error(S, Reason),
-    {stop, Req0, S};
-finish_err(Req0, S = #st{stream = false}, Reason) ->
-    Status = http_status(Reason),
-    Req1 = json_error(Status, Reason, Req0),
-    record_error(S, Reason),
-    {stop, Req1, S}.
-
-%%====================================================================
-%% Timers and metrics
-%%====================================================================
-
-first_token(S = #st{first_token_at = undefined}) ->
-    Now = mono_ms(),
-    PrefillSec = (Now - S#st.started_mono) / 1000.0,
-    barrel_inference_server_metrics:observe_prefill(S#st.model, PrefillSec),
-    cancel_timer(S#st.prefill_tref),
-    arm_idle_timer(S#st{first_token_at = Now, prefill_tref = undefined});
-first_token(S) ->
-    rearm_idle(S).
-
-arm_prefill_timer(S) ->
-    Ms = barrel_inference_server_config:prefill_ms(),
-    case S#st.ref of
-        undefined ->
-            S;
-        Ref ->
-            S#st{
-                prefill_tref = erlang:send_after(
-                    Ms,
-                    self(),
-                    {prefill_timeout, Ref}
-                )
-            }
-    end.
-
-arm_idle_timer(S) ->
-    rearm_idle(S).
-
-rearm_idle(S) ->
-    cancel_timer(S#st.idle_tref),
-    Ms = barrel_inference_server_config:generation_idle_ms(),
-    case S#st.ref of
-        undefined ->
-            S;
-        Ref ->
-            S#st{
-                idle_tref = erlang:send_after(
-                    Ms,
-                    self(),
-                    {idle_timeout, Ref}
-                )
-            }
-    end.
-
-%% Wall-clock timeout for the whole request. Armed at start_pipeline
-%% time with a Ref-free message so it can fire before admission too.
-arm_total_timer(S = #st{total_tref = undefined}) ->
-    Ms = total_ms(),
-    TRef = erlang:send_after(Ms, self(), total_request_timeout),
-    S#st{total_tref = TRef}.
-
-total_ms() ->
-    case barrel_inference_server_config:total_ms() of
-        N when is_integer(N), N > 0 -> N;
-        _ -> 1800000
-    end.
-
-%% Capture the inference Ref on the first token/done/error message
-%% if we have not seen `{pipeline, admitted, Ref, _}` yet. For
-%% streaming requests also call `stream_reply` here so a body chunk
-%% can be sent immediately. Idempotent when admit arrived first.
-learn_ref(S = #st{ref = undefined, stream = true}, Req0, Ref) ->
-    {Req1, S1} = ensure_stream(Req0, S),
-    S2 = arm_prefill_timer(S1#st{phase = running, ref = Ref}),
-    {S2, Req1};
-learn_ref(S = #st{ref = undefined}, Req0, Ref) ->
-    {arm_prefill_timer(S#st{phase = running, ref = Ref}), Req0};
-learn_ref(S, Req, _Ref) ->
-    {S, Req}.
-
-%% Open the SSE stream exactly once. Subsequent calls are no-ops.
-ensure_stream(Req, S = #st{stream_started = true}) ->
-    {Req, S};
-ensure_stream(Req0, S) ->
-    Req1 = cowboy_req:stream_reply(200, sse_headers(), Req0),
-    {Req1, S#st{stream_started = true}}.
-
-sse_comment(Req, Text) ->
-    cowboy_req:stream_body([<<": ">>, Text, <<"\n\n">>], nofin, Req),
-    ok.
-
-sse_event(Req, EventName, JsonMap) ->
-    Frame = [
-        <<"event: ">>,
-        EventName,
-        <<"\n">>,
-        <<"data: ">>,
-        json:encode(JsonMap),
-        <<"\n\n">>
-    ],
-    cowboy_req:stream_body(Frame, nofin, Req),
-    ok.
-
-error_payload(Status, Reason) ->
-    #{
-        <<"error">> => #{
-            <<"status">> => Status,
-            <<"message">> => error_message(Reason)
-        }
-    }.
-
-%% Mirror of barrel_inference_server_h_messages: monitor the engine on admit
-%% so a NIF / gen_statem crash mid-inference surfaces cleanly.
-monitor_engine(S = #st{engine_mon = Mon}) when is_reference(Mon) ->
-    S;
-monitor_engine(S = #st{model = Model}) ->
-    case barrel_inference_registry:whereis_name(Model) of
-        undefined -> S;
-        Pid when is_pid(Pid) -> S#st{engine_mon = erlang:monitor(process, Pid)}
-    end.
-
-demonitor_engine(S = #st{engine_mon = Mon}) when is_reference(Mon) ->
-    _ = erlang:demonitor(Mon, [flush]),
-    S#st{engine_mon = undefined};
-demonitor_engine(S) ->
-    S.
-
-cancel_timer(undefined) ->
+record_session_committed(#st{session_id = undefined}, _) ->
     ok;
-cancel_timer(Ref) ->
-    _ = erlang:cancel_timer(Ref),
-    ok.
-
-record_success(S, Stats) ->
-    record_metrics(S, 200, Stats),
-    barrel_inference_server_metrics:inc_prompt_tokens(
-        S#st.model,
-        maps:get(prompt_tokens, Stats, 0)
-    ),
-    barrel_inference_server_metrics:inc_completion_tokens(
-        S#st.model,
-        maps:get(completion_tokens, Stats, 0)
-    ),
-    case maps:get(generation_ms, Stats, 0) of
-        0 ->
-            ok;
-        Ms ->
-            Tokens = maps:get(completion_tokens, Stats, 0),
-            case Tokens > 0 of
-                true ->
-                    Tps = (Tokens * 1000) / Ms,
-                    barrel_inference_server_metrics:observe_generation_tps(S#st.model, Tps);
-                false ->
-                    ok
-            end
-    end.
-
-record_error(S, _Reason) ->
-    record_metrics(S, 500).
-
-record_metrics(S, Status) -> record_metrics(S, Status, #{}).
-
-record_metrics(S, Status, Stats) ->
-    Now = mono_ms(),
-    Duration = (Now - S#st.started_mono) / 1000.0,
-    Endpoint =
-        case S#st.api of
-            openai_legacy -> <<"/v1/completions">>;
-            _ -> <<"/v1/chat/completions">>
-        end,
-    barrel_inference_server_metrics:record_request(
-        Endpoint, S#st.requested, integer_to_binary(Status), Duration
-    ),
-    %% Structured per-request log line. Mirrors the Anthropic handler:
-    %% Stats on 200 carries cache_hit_kind + cache_delta so operators
-    %% can measure cross-conversation prefix reuse from the daemon's
-    %% logs. Error paths pass an empty Stats; cache fields collapse to
-    %% defaults.
-    logger:notice(
-        maps:merge(
-            #{
-                event => openai_request,
-                endpoint => Endpoint,
-                model => S#st.requested,
-                status => Status,
-                duration_ms => round(Duration * 1000),
-                request_id => S#st.req_id
-            },
-            cache_log_fields(Stats)
-        )
+record_session_committed(S, Stats) ->
+    barrel_inference_server_session_state:record(
+        S#st.model, S#st.session_id, S#st.prompt_token_ids, Stats
     ).
 
-cache_log_fields(Stats) ->
-    Delta = maps:get(cache_delta, Stats, #{}),
-    #{
-        cache_hit_kind => maps:get(cache_hit_kind, Stats, undefined),
-        cache_read_tokens => maps:get(read, Delta, 0),
-        cache_created_tokens => maps:get(created, Delta, 0),
-        prompt_tokens => maps:get(prompt_tokens, Stats, 0)
+accumulate_stats(S, Stats) ->
+    S#st{agg_stats = merge_stats(S#st.agg_stats, Stats)}.
+
+merge_stats(A, B) ->
+    Sum = fun(K) -> maps:get(K, A, 0) + maps:get(K, B, 0) end,
+    (maps:merge(A, B))#{
+        prompt_tokens => Sum(prompt_tokens),
+        completion_tokens => Sum(completion_tokens),
+        prefill_ms => Sum(prefill_ms),
+        generation_ms => Sum(generation_ms)
     }.
 
-%%====================================================================
-%% Reply helpers
-%%====================================================================
-
-reply_405(Req0) ->
-    Req1 = cowboy_req:reply(405, #{}, <<>>, Req0),
-    {ok, Req1, undefined}.
-
-reply_json_error(Status, Reason, Req0) ->
-    Req1 = json_error(Status, Reason, Req0),
-    {ok, Req1, undefined}.
-
-json_error(Status, Reason, Req0) ->
-    Body = #{
-        <<"error">> => #{
-            <<"message">> => error_message(Reason),
-            <<"type">> => error_type(Status),
-            <<"code">> => error_code(Reason)
-        }
-    },
-    cowboy_req:reply(
-        Status,
-        #{<<"content-type">> => <<"application/json">>},
-        json:encode(Body),
-        Req0
-    ).
-
-%% Render `error.message' as a sentence rather than an Erlang term.
-%% OpenAI clients show the message verbatim, so a tuple printed with
-%% `~p' (`{context_overflow,4500,4096}') leaks Erlang syntax.
-error_message({context_overflow, Tokens, Ctx}) ->
-    iolist_to_binary(
-        io_lib:format(
-            "prompt is too long: ~B tokens > ~B maximum",
-            [Tokens, Ctx]
-        )
-    );
-error_message({error, {decode_failed, _}}) ->
-    error_message(decode_failed);
-error_message({decode_failed, _}) ->
-    error_message(decode_failed);
-error_message(decode_failed) ->
-    <<"the model was overloaded and could not process this request; please retry">>;
-error_message(Reason) ->
-    to_bin(Reason).
-
-%% Stable atom-style code for tooling; OpenAI uses these for retry /
-%% UX decisions (e.g. `context_length_exceeded' is well-known).
-error_code({context_overflow, _, _}) -> <<"context_length_exceeded">>;
-error_code({error, {decode_failed, _}}) -> <<"server_overloaded">>;
-error_code({decode_failed, _}) -> <<"server_overloaded">>;
-error_code(Reason) -> to_bin(Reason).
-
-error_type(400) -> <<"invalid_request_error">>;
-error_type(404) -> <<"invalid_request_error">>;
-error_type(429) -> <<"rate_limit_error">>;
-error_type(500) -> <<"server_error">>;
-error_type(503) -> <<"server_error">>;
-error_type(504) -> <<"server_error">>;
-error_type(_) -> <<"server_error">>.
-
-http_status(prefill_timeout) -> 504;
-http_status(generation_idle_timeout) -> 504;
-http_status(total_timeout) -> 504;
-http_status({error, {decode_failed, _}}) -> 503;
-http_status({decode_failed, _}) -> 503;
-http_status(_) -> 500.
-
-sse_headers() ->
-    #{
-        <<"content-type">> => <<"text/event-stream">>,
-        <<"cache-control">> => <<"no-cache">>,
-        <<"x-accel-buffering">> => <<"no">>
-    }.
-
-decode(Body) ->
-    try
-        case json:decode(Body) of
-            Map when is_map(Map) -> {ok, Map};
-            _ -> error
-        end
-    catch
-        _:_ -> error
-    end.
-
-to_bin(B) when is_binary(B) -> B;
-to_bin(A) when is_atom(A) -> atom_to_binary(A);
-to_bin(T) -> iolist_to_binary(io_lib:format("~p", [T])).
-
-mono_ms() -> erlang:monotonic_time(millisecond).
+clear_pending(S) ->
+    case S#st.exec_mon of
+        Mon when is_reference(Mon) -> erlang:demonitor(Mon, [flush]);
+        _ -> ok
+    end,
+    cancel_timer(S#st.exec_tref),
+    S#st{pending_exec = undefined, exec_mon = undefined, exec_tref = undefined}.
 
 %%====================================================================
-%% Tool-call buffering
+%% Tool-call helpers
 %%====================================================================
 
-is_tool_first_byte(<<>>) -> false;
-is_tool_first_byte(<<C, _/binary>>) when C =:= $\s; C =:= $\t; C =:= $\r; C =:= $\n -> false;
-is_tool_first_byte(<<${, _/binary>>) -> true;
-is_tool_first_byte(_) -> false.
+cap_parallel(#st{loop_request = #barrel_inference_request{parallel_tool_calls = false}}, Calls) ->
+    lists:sublist(Calls, 1);
+cap_parallel(_S, Calls) ->
+    Calls.
 
-%% Trailing `stream_options.include_usage` chunk + its `data:`
-%% framing, or empty iodata when the client didn't opt in. Slotted
-%% into the finish stream just before `[DONE]`.
-usage_chunk(#st{include_usage = false}, _Stats) ->
-    [];
-usage_chunk(S = #st{include_usage = true}, Stats) ->
-    Chunk = barrel_inference_server_translate:internal_to_openai_usage_chunk(
-        Stats, S#st.req_id, S#st.requested
-    ),
-    [<<"data: ">>, Chunk, <<"\n\n">>].
+partition_calls(Calls, ServerTools) ->
+    lists:partition(fun(#{name := N}) -> maps:is_key(N, ServerTools) end, Calls).
 
-%% N wire-captured client calls in one chunk delta (index 0..N-1).
-openai_tool_calls_chunk(S, Calls) ->
-    {Entries, _} = lists:mapfoldl(
-        fun(#{id := Id, name := Name, input := Input}, Ix) ->
-            {
-                #{
-                    <<"index">> => Ix,
-                    <<"id">> => Id,
-                    <<"type">> => <<"function">>,
-                    <<"function">> => #{
-                        <<"name">> => Name,
-                        <<"arguments">> => iolist_to_binary(json:encode(Input))
-                    }
-                },
-                Ix + 1
-            }
-        end,
-        0,
-        Calls
-    ),
-    Chunk = #{
-        <<"id">> => S#st.req_id,
-        <<"object">> => <<"chat.completion.chunk">>,
-        <<"created">> => erlang:system_time(second),
-        <<"model">> => S#st.requested,
-        <<"choices">> => [
-            #{
-                <<"index">> => 0,
-                <<"delta">> => #{
-                    <<"role">> => <<"assistant">>,
-                    <<"tool_calls">> => Entries
-                },
-                <<"finish_reason">> => null
-            }
-        ]
-    },
-    json:encode(Chunk).
-
-openai_tool_call_chunk(S, JsonBin) ->
-    {Name, ArgsJson, ToolId} = extract_tool_call(S, JsonBin),
-    Created = erlang:system_time(second),
-    Chunk = #{
-        <<"id">> => S#st.req_id,
-        <<"object">> => <<"chat.completion.chunk">>,
-        <<"created">> => Created,
-        <<"model">> => S#st.requested,
-        <<"choices">> => [
-            #{
-                <<"index">> => 0,
-                <<"delta">> => #{
-                    <<"role">> => <<"assistant">>,
-                    <<"tool_calls">> => [
-                        #{
-                            <<"index">> => 0,
-                            <<"id">> => ToolId,
-                            <<"type">> => <<"function">>,
-                            <<"function">> => #{
-                                <<"name">> => Name,
-                                <<"arguments">> => ArgsJson
-                            }
-                        }
-                    ]
-                },
-                <<"finish_reason">> => null
-            }
-        ]
-    },
-    json:encode(Chunk).
-
-%% Legacy first-byte path: parse the buffered JSON into a single
-%% tool_calls entry. (Wire-captured calls take the captured_calls path.)
-extract_tool_call(_S, JsonBin) ->
-    {Nm, Args} = parse_tool_call(JsonBin),
-    {Nm, Args, make_tool_id()}.
-
-%% Autoparser primary: llama.cpp's `common_chat_parse' extracts
-%% structured tool calls from the buffered response text using the
-%% per-request `ParamsRef' carried admit -> done.
-maybe_autoparser_extract(
-    S = #st{buf_text = BufText, chat_params_ref = ParamsRef}
-) when S#st.loop_request =/= undefined ->
+maybe_autoparser_extract(S = #st{buf_text = BufText, chat_params_ref = ParamsRef}) when
+    S#st.loop_request =/= undefined
+->
     case
         barrel_inference_server_autoparser:maybe_extract(
             ParamsRef, S#st.loop_request, BufText, openai
@@ -1014,125 +863,6 @@ parse_tool_call_to_map(JsonBin) when is_binary(JsonBin) ->
             {<<"unknown">>, #{}}
     catch
         _:_ -> {<<"unknown">>, #{}}
-    end.
-
-%%====================================================================
-%% Agentic continue-loop (server-executed built-in tools)
-%%====================================================================
-
-%% Dispatch the model's captured tool calls once generation is done.
-%% No wire calls -> the legacy first-byte path / plain finish. Else
-%% honour parallel_tool_calls, split the batch: any server-targeted call
-%% makes the turn CONTINUE (run all server calls concurrently, re-infer
-%% once); a server-free batch FINISHES with N client tool_calls.
-dispatch_done(Req, S = #st{captured_calls = []}) ->
-    maybe_legacy_server_tool(Req, S#st{received_done = true});
-dispatch_done(Req, S = #st{captured_calls = Calls0}) ->
-    Calls = cap_parallel(S, Calls0),
-    {ServerCalls, ClientCalls} = partition_calls(Calls, S#st.server_tools),
-    case ServerCalls of
-        [] -> finish_with_tool_calls(Req, S#st{received_done = true}, ClientCalls);
-        _ -> begin_server_tools(ServerCalls, Req, S)
-    end.
-
-cap_parallel(#st{loop_request = #barrel_inference_request{parallel_tool_calls = false}}, Calls) ->
-    lists:sublist(Calls, 1);
-cap_parallel(_S, Calls) ->
-    Calls.
-
-partition_calls(Calls, ServerTools) ->
-    lists:partition(fun(#{name := N}) -> maps:is_key(N, ServerTools) end, Calls).
-
-%% Legacy first-byte path: the buffered JSON names a single tool. If it
-%% is a server tool, run it and continue; else finish (text / one
-%% tool_calls chunk via finish_ok's tool_buffer clause).
-maybe_legacy_server_tool(Req, S = #st{mode = tool_buffer, server_tools = ST}) when
-    map_size(ST) > 0
-->
-    {Name, Input} = parse_tool_call_to_map(iolist_to_binary(S#st.buf_text)),
-    case maps:find(Name, ST) of
-        {ok, _ExecSpec} ->
-            Call = #{
-                id => barrel_inference_server_translate:make_id(<<"call_">>),
-                name => Name,
-                input => Input,
-                full_bin => iolist_to_binary(S#st.buf_text)
-            },
-            begin_server_tools([Call], Req, S);
-        error ->
-            finish_ok(Req, S#st{received_done = true}, S#st.agg_stats)
-    end;
-maybe_legacy_server_tool(Req, S) ->
-    finish_ok(Req, S#st{received_done = true}, S#st.agg_stats).
-
-%% Run all server-targeted calls concurrently off the handler process
-%% via one coordinator; results arrive as one {tool_exec_batch_result,
-%% BatchRef, _}.
-begin_server_tools(ServerCalls, Req, S) ->
-    Ctx = #{
-        model => S#st.model,
-        request_id => S#st.req_id,
-        session_id => S#st.session_id
-    },
-    Batch = [
-        #{
-            call_id => Id,
-            spec => maps:get(Name, S#st.server_tools),
-            name => Name,
-            args => Input,
-            full_bin => FullBin
-        }
-     || #{id := Id, name := Name, input := Input, full_bin := FullBin} <- ServerCalls
-    ],
-    {_Pid, Mon, BatchRef} = barrel_inference_server_tool_batch:spawn_batch(Batch, Ctx),
-    TRef = erlang:send_after(exec_timeout_ms(), self(), {exec_timeout, BatchRef}),
-    Pending = #{batch_ref => BatchRef, calls => Batch},
-    cancel_timer(S#st.idle_tref),
-    {ok, Req,
-        S#st{
-            pending_exec = Pending,
-            exec_mon = Mon,
-            exec_tref = TRef,
-            idle_tref = undefined,
-            captured_calls = []
-        },
-        hibernate}.
-
-%% All server-tool results are in (or the batch failed); fold every
-%% (assistant call, tool result) pair into the conversation and
-%% re-invoke ONCE on the warm session path.
-continue_after_tools(Outcome, Req, S0) ->
-    #{calls := Calls} = S0#st.pending_exec,
-    S = clear_pending(S0),
-    Iter = S#st.tool_iter + 1,
-    case Iter >= S#st.max_tool_iter of
-        true ->
-            Stats = maps:put(finish_reason, length, S#st.agg_stats),
-            finish_ok(
-                Req,
-                S#st{received_done = true, tool_iter = Iter, mode = text, buf_text = []},
-                Stats
-            );
-        false ->
-            NewMessages = S#st.loop_messages ++ tool_round_messages(Calls, Outcome),
-            ContReq = (S#st.loop_request)#barrel_inference_request{messages = NewMessages},
-            release_slot(S),
-            {WorkerPid, Mon} = barrel_inference_server_pipeline:start_link(self(), ContReq),
-            S2 = S#st{
-                tool_iter = Iter,
-                loop_messages = NewMessages,
-                worker = WorkerPid,
-                worker_mon = Mon,
-                phase = waiting_load,
-                ref = undefined,
-                slot = undefined,
-                mode = text,
-                buf_text = [],
-                out_tokens = 0,
-                captured_calls = [],
-                first_token_at = undefined
-            },
-            {ok, Req, S2, hibernate}
     end.
 
 tool_round_messages(_Calls, Results) when is_list(Results) ->
@@ -1160,83 +890,78 @@ round_pair(CallId, FullBin, ResultJson) ->
         }
     ].
 
-%% Surface every client tool call as a tool_calls entry and finish
-%% (finish_reason = tool_calls). Streaming emits one chunk whose delta
-%% carries N entries (index 0..N-1) then the final chunk; non-streaming
-%% returns them in one response body.
-finish_with_tool_calls(Req0, S = #st{stream = true}, Calls) ->
-    ToolStats = maps:put(finish_reason, tool_call, S#st.agg_stats),
-    Final = openai_tool_calls_chunk(S, Calls),
-    Stop = barrel_inference_server_translate:internal_to_openai_chat_final(
-        ToolStats, S#st.req_id, S#st.requested
-    ),
-    cowboy_req:stream_body(
-        [
-            <<"data: ">>,
-            Final,
-            <<"\n\n">>,
-            <<"data: ">>,
-            Stop,
-            <<"\n\n">>,
-            usage_chunk(S, ToolStats),
-            <<"data: [DONE]\n\n">>
-        ],
-        fin,
-        Req0
-    ),
-    record_success(S, ToolStats),
-    {stop, Req0, S};
-finish_with_tool_calls(Req0, S = #st{stream = false}, Calls) ->
-    Stats = maps:put(finish_reason, tool_call, S#st.agg_stats),
-    Body = barrel_inference_server_translate:internal_to_openai_chat_tool_calls_response(
-        Calls, Stats, S#st.requested
-    ),
-    Req1 = cowboy_req:reply(
-        200,
-        #{<<"content-type">> => <<"application/json">>},
-        json:encode(Body),
-        Req0
-    ),
-    record_success(S, Stats),
-    {stop, Req1, S}.
-
-clear_pending(S) ->
-    case S#st.exec_mon of
-        Mon when is_reference(Mon) -> erlang:demonitor(Mon, [flush]);
-        _ -> ok
-    end,
-    cancel_timer(S#st.exec_tref),
-    S#st{pending_exec = undefined, exec_mon = undefined, exec_tref = undefined}.
-
-release_slot(#st{slot = undefined}) ->
-    ok;
-release_slot(#st{model = Model, slot = Slot}) ->
-    barrel_inference_server_queue:release(Model, Slot).
-
-result_json({ok, Json}) when is_map(Json) ->
-    iolist_to_binary(json:encode(Json));
-result_json({ok, Bin}) when is_binary(Bin) ->
-    Bin;
-result_json({error, Reason}) ->
-    iolist_to_binary(json:encode(#{<<"error">> => to_bin(Reason)})).
+result_json({ok, Json}) when is_map(Json) -> iolist_to_binary(json:encode(Json));
+result_json({ok, Bin}) when is_binary(Bin) -> Bin;
+result_json({error, Reason}) -> iolist_to_binary(json:encode(#{<<"error">> => to_bin(Reason)})).
 
 exec_timeout_ms() ->
     barrel_inference_server_config:generation_idle_ms().
 
-accumulate_stats(S, Stats) ->
-    S#st{agg_stats = merge_stats(S#st.agg_stats, Stats)}.
+openai_tool_calls_chunk(S, Calls) ->
+    {Entries, _} = lists:mapfoldl(
+        fun(#{id := Id, name := Name, input := Input}, Ix) ->
+            {
+                #{
+                    <<"index">> => Ix,
+                    <<"id">> => Id,
+                    <<"type">> => <<"function">>,
+                    <<"function">> => #{
+                        <<"name">> => Name,
+                        <<"arguments">> => iolist_to_binary(json:encode(Input))
+                    }
+                },
+                Ix + 1
+            }
+        end,
+        0,
+        Calls
+    ),
+    json:encode(#{
+        <<"id">> => S#st.req_id,
+        <<"object">> => <<"chat.completion.chunk">>,
+        <<"created">> => erlang:system_time(second),
+        <<"model">> => S#st.requested,
+        <<"choices">> => [
+            #{
+                <<"index">> => 0,
+                <<"delta">> => #{
+                    <<"role">> => <<"assistant">>,
+                    <<"tool_calls">> => Entries
+                },
+                <<"finish_reason">> => null
+            }
+        ]
+    }).
 
-merge_stats(A, B) ->
-    Sum = fun(K) -> maps:get(K, A, 0) + maps:get(K, B, 0) end,
-    (maps:merge(A, B))#{
-        prompt_tokens => Sum(prompt_tokens),
-        completion_tokens => Sum(completion_tokens),
-        prefill_ms => Sum(prefill_ms),
-        generation_ms => Sum(generation_ms)
-    }.
+openai_tool_call_chunk(S, JsonBin) ->
+    {Name, ArgsJson} = parse_tool_call(JsonBin),
+    json:encode(#{
+        <<"id">> => S#st.req_id,
+        <<"object">> => <<"chat.completion.chunk">>,
+        <<"created">> => erlang:system_time(second),
+        <<"model">> => S#st.requested,
+        <<"choices">> => [
+            #{
+                <<"index">> => 0,
+                <<"delta">> => #{
+                    <<"role">> => <<"assistant">>,
+                    <<"tool_calls">> => [
+                        #{
+                            <<"index">> => 0,
+                            <<"id">> => make_tool_id(),
+                            <<"type">> => <<"function">>,
+                            <<"function">> => #{
+                                <<"name">> => Name,
+                                <<"arguments">> => ArgsJson
+                            }
+                        }
+                    ]
+                },
+                <<"finish_reason">> => null
+            }
+        ]
+    }).
 
-%% The grammar emits `{"name":"...", "arguments":{...}}`. Parse and
-%% re-encode the arguments as a JSON-encoded string (OpenAI schema).
 parse_tool_call(JsonBin) ->
     case json:decode(JsonBin) of
         #{<<"name">> := Name, <<"arguments">> := Args} ->
@@ -1246,7 +971,165 @@ parse_tool_call(JsonBin) ->
     end.
 
 make_tool_id() ->
-    iolist_to_binary([
-        <<"call_">>,
-        integer_to_binary(erlang:unique_integer([positive]))
-    ]).
+    iolist_to_binary([<<"call_">>, integer_to_binary(erlang:unique_integer([positive]))]).
+
+is_tool_first_byte(<<>>) -> false;
+is_tool_first_byte(<<C, _/binary>>) when C =:= $\s; C =:= $\t; C =:= $\r; C =:= $\n -> false;
+is_tool_first_byte(<<${, _/binary>>) -> true;
+is_tool_first_byte(_) -> false.
+
+usage_chunk(#st{include_usage = false}, _Stats) ->
+    [];
+usage_chunk(S = #st{include_usage = true}, Stats) ->
+    Chunk = barrel_inference_server_translate:internal_to_openai_usage_chunk(
+        Stats, S#st.req_id, S#st.requested
+    ),
+    [<<"data: ">>, Chunk, <<"\n\n">>].
+
+%%====================================================================
+%% Metrics
+%%====================================================================
+
+record_success(S, Stats) ->
+    record_metrics(S, 200, Stats),
+    barrel_inference_server_metrics:inc_prompt_tokens(
+        S#st.model, maps:get(prompt_tokens, Stats, 0)
+    ),
+    barrel_inference_server_metrics:inc_completion_tokens(
+        S#st.model, maps:get(completion_tokens, Stats, 0)
+    ),
+    case maps:get(generation_ms, Stats, 0) of
+        0 ->
+            ok;
+        Ms ->
+            Tokens = maps:get(completion_tokens, Stats, 0),
+            case Tokens > 0 of
+                true ->
+                    Tps = (Tokens * 1000) / Ms,
+                    barrel_inference_server_metrics:observe_generation_tps(S#st.model, Tps);
+                false ->
+                    ok
+            end
+    end.
+
+record_error(S, _Reason) ->
+    record_metrics(S, 500).
+
+record_metrics(S, Status) -> record_metrics(S, Status, #{}).
+record_metrics(S, Status, Stats) ->
+    Now = mono_ms(),
+    Duration = (Now - S#st.started_mono) / 1000.0,
+    Endpoint =
+        case S#st.api of
+            openai_legacy -> <<"/v1/completions">>;
+            _ -> <<"/v1/chat/completions">>
+        end,
+    barrel_inference_server_metrics:record_request(
+        Endpoint, S#st.requested, integer_to_binary(Status), Duration
+    ),
+    logger:notice(
+        maps:merge(
+            #{
+                event => openai_request,
+                endpoint => Endpoint,
+                model => S#st.requested,
+                status => Status,
+                duration_ms => round(Duration * 1000),
+                request_id => S#st.req_id
+            },
+            cache_log_fields(Stats)
+        )
+    ).
+
+cache_log_fields(Stats) ->
+    Delta = maps:get(cache_delta, Stats, #{}),
+    #{
+        cache_hit_kind => maps:get(cache_hit_kind, Stats, undefined),
+        cache_read_tokens => maps:get(read, Delta, 0),
+        cache_created_tokens => maps:get(created, Delta, 0),
+        prompt_tokens => maps:get(prompt_tokens, Stats, 0)
+    }.
+
+%%====================================================================
+%% Reply helpers
+%%====================================================================
+
+emit_raw(Emit, IoData) ->
+    case Emit(IoData) of
+        ok -> ok;
+        {error, _} -> closed
+    end.
+
+error_body({context_overflow, Tokens, Ctx}, _Status) ->
+    Msg = iolist_to_binary(
+        io_lib:format("prompt is too long: ~B tokens > ~B maximum", [Tokens, Ctx])
+    ),
+    #{
+        <<"error">> => #{
+            <<"message">> => Msg,
+            <<"type">> => <<"invalid_request_error">>,
+            <<"code">> => <<"context_length_exceeded">>
+        }
+    };
+error_body({error, {decode_failed, _}}, Status) ->
+    error_body(decode_failed, Status);
+error_body({decode_failed, _}, Status) ->
+    error_body(decode_failed, Status);
+error_body(decode_failed, _Status) ->
+    #{
+        <<"error">> => #{
+            <<"message">> =>
+                <<"the model was overloaded and could not process this request; please retry">>,
+            <<"type">> => <<"server_error">>,
+            <<"code">> => <<"server_overloaded">>
+        }
+    };
+error_body(Reason, Status) ->
+    #{
+        <<"error">> => #{
+            <<"message">> => to_bin(Reason),
+            <<"type">> => error_type(Status),
+            <<"code">> => to_bin(Reason)
+        }
+    }.
+
+error_type(400) -> <<"invalid_request_error">>;
+error_type(404) -> <<"invalid_request_error">>;
+error_type(413) -> <<"invalid_request_error">>;
+error_type(429) -> <<"rate_limit_error">>;
+error_type(_) -> <<"server_error">>.
+
+http_status(prefill_timeout) -> 504;
+http_status(generation_idle_timeout) -> 504;
+http_status(total_timeout) -> 504;
+http_status({error, {decode_failed, _}}) -> 503;
+http_status({decode_failed, _}) -> 503;
+http_status(_) -> 500.
+
+sse_headers() ->
+    [
+        {<<"content-type">>, <<"text/event-stream">>},
+        {<<"cache-control">>, <<"no-cache">>},
+        {<<"x-accel-buffering">>, <<"no">>}
+    ].
+
+decode(Body) ->
+    try
+        case json:decode(Body) of
+            M when is_map(M) -> {ok, M};
+            _ -> error
+        end
+    catch
+        _:_ -> error
+    end.
+
+model_crashed_from(_) -> model_crashed.
+
+stream_idle_timeout() ->
+    application:get_env(barrel_inference_server, idle_timeout_ms, 1800000).
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(A) when is_atom(A) -> atom_to_binary(A);
+to_bin(T) -> iolist_to_binary(io_lib:format("~p", [T])).
+
+mono_ms() -> erlang:monotonic_time(millisecond).

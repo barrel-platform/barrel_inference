@@ -5,11 +5,12 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include("../include/barrel_inference_server.hrl").
+-include_lib("livery/include/livery.hrl").
 
-%% Cowboy's Req is a map in current versions; we only use header
-%% lookup, which works on either a literal map or a real Req.
+%% Build a livery_req shaped just enough for `livery_req:header/3'.
 mock_req(Headers) ->
-    #{headers => Headers}.
+    Proplist = maps:to_list(Headers),
+    #livery_req{headers = Proplist}.
 
 base_request() ->
     #barrel_inference_request{

@@ -104,13 +104,6 @@ init([]) ->
             start => {barrel_inference_server_keepalive, start_link, []},
             type => worker,
             shutdown => 5000
-        },
-
-        #{
-            id => barrel_inference_server_listener_mon,
-            start => {barrel_inference_server_listener_mon, start_link, []},
-            type => worker,
-            shutdown => 5000
         }
     ],
     {ok, {SupFlags, Children}}.
