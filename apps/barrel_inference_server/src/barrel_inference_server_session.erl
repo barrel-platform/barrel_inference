@@ -33,7 +33,7 @@
 
 -define(MAX_HEADER_BYTES, 256).
 
--spec derive(cowboy_req:req() | term(), #barrel_inference_request{}) -> binary().
+-spec derive(term(), #barrel_inference_request{}) -> binary().
 derive(Req, R) ->
     case header_session(Req) of
         <<>> -> fallback_session(R);
@@ -42,11 +42,6 @@ derive(Req, R) ->
 
 header_session(Req) when is_tuple(Req), tuple_size(Req) > 0, element(1, Req) =:= livery_req ->
     case livery_req:header(<<"x-conversation-id">>, Req, undefined) of
-        Bin when is_binary(Bin) -> sanitise_header(Bin);
-        _ -> <<>>
-    end;
-header_session(Req) when is_map(Req) ->
-    case cowboy_req:header(<<"x-conversation-id">>, Req, undefined) of
         Bin when is_binary(Bin) -> sanitise_header(Bin);
         _ -> <<>>
     end;

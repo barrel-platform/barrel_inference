@@ -8,12 +8,7 @@
 %%% slot indefinitely.
 
 -module(barrel_inference_server_h_embeddings).
--behaviour(cowboy_handler).
 
--export([init/2]).
-
-%% livery entry points (one per route binding in
-%% barrel_inference_server_routes:livery_routes/0).
 -export([openai/1, ollama/1, ollama_legacy/1]).
 
 openai(Req) -> livery_handle(Req, openai).
@@ -117,104 +112,6 @@ api_endpoint(ollama) -> <<"/api/embed">>;
 api_endpoint(ollama_legacy) -> <<"/api/embeddings">>;
 api_endpoint(_) -> <<"/v1/embeddings">>.
 
-init(Req0, Opts) ->
-    case cowboy_req:method(Req0) of
-        <<"POST">> -> handle_post(Req0, Opts);
-        _ -> {ok, cowboy_req:reply(405, #{}, <<>>, Req0), Opts}
-    end.
-
-handle_post(Req0, Opts) ->
-    case barrel_inference_server_body:read(Req0) of
-        {ok, Body, Req1} -> dispatch(Body, Req1, Opts);
-        {too_large, Req1} -> reply_error(413, request_too_large, Req1, Opts)
-    end.
-
-dispatch(Body, Req0, Opts) ->
-    case decode(Body) of
-        {ok, Map} -> translate(Map, Req0, Opts);
-        error -> reply_error(400, invalid_json, Req0, Opts)
-    end.
-
-translate(Map, Req0, Opts) ->
-    Api = maps:get(api, Opts, openai),
-    Translated =
-        case Api of
-            openai ->
-                barrel_inference_server_translate:openai_embeddings_to_internal(Map);
-            ollama ->
-                barrel_inference_server_translate:ollama_embed_to_internal(Map);
-            ollama_legacy ->
-                barrel_inference_server_translate:ollama_embeddings_legacy_to_internal(Map)
-        end,
-    case Translated of
-        {ok, Parsed = #{model := Requested, inputs := Inputs}} ->
-            KeepAlive = maps:get(keep_alive_ms, Parsed, undefined),
-            run(Requested, Inputs, Req0, Opts, KeepAlive);
-        {error, Reason} ->
-            reply_error(400, Reason, Req0, Opts)
-    end.
-
-run(Requested, Inputs, Req0, Opts, KeepAlive) ->
-    Started = erlang:monotonic_time(millisecond),
-    case length(Inputs) > barrel_inference_server_config:max_embedding_inputs() of
-        true ->
-            reply_error(400, too_many_inputs, Req0, Opts);
-        false ->
-            Real = barrel_inference_server_config:resolve_model(Requested),
-            case barrel_inference_server_config:ensure_loaded(Real) of
-                ok ->
-                    do_embed(Real, Requested, Inputs, Started, Req0, Opts, KeepAlive);
-                {error, not_found} ->
-                    reply_error(404, model_not_found, Req0, Opts);
-                {error, Reason} ->
-                    reply_error(503, Reason, Req0, Opts)
-            end
-    end.
-
-do_embed(Real, Requested, Inputs, Started, Req0, Opts, KeepAlive) ->
-    Timeout = queue_timeout(Real),
-    case barrel_inference_server_queue:acquire(Real, Timeout) of
-        {ok, Slot} ->
-            ok = barrel_inference_server_keepalive:request_begin(Real),
-            try
-                run_embed(Real, Requested, Inputs, Started, Req0, Opts)
-            after
-                barrel_inference_server_queue:release(Real, Slot),
-                barrel_inference_server_keepalive:request_end(
-                    Real, effective_keep_alive(KeepAlive)
-                )
-            end;
-        {error, pool_exhausted} ->
-            barrel_inference_server_metrics:inc_pool_exhausted(Real),
-            record_metrics(endpoint(Opts), Requested, 429, Started),
-            reply_error(429, pool_exhausted, Req0, Opts);
-        {error, queue_timeout} ->
-            record_metrics(endpoint(Opts), Requested, 504, Started),
-            reply_error(504, queue_timeout, Req0, Opts)
-    end.
-
-run_embed(Real, Requested, Inputs, Started, Req0, Opts) ->
-    case embed_each(Real, Inputs) of
-        {ok, Vectors, PromptTokens} ->
-            Body = build_response(Opts, Vectors, PromptTokens, Requested, Started),
-            Req1 = cowboy_req:reply(
-                200,
-                #{<<"content-type">> => <<"application/json">>},
-                Body,
-                Req0
-            ),
-            record_metrics(endpoint(Opts), Requested, 200, Started),
-            barrel_inference_server_metrics:inc_prompt_tokens(Requested, PromptTokens),
-            {ok, Req1, Opts};
-        {error, Reason} ->
-            Status = embed_status(Reason),
-            record_metrics(endpoint(Opts), Requested, Status, Started),
-            reply_error(Status, Reason, Req0, Opts)
-    end.
-
-build_response(Opts, Vectors, PromptTokens, Requested, Started) ->
-    build_embed_body(maps:get(api, Opts, openai), Vectors, PromptTokens, Requested, Started).
-
 build_embed_body(Api, Vectors, PromptTokens, Requested, Started) ->
     Now = erlang:monotonic_time(millisecond),
     Timings = #{
@@ -238,10 +135,6 @@ build_embed_body(Api, Vectors, PromptTokens, Requested, Started) ->
                 )
             )
     end.
-
-endpoint(#{api := ollama}) -> <<"/api/embed">>;
-endpoint(#{api := ollama_legacy}) -> <<"/api/embeddings">>;
-endpoint(_) -> <<"/v1/embeddings">>.
 
 effective_keep_alive(undefined) -> barrel_inference_server_config:keep_alive_default_ms();
 effective_keep_alive(V) -> V.
@@ -308,20 +201,6 @@ decode(Body) ->
     catch
         _:_ -> error
     end.
-
-reply_error(Status, Reason, Req0, Opts) ->
-    Body = openai_error(
-        reason_message(Reason),
-        error_type(Status),
-        reason_code(Reason)
-    ),
-    Req1 = cowboy_req:reply(
-        Status,
-        #{<<"content-type">> => <<"application/json">>},
-        json:encode(Body),
-        Req0
-    ),
-    {ok, Req1, Opts}.
 
 reason_message(Reason) when is_atom(Reason) -> atom_to_binary(Reason);
 reason_message(Reason) when is_binary(Reason) -> Reason;

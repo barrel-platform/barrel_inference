@@ -57,7 +57,6 @@
     livery_listener_serves_health/1,
     livery_listener_serves_metrics/1,
     livery_listener_serves_models_list/1,
-    livery_listener_returns_503_for_unmigrated_route/1,
     livery_listener_echoes_request_id_header/1,
     livery_ollama_generate_invalid_json_returns_400/1,
     livery_ollama_chat_invalid_json_returns_400/1,
@@ -119,7 +118,6 @@ all() ->
         livery_listener_serves_health,
         livery_listener_serves_metrics,
         livery_listener_serves_models_list,
-        livery_listener_returns_503_for_unmigrated_route,
         livery_listener_echoes_request_id_header,
         livery_ollama_generate_invalid_json_returns_400,
         livery_ollama_chat_invalid_json_returns_400,
@@ -164,15 +162,12 @@ init_per_suite(Config) ->
             max_age => 600
         }
     ),
-    LiveryPort = free_livery_port(),
-    application:set_env(barrel_inference_server, livery_port, LiveryPort),
     {ok, Started} = application:ensure_all_started(barrel_inference_server),
     {ok, _} = application:ensure_all_started(inets),
     Url = io_lib:format("http://127.0.0.1:~p", [chosen_port()]),
-    LiveryUrl = io_lib:format("http://127.0.0.1:~p", [LiveryPort]),
     [
         {base, lists:flatten(Url)},
-        {livery_base, lists:flatten(LiveryUrl)},
+        {livery_base, lists:flatten(Url)},
         {started, Started},
         {port, Port}
         | Config
@@ -181,12 +176,6 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     [application:stop(A) || A <- lists:reverse(?config(started, Config))],
     ok.
-
-free_livery_port() ->
-    {ok, Sock} = gen_tcp:listen(0, [{reuseaddr, true}]),
-    {ok, Port} = inet:port(Sock),
-    gen_tcp:close(Sock),
-    Port.
 
 free_port() ->
     {ok, Sock} = gen_tcp:listen(0, [{reuseaddr, true}]),
@@ -895,25 +884,6 @@ livery_listener_serves_models_list(Cfg) ->
     Decoded = json:decode(list_to_binary(Body)),
     ?assertEqual(<<"list">>, maps:get(<<"object">>, Decoded)),
     ?assert(is_list(maps:get(<<"data">>, Decoded))).
-
-%% After γ5 every HTTP route is wired to a real livery handler; the
-%% catch-all `not_yet_migrated/1` stub stays exported (and unit-tested
-%% in-process) until Phase δ removes it, but no route reaches it any
-%% more.
-livery_listener_returns_503_for_unmigrated_route(_Cfg) ->
-    Resp = barrel_inference_server_routes:not_yet_migrated(undefined),
-    ?assertEqual(503, livery_resp:status(Resp)),
-    Body = livery_resp:body(Resp),
-    BodyBin =
-        case Body of
-            {full, B} -> iolist_to_binary(B);
-            B -> iolist_to_binary(B)
-        end,
-    Decoded = json:decode(BodyBin),
-    ?assertEqual(
-        <<"not_migrated_to_livery">>,
-        maps:get(<<"error">>, Decoded)
-    ).
 
 %% The custom-named request-id header round-trips on the livery side
 %% the same way it does on cowboy, proving the

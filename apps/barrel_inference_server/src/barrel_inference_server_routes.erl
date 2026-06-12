@@ -1,112 +1,41 @@
-%%% Single source of truth for the HTTP route table.
-%%%
-%%% Two consumers:
-%%%   - `barrel_inference_server_listener_mon' compiles `cowboy_routes/0'
-%%%     into a cowboy_router dispatch table.
-%%%   - `barrel_inference_server_app' compiles `livery_routes/0' into a
-%%%     `livery_router' when the `livery_port' env is set.
-%%%
-%%% A new endpoint is added once here. The cowboy and livery
-%%% shapes both list method, path, handler, and per-route opts so the
-%%% only difference is the router compile call.
+%%% HTTP route table. Compiled into a `livery_router` by
+%%% `barrel_inference_server_app:start_listener/0`.
 
 -module(barrel_inference_server_routes).
 
--export([cowboy_routes/0, livery_routes/0, not_yet_migrated/1]).
+-export([routes/0]).
 
--export_type([livery_route/0]).
+-export_type([route/0]).
 
--spec cowboy_routes() -> cowboy_router:routes().
-cowboy_routes() ->
-    [
-        {'_', [
-            {"/v1/chat/completions", barrel_inference_server_h_chat, #{api => openai}},
-            {"/v1/completions", barrel_inference_server_h_chat, #{api => openai_legacy}},
-            {"/v1/responses", barrel_inference_server_h_responses, #{api => openai}},
-            {"/v1/messages", barrel_inference_server_h_messages, #{}},
-            {"/v1/messages/count_tokens", barrel_inference_server_h_messages, #{op => count_tokens}},
-            {"/v1/embeddings", barrel_inference_server_h_embeddings, #{}},
-            {"/v1/models", barrel_inference_server_h_models, #{}},
-            {"/v1/models/:model_id", barrel_inference_server_h_models, #{}},
-            {"/health", barrel_inference_server_h_health, #{kind => liveness}},
-            {"/health/ready", barrel_inference_server_h_health, #{kind => readiness}},
-            {"/metrics", barrel_inference_server_h_metrics, #{}},
-            {"/api/tags", barrel_inference_server_h_api, #{op => tags}},
-            {"/api/pull", barrel_inference_server_h_api, #{op => pull}},
-            {"/api/show", barrel_inference_server_h_api, #{op => show}},
-            {"/api/delete", barrel_inference_server_h_api, #{op => delete}},
-            {"/api/copy", barrel_inference_server_h_api, #{op => copy}},
-            {"/api/edit", barrel_inference_server_h_api, #{op => edit}},
-            {"/api/create", barrel_inference_server_h_api, #{op => create}},
-            {"/api/search", barrel_inference_server_h_api, #{op => search}},
-            {"/api/generate", barrel_inference_server_h_ollama, #{op => generate}},
-            {"/api/chat", barrel_inference_server_h_ollama, #{op => chat}},
-            {"/api/version", barrel_inference_server_h_api, #{op => version}},
-            {"/api/ps", barrel_inference_server_h_api, #{op => ps}},
-            {"/api/embed", barrel_inference_server_h_embeddings, #{api => ollama}},
-            {"/api/embeddings", barrel_inference_server_h_embeddings, #{api => ollama_legacy}}
-        ]}
-    ].
+-type route() :: {binary(), binary(), {module(), atom()}}.
 
-%% Routes for the livery listener. The cowboy `init/2` handler shape
-%% does not fit livery's `fun((Req) -> Resp)` model, so livery routes
-%% point at the new `handle/1`-style entry points on the same handler
-%% modules. Routes whose handler hasn't been migrated yet are listed
-%% with a placeholder pointing at the catch-all 503 stub so the listener
-%% can boot for the simple-handler subset; γ phase PRs add the
-%% streaming entry points and replace the placeholders in lockstep.
--spec livery_routes() -> [livery_route()].
-livery_routes() ->
-    %% Stub kept as the fallback for `not_yet_migrated/1` (returns 503
-    %% with the JSON migration hint) even though every route currently
-    %% points at a real livery handler. Phase δ removes both this
-    %% variable and the `not_yet_migrated/1' export.
-    _Stub = {barrel_inference_server_routes, not_yet_migrated},
+-spec routes() -> [route()].
+routes() ->
     [
         {<<"GET">>, <<"/health">>, {barrel_inference_server_h_health, liveness}},
         {<<"GET">>, <<"/health/ready">>, {barrel_inference_server_h_health, readiness}},
         {<<"GET">>, <<"/metrics">>, {barrel_inference_server_h_metrics, handle}},
         {<<"GET">>, <<"/v1/models">>, {barrel_inference_server_h_models, list}},
         {<<"GET">>, <<"/v1/models/:model_id">>, {barrel_inference_server_h_models, single}},
-        {<<"POST">>, <<"/v1/chat/completions">>, {barrel_inference_server_h_chat_livery, openai}},
-        {<<"POST">>, <<"/v1/completions">>, {barrel_inference_server_h_chat_livery, legacy}},
-        {<<"POST">>, <<"/v1/responses">>, {barrel_inference_server_h_responses_livery, openai}},
-        {<<"POST">>, <<"/v1/messages">>, {barrel_inference_server_h_messages_livery, messages}},
+        {<<"POST">>, <<"/v1/chat/completions">>, {barrel_inference_server_h_chat, openai}},
+        {<<"POST">>, <<"/v1/completions">>, {barrel_inference_server_h_chat, legacy}},
+        {<<"POST">>, <<"/v1/responses">>, {barrel_inference_server_h_responses, openai}},
+        {<<"POST">>, <<"/v1/messages">>, {barrel_inference_server_h_messages, messages}},
         {<<"POST">>, <<"/v1/messages/count_tokens">>,
-            {barrel_inference_server_h_messages_livery, count_tokens}},
+            {barrel_inference_server_h_messages, count_tokens}},
         {<<"POST">>, <<"/v1/embeddings">>, {barrel_inference_server_h_embeddings, openai}},
-        {<<"GET">>, <<"/api/tags">>, {barrel_inference_server_h_api_livery, tags}},
-        {<<"POST">>, <<"/api/pull">>, {barrel_inference_server_h_api_livery, pull}},
-        {<<"POST">>, <<"/api/show">>, {barrel_inference_server_h_api_livery, show}},
-        {<<"DELETE">>, <<"/api/delete">>, {barrel_inference_server_h_api_livery, delete}},
-        {<<"POST">>, <<"/api/copy">>, {barrel_inference_server_h_api_livery, copy}},
-        {<<"POST">>, <<"/api/edit">>, {barrel_inference_server_h_api_livery, edit}},
-        {<<"POST">>, <<"/api/create">>, {barrel_inference_server_h_api_livery, create}},
-        {<<"POST">>, <<"/api/search">>, {barrel_inference_server_h_api_livery, search}},
-        {<<"POST">>, <<"/api/generate">>, {barrel_inference_server_h_ollama_livery, generate}},
-        {<<"POST">>, <<"/api/chat">>, {barrel_inference_server_h_ollama_livery, chat}},
-        {<<"GET">>, <<"/api/version">>, {barrel_inference_server_h_api_livery, version}},
-        {<<"GET">>, <<"/api/ps">>, {barrel_inference_server_h_api_livery, ps}},
+        {<<"GET">>, <<"/api/tags">>, {barrel_inference_server_h_api, tags}},
+        {<<"POST">>, <<"/api/pull">>, {barrel_inference_server_h_api, pull}},
+        {<<"POST">>, <<"/api/show">>, {barrel_inference_server_h_api, show}},
+        {<<"DELETE">>, <<"/api/delete">>, {barrel_inference_server_h_api, delete}},
+        {<<"POST">>, <<"/api/copy">>, {barrel_inference_server_h_api, copy}},
+        {<<"POST">>, <<"/api/edit">>, {barrel_inference_server_h_api, edit}},
+        {<<"POST">>, <<"/api/create">>, {barrel_inference_server_h_api, create}},
+        {<<"POST">>, <<"/api/search">>, {barrel_inference_server_h_api, search}},
+        {<<"POST">>, <<"/api/generate">>, {barrel_inference_server_h_ollama, generate}},
+        {<<"POST">>, <<"/api/chat">>, {barrel_inference_server_h_ollama, chat}},
+        {<<"GET">>, <<"/api/version">>, {barrel_inference_server_h_api, version}},
+        {<<"GET">>, <<"/api/ps">>, {barrel_inference_server_h_api, ps}},
         {<<"POST">>, <<"/api/embed">>, {barrel_inference_server_h_embeddings, ollama}},
         {<<"POST">>, <<"/api/embeddings">>, {barrel_inference_server_h_embeddings, ollama_legacy}}
     ].
-
--type livery_route() :: {binary(), binary(), {module(), atom()}}.
-
-%% Catch-all handler for routes whose cowboy implementation hasn't been
-%% ported to a livery `handle/1' yet. Returns 503 with a JSON body
-%% explaining the route is only served by the cowboy listener during
-%% the migration window. The `target=livery' CT group skips any case
-%% that exercises a route still using this stub.
-not_yet_migrated(_Req) ->
-    livery_resp:json(
-        503,
-        json:encode(#{
-            <<"error">> => <<"not_migrated_to_livery">>,
-            <<"hint">> =>
-                <<
-                    "This route is only served by the cowboy listener "
-                    "during the migration window."
-                >>
-        })
-    ).

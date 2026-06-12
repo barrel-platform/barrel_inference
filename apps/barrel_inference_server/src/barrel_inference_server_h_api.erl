@@ -1,143 +1,334 @@
-%%% Ollama-compatible /api/* endpoints.
-%%%
-%%% One handler module routes all six operations off the `op` opt
-%%% set in the dispatch table. Most ops are short request/response
-%%% pairs; `pull` uses cowboy_loop + NDJSON streaming so progress
-%%% events flow back as the fetch worker makes progress.
-%%%
-%%%   GET    /api/tags    -> list models in the registry
-%%%   POST   /api/pull    -> pull a model, stream NDJSON status events
-%%%   POST   /api/show    -> show one manifest
-%%%   DELETE /api/delete  -> remove a manifest (blob preserved)
-%%%   POST   /api/copy    -> alias a manifest under a new name:tag
-%%%   POST   /api/create  -> create from a Modelfile (FROM only)
+%%% Livery-side handler for the Ollama-shaped /api/* endpoints. Phase
+%%% γ2: GET ops only (tags, version, ps). The POST ops (show, delete,
+%%% copy, edit, create, search) and the streaming pull op land in
+%%% follow-up PRs.
 
 -module(barrel_inference_server_h_api).
--behaviour(cowboy_handler).
 
--export([init/2, info/3, terminate/3]).
+-export([tags/1, version/1, ps/1]).
+-export([show/1, delete/1, copy/1, edit/1, create/1, search/1]).
+-export([pull/1]).
 
-%% Pure helpers reused by barrel_inference_server_h_api_livery during
-%% the cowboy → livery migration window. Once the migration completes
-%% these go back to being private.
--export([parse_modelfile/1, split_name_tag/1]).
+tags(_Req) ->
+    Models = [tag_entry(M) || M <- barrel_inference_server_models:list()],
+    livery_resp:json(200, json:encode(#{<<"models">> => Models})).
 
--record(pull, {
-    name :: binary(),
-    tag :: binary(),
-    spec :: binary(),
-    coord :: undefined | pid(),
-    last_progress = 0 :: integer()
-}).
-
-%% =============================================================================
-%% Cowboy entry
-%% =============================================================================
-
-init(Req0, #{op := tags} = Opts) ->
-    expect(<<"GET">>, Req0, Opts, fun handle_tags/2);
-init(Req0, #{op := show} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_show/2);
-init(Req0, #{op := delete} = Opts) ->
-    expect(<<"DELETE">>, Req0, Opts, fun handle_delete/2);
-init(Req0, #{op := copy} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_copy/2);
-init(Req0, #{op := edit} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_edit/2);
-init(Req0, #{op := create} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_create/2);
-init(Req0, #{op := pull} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_pull/2);
-init(Req0, #{op := search} = Opts) ->
-    expect(<<"POST">>, Req0, Opts, fun handle_search/2);
-init(Req0, #{op := version} = Opts) ->
-    expect(<<"GET">>, Req0, Opts, fun handle_version/2);
-init(Req0, #{op := ps} = Opts) ->
-    expect(<<"GET">>, Req0, Opts, fun handle_ps/2).
-
-%% Pull progress/status/outcome events come from the per-pull coordinator
-%% (barrel_inference_server_pull), which owns persistence. The handler only
-%% relays them to the client as NDJSON; if it dies, the coordinator still
-%% finishes and persists.
-info({pull_event, Coord, {progress, Bytes, Total}}, Req, #pull{coord = Coord} = St) ->
-    Now = erlang:monotonic_time(millisecond),
-    case Now - St#pull.last_progress >= 100 of
-        true ->
-            ok = ndjson_progress(Req, St, Bytes, Total),
-            {ok, Req, St#pull{last_progress = Now}};
-        false ->
-            {ok, Req, St}
-    end;
-info({pull_event, Coord, {phase, Phase}}, Req, #pull{coord = Coord} = St) ->
-    ok = ndjson_line(Req, #{<<"status">> => atom_to_binary(Phase, utf8)}),
-    {ok, Req, St};
-info({pull_event, Coord, {status, Status}}, Req, #pull{coord = Coord} = St) ->
-    ok = ndjson_line(Req, #{<<"status">> => Status}),
-    {ok, Req, St};
-info({pull_event, Coord, {success, _Manifest}}, Req, #pull{coord = Coord} = St) ->
-    ok = ndjson_line(Req, #{<<"status">> => <<"success">>}),
-    cowboy_req:stream_body(<<>>, fin, Req),
-    {stop, Req, St};
-info({pull_event, Coord, {error, Reason}}, Req, #pull{coord = Coord} = St) ->
-    ok = ndjson_line(Req, error_body(reason_string(Reason))),
-    cowboy_req:stream_body(<<>>, fin, Req),
-    {stop, Req, St};
-info(_, Req, St) ->
-    {ok, Req, St}.
-
-terminate(_, _, _) ->
-    ok.
-
-%% =============================================================================
-%% Method gating
-%% =============================================================================
-
-expect(Method, Req0, Opts, Fun) ->
-    case cowboy_req:method(Req0) of
-        Method ->
-            Fun(Req0, Opts);
-        _ ->
-            Reply = cowboy_req:reply(
-                405,
-                json_headers(),
-                json_body(#{<<"error">> => <<"method_not_allowed">>}),
-                Req0
-            ),
-            {ok, Reply, Opts}
-    end.
-
-%% =============================================================================
-%% GET /api/version
-%% =============================================================================
-
-handle_version(Req0, Opts) ->
+version(_Req) ->
     Vsn =
         case application:get_key(barrel_inference_server, vsn) of
             {ok, V} when is_list(V) -> list_to_binary(V);
             {ok, V} when is_binary(V) -> V;
             _ -> <<"0.0.0">>
         end,
-    Req1 = cowboy_req:reply(200, json_headers(), json_body(#{<<"version">> => Vsn}), Req0),
-    {ok, Req1, Opts}.
+    livery_resp:json(200, json:encode(#{<<"version">> => Vsn})).
 
-%% =============================================================================
-%% GET /api/ps
-%%
-%% Ollama-shape "running" list. Intersection of barrel_inference:list_models/0
-%% (loaded gen_statems) with the registry manifests + the keepalive
-%% per-model TTL state.
-%% =============================================================================
-
-handle_ps(Req0, Opts) ->
+ps(_Req) ->
     Loaded = safe_list_loaded(),
     Statuses = safe_keepalive_status(),
     StatusMap = maps:from_list([{maps:get(model, S), S} || S <- Statuses]),
     Manifests = manifests_by_name(),
     Models = [ps_entry(Info, StatusMap, Manifests) || Info <- Loaded],
-    Req1 = cowboy_req:reply(
-        200, json_headers(), json_body(#{<<"models">> => Models}), Req0
-    ),
-    {ok, Req1, Opts}.
+    livery_resp:json(200, json:encode(#{<<"models">> => Models})).
+
+%%====================================================================
+%% POST ops
+%%====================================================================
+
+show(Req) ->
+    with_json_body(Req, fun(Body) ->
+        case maps:find(<<"name">>, Body) of
+            {ok, Name} -> show_lookup(Name);
+            error -> err(400, <<"missing name">>)
+        end
+    end).
+
+show_lookup(Name) ->
+    case barrel_inference_server_models:get(Name) of
+        {ok, M} -> livery_resp:json(200, json:encode(show_body(M)));
+        {error, not_found} -> err(404, <<"model_not_found">>);
+        {error, Reason} -> err(500, reason_string(Reason))
+    end.
+
+delete(Req) ->
+    with_json_body(Req, fun(Body) ->
+        case maps:find(<<"name">>, Body) of
+            {ok, Name} -> delete_run(Name);
+            error -> err(400, <<"missing name">>)
+        end
+    end).
+
+delete_run(Name) ->
+    handle_ok_or_error(barrel_inference_server_models:delete(Name)).
+
+copy(Req) ->
+    with_json_body(Req, fun(Body) ->
+        case {maps:find(<<"source">>, Body), maps:find(<<"destination">>, Body)} of
+            {{ok, Src}, {ok, Dst}} -> copy_run(Src, Dst);
+            _ -> err(400, <<"missing source/destination">>)
+        end
+    end).
+
+copy_run(Src, Dst) ->
+    handle_ok_or_error(barrel_inference_server_models:copy(Src, Dst)).
+
+%% Common reply shape for ops that return ok (200 empty body) or one of
+%% the standard error tuples.
+handle_ok_or_error(ok) ->
+    livery_resp:json(200, <<>>);
+handle_ok_or_error({error, not_found}) ->
+    err(404, <<"model_not_found">>);
+handle_ok_or_error({error, Reason}) ->
+    err(500, reason_string(Reason)).
+
+edit(Req) ->
+    with_json_body(Req, fun(Body) ->
+        case {maps:find(<<"name">>, Body), maps:find(<<"parameters">>, Body)} of
+            {{ok, Name}, {ok, Params}} when is_map(Params) ->
+                edit_run(Name, Params);
+            _ ->
+                err(400, <<"missing name/parameters">>)
+        end
+    end).
+
+edit_run(Name, Params) ->
+    case barrel_inference_server_models:edit(Name, Params) of
+        {ok, Updated} -> livery_resp:json(200, json:encode(show_body(Updated)));
+        {error, not_found} -> err(404, <<"model_not_found">>);
+        {error, bad_parameters} -> err(400, <<"bad_parameters">>);
+        {error, Reason} -> err(500, reason_string(Reason))
+    end.
+
+create(Req) ->
+    with_json_body(Req, fun(Body) ->
+        case {maps:find(<<"name">>, Body), maps:find(<<"modelfile">>, Body)} of
+            {{ok, Name}, {ok, Modelfile}} ->
+                create_run(Name, Modelfile);
+            _ ->
+                err(400, <<"missing name/modelfile">>)
+        end
+    end).
+
+create_run(Name, Modelfile) ->
+    case parse_modelfile(Modelfile) of
+        {ok, FromSpec, Overrides} ->
+            {DstName, DstTag} = split_name_tag(Name),
+            PullOpts = #{name => DstName, tag => DstTag, modelfile_overrides => Overrides},
+            case barrel_inference_server_models:pull(FromSpec, PullOpts) of
+                {ok, _} -> livery_resp:json(200, <<>>);
+                {error, Reason} -> err(500, reason_string(Reason))
+            end;
+        {error, Reason} ->
+            err(400, reason_string(Reason))
+    end.
+
+search(Req) ->
+    with_json_body(Req, fun(Body) ->
+        case maps:find(<<"query">>, Body) of
+            {ok, Query} ->
+                Limit = maps:get(<<"limit">>, Body, 20),
+                {ok, Hits} = barrel_inference_server_search:search(Query, #{limit => Limit}),
+                livery_resp:json(200, json:encode(#{<<"hits">> => Hits}));
+            error ->
+                err(400, <<"missing query">>)
+        end
+    end).
+
+%%====================================================================
+%% POST /api/pull (NDJSON streaming)
+%%====================================================================
+
+pull(Req) ->
+    with_json_body(Req, fun pull_dispatch/1).
+
+pull_dispatch(Body) ->
+    case maps:find(<<"name">>, Body) of
+        {ok, Name} ->
+            Stream = maps:get(<<"stream">>, Body, true),
+            TagOverride = maps:get(<<"tag">>, Body, undefined),
+            pull_resolve(Name, TagOverride, Stream);
+        error ->
+            err(400, <<"missing name">>)
+    end.
+
+pull_resolve(Name, TagOverride, Stream) ->
+    case barrel_inference_server_models:resolve_spec(Name) of
+        {ok, Spec, DefName, DefTag} ->
+            Tag = pick_tag(TagOverride, DefTag),
+            case Stream of
+                true -> pull_stream(Spec, DefName, Tag);
+                _ -> pull_blocking(Spec, DefName, Tag)
+            end;
+        {error, Reason} ->
+            err(400, reason_string(Reason))
+    end.
+
+pick_tag(undefined, Default) -> Default;
+pick_tag(<<>>, Default) -> Default;
+pick_tag(Tag, _) when is_binary(Tag) -> Tag.
+
+pull_blocking(Spec, Name, Tag) ->
+    case barrel_inference_server_pull_sup:start_pull(Spec, Name, Tag, #{}, [self()]) of
+        {ok, Coord} ->
+            Mon = monitor(process, Coord),
+            Timeout = application:get_env(
+                barrel_inference_server, pull_blocking_timeout_ms, 1800000
+            ),
+            await_pull(Coord, Mon, Timeout);
+        {error, Reason} ->
+            err(500, reason_string(Reason))
+    end.
+
+await_pull(Coord, Mon, Timeout) ->
+    receive
+        {pull_event, Coord, {success, _Manifest}} ->
+            demonitor(Mon, [flush]),
+            livery_resp:json(200, json:encode(#{<<"status">> => <<"success">>}));
+        {pull_event, Coord, {error, Reason}} ->
+            demonitor(Mon, [flush]),
+            err(500, reason_string(Reason));
+        {pull_event, Coord, _Other} ->
+            await_pull(Coord, Mon, Timeout);
+        {'DOWN', Mon, process, Coord, _Reason} ->
+            err(500, <<"pull failed">>)
+    after Timeout ->
+        demonitor(Mon, [flush]),
+        err(504, <<"pull timed out; continuing in background">>)
+    end.
+
+pull_stream(Spec, Name, Tag) ->
+    livery_resp:stream(
+        200,
+        [{<<"content-type">>, <<"application/x-ndjson">>}],
+        fun(Emit) -> stream_pull_drive(Emit, Spec, Name, Tag) end
+    ).
+
+stream_pull_drive(Emit, Spec, Name, Tag) ->
+    _ = emit_line(Emit, #{<<"status">> => <<"pulling manifest">>}),
+    case barrel_inference_server_pull_sup:start_pull(Spec, Name, Tag, #{}, [self()]) of
+        {ok, Coord} ->
+            stream_pull_loop(Emit, Spec, Coord, 0);
+        {error, Reason} ->
+            _ = emit_line(Emit, #{<<"error">> => reason_string(Reason)}),
+            ok
+    end.
+
+stream_pull_loop(Emit, Spec, Coord, LastProgress) ->
+    receive
+        {pull_event, Coord, Event} ->
+            handle_pull_event(Event, Emit, Spec, Coord, LastProgress)
+    after pull_idle_timeout() ->
+        _ = emit_line(Emit, #{<<"error">> => <<"pull_idle_timeout">>}),
+        ok
+    end.
+
+pull_idle_timeout() ->
+    application:get_env(barrel_inference_server, pull_idle_timeout_ms, 1800000).
+
+handle_pull_event({progress, Bytes, Total}, Emit, Spec, Coord, LastProgress) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Now - LastProgress >= 100 of
+        true -> emit_progress_and_loop(Emit, Spec, Coord, Now, Bytes, Total);
+        false -> stream_pull_loop(Emit, Spec, Coord, LastProgress)
+    end;
+handle_pull_event({phase, Phase}, Emit, Spec, Coord, LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => atom_to_binary(Phase, utf8)}),
+    stream_pull_loop(Emit, Spec, Coord, LastProgress);
+handle_pull_event({status, Status}, Emit, Spec, Coord, LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => Status}),
+    stream_pull_loop(Emit, Spec, Coord, LastProgress);
+handle_pull_event({success, _Manifest}, Emit, _Spec, _Coord, _LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => <<"success">>}),
+    ok;
+handle_pull_event({error, Reason}, Emit, _Spec, _Coord, _LastProgress) ->
+    _ = emit_line(Emit, #{<<"error">> => reason_string(Reason)}),
+    ok.
+
+emit_progress_and_loop(Emit, Spec, Coord, Now, Bytes, Total) ->
+    Line = #{
+        <<"status">> => digest_status(Spec),
+        <<"digest">> => Spec,
+        <<"total">> => or_null(Total),
+        <<"completed">> => Bytes
+    },
+    case emit_line(Emit, Line) of
+        ok -> stream_pull_loop(Emit, Spec, Coord, Now);
+        closed -> ok
+    end.
+
+digest_status(Spec) ->
+    iolist_to_binary([<<"pulling ">>, Spec]).
+
+or_null(undefined) -> null;
+or_null(V) -> V.
+
+emit_line(Emit, M) ->
+    case Emit([json:encode(M), <<"\n">>]) of
+        ok -> ok;
+        {error, _} -> closed
+    end.
+
+%%====================================================================
+%% POST helpers
+%%====================================================================
+
+with_json_body(Req, Then) ->
+    case barrel_inference_server_body:read(Req) of
+        {ok, Bin, _Req1} ->
+            case decode_body(Bin) of
+                {ok, Map} -> Then(Map);
+                error -> err(400, <<"bad_request">>)
+            end;
+        {too_large, _Req1} ->
+            err(413, <<"request_too_large">>)
+    end.
+
+decode_body(<<>>) ->
+    {ok, #{}};
+decode_body(Bin) ->
+    try json:decode(Bin) of
+        M when is_map(M) -> {ok, M};
+        _ -> error
+    catch
+        _:_ -> error
+    end.
+
+err(Status, Msg) when is_binary(Msg) ->
+    livery_resp:json(Status, json:encode(#{<<"error">> => Msg})).
+
+show_body(M) ->
+    Quant = maps:get(<<"quantization">>, M, null),
+    #{
+        <<"modelfile">> => modelfile_for(M),
+        <<"parameters">> => <<>>,
+        <<"template">> => maps:get(<<"chat_template">>, M, null),
+        <<"details">> => details(M),
+        <<"model_info">> => #{
+            <<"general.architecture">> => maps:get(<<"architecture">>, M, null),
+            <<"general.size_label">> => maps:get(<<"parameter_size">>, M, null),
+            <<"general.file_type">> => Quant,
+            <<"context_length">> => effective_context_length(M),
+            <<"embedding_length">> => maps:get(<<"embedding_length">>, M, null)
+        }
+    }.
+
+effective_context_length(M) ->
+    case barrel_inference_server_models:effective_context_size(M) of
+        undefined -> null;
+        N -> N
+    end.
+
+modelfile_for(M) ->
+    Spec = maps:get(<<"spec">>, M, <<>>),
+    iolist_to_binary([<<"FROM ">>, Spec, <<"\n">>]).
+
+reason_string(B) when is_binary(B) -> B;
+reason_string(A) when is_atom(A) -> atom_to_binary(A, utf8);
+reason_string(T) -> iolist_to_binary(io_lib:format("~p", [T])).
+
+%%====================================================================
+%% Internal (duplicated locally for the migration window; once γ
+%% completes these can be merged back into h_api as shared exports).
+%%====================================================================
 
 safe_list_loaded() ->
     try barrel_inference:list_models() of
@@ -174,26 +365,6 @@ ps_entry(Info, StatusMap, Manifests) ->
         <<"size_vram">> => maps:get(<<"size_bytes">>, Manifest, 0)
     }.
 
-iso_or_null(infinity) -> null;
-iso_or_null(Ms) when is_integer(Ms) -> iso_from_unix_ms(Ms).
-
-iso_from_unix_ms(Ms) ->
-    Seconds = Ms div 1000,
-    {{Y, Mo, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Seconds, second),
-    list_to_binary(
-        io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ", [Y, Mo, D, H, Mi, S])
-    ).
-
-%% =============================================================================
-%% GET /api/tags
-%% =============================================================================
-
-handle_tags(Req0, Opts) ->
-    Models = [tag_entry(M) || M <- barrel_inference_server_models:list()],
-    Body = #{<<"models">> => Models},
-    Req1 = cowboy_req:reply(200, json_headers(), json_body(Body), Req0),
-    {ok, Req1, Opts}.
-
 tag_entry(M) ->
     Name = maps:get(<<"name">>, M),
     Tag = maps:get(<<"tag">>, M, <<"latest">>),
@@ -213,172 +384,20 @@ details(M) ->
         <<"quantization_level">> => maps:get(<<"quantization">>, M, null)
     }.
 
-%% =============================================================================
-%% POST /api/show
-%% =============================================================================
+iso_or_null(infinity) -> null;
+iso_or_null(Ms) when is_integer(Ms) -> iso_from_unix_ms(Ms).
 
-handle_show(Req0, Opts) ->
-    case read_json(Req0) of
-        {ok, #{<<"name">> := Name}, Req1} ->
-            case barrel_inference_server_models:get(Name) of
-                {ok, M} ->
-                    reply(Req1, Opts, 200, show_body(M));
-                {error, not_found} ->
-                    reply(Req1, Opts, 404, error_body(<<"model_not_found">>));
-                {error, Reason} ->
-                    reply(Req1, Opts, 500, error_body(reason_string(Reason)))
-            end;
-        {ok, _, Req1} ->
-            reply(Req1, Opts, 400, error_body(<<"missing name">>));
-        {error, Req1, Status} ->
-            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
-    end.
+iso_from_unix_ms(Ms) ->
+    Seconds = Ms div 1000,
+    {{Y, Mo, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Seconds, second),
+    list_to_binary(
+        io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ", [Y, Mo, D, H, Mi, S])
+    ).
 
-show_body(M) ->
-    Quant = maps:get(<<"quantization">>, M, null),
-    #{
-        <<"modelfile">> => modelfile_for(M),
-        <<"parameters">> => <<>>,
-        <<"template">> => maps:get(<<"chat_template">>, M, null),
-        <<"details">> => details(M),
-        <<"model_info">> => #{
-            <<"general.architecture">> => maps:get(<<"architecture">>, M, null),
-            <<"general.size_label">> => maps:get(<<"parameter_size">>, M, null),
-            <<"general.file_type">> => Quant,
-            %% Report the context the model actually loads with (honours a
-            %% parameters.num_ctx override), not the raw manifest context_size.
-            <<"context_length">> => effective_context_length(M),
-            <<"embedding_length">> => maps:get(<<"embedding_length">>, M, null)
-        }
-    }.
+%%====================================================================
+%% Modelfile + name/tag helpers (for /api/create)
+%%====================================================================
 
-effective_context_length(M) ->
-    case barrel_inference_server_models:effective_context_size(M) of
-        undefined -> null;
-        N -> N
-    end.
-
-modelfile_for(M) ->
-    Spec = maps:get(<<"spec">>, M, <<>>),
-    iolist_to_binary([<<"FROM ">>, Spec, <<"\n">>]).
-
-%% =============================================================================
-%% DELETE /api/delete
-%% =============================================================================
-
-handle_delete(Req0, Opts) ->
-    case read_json(Req0) of
-        {ok, #{<<"name">> := Name}, Req1} ->
-            case barrel_inference_server_models:delete(Name) of
-                ok ->
-                    Req2 = cowboy_req:reply(200, json_headers(), <<>>, Req1),
-                    {ok, Req2, Opts};
-                {error, not_found} ->
-                    reply(Req1, Opts, 404, error_body(<<"model_not_found">>));
-                {error, Reason} ->
-                    reply(Req1, Opts, 500, error_body(reason_string(Reason)))
-            end;
-        {ok, _, Req1} ->
-            reply(Req1, Opts, 400, error_body(<<"missing name">>));
-        {error, Req1, Status} ->
-            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
-    end.
-
-%% =============================================================================
-%% POST /api/copy
-%% =============================================================================
-
-handle_copy(Req0, Opts) ->
-    case read_json(Req0) of
-        {ok, #{<<"source">> := Src, <<"destination">> := Dst}, Req1} ->
-            case barrel_inference_server_models:copy(Src, Dst) of
-                ok ->
-                    Req2 = cowboy_req:reply(200, json_headers(), <<>>, Req1),
-                    {ok, Req2, Opts};
-                {error, not_found} ->
-                    reply(Req1, Opts, 404, error_body(<<"model_not_found">>));
-                {error, Reason} ->
-                    reply(Req1, Opts, 500, error_body(reason_string(Reason)))
-            end;
-        {ok, _, Req1} ->
-            reply(Req1, Opts, 400, error_body(<<"missing source/destination">>));
-        {error, Req1, Status} ->
-            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
-    end.
-
-%% =============================================================================
-%% POST /api/edit
-%% =============================================================================
-%%
-%% Body: `{"name": "model:tag", "parameters": {"num_batch": 512, ...}}'.
-%%
-%% Merges the supplied PARAMETER values into the manifest's
-%% `parameters' sub-map and persists atomically. Keys not in the
-%% request body stay intact; keys in the body overwrite. Returns
-%% the updated manifest in the same envelope as `/api/show'.
-%%
-%% The loaded model (if any) keeps running with its current
-%% `context_opts'; the new values take effect on the next admit
-%% after the model unloads (via `keep_alive' expiry or a
-%% `keep_alive: 0' request). The loader honours `parameters.num_X'
-%% over `loader.n_X' on the next load.
-
-handle_edit(Req0, Opts) ->
-    case read_json(Req0) of
-        {ok, #{<<"name">> := Name, <<"parameters">> := Params}, Req1} when
-            is_map(Params)
-        ->
-            case barrel_inference_server_models:edit(Name, Params) of
-                {ok, Updated} ->
-                    reply(Req1, Opts, 200, show_body(Updated));
-                {error, not_found} ->
-                    reply(Req1, Opts, 404, error_body(<<"model_not_found">>));
-                {error, bad_parameters} ->
-                    reply(Req1, Opts, 400, error_body(<<"bad_parameters">>));
-                {error, Reason} ->
-                    reply(Req1, Opts, 500, error_body(reason_string(Reason)))
-            end;
-        {ok, _, Req1} ->
-            reply(Req1, Opts, 400, error_body(<<"missing name/parameters">>));
-        {error, Req1, Status} ->
-            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
-    end.
-
-%% =============================================================================
-%% POST /api/create  (FROM directive only)
-%% =============================================================================
-
-handle_create(Req0, Opts) ->
-    case read_json(Req0) of
-        {ok, #{<<"name">> := Name, <<"modelfile">> := Modelfile}, Req1} ->
-            case parse_modelfile(Modelfile) of
-                {ok, FromSpec, Overrides} ->
-                    {DstName, DstTag} = split_name_tag(Name),
-                    PullOpts = #{
-                        name => DstName, tag => DstTag, modelfile_overrides => Overrides
-                    },
-                    case barrel_inference_server_models:pull(FromSpec, PullOpts) of
-                        {ok, _} ->
-                            Req2 = cowboy_req:reply(200, json_headers(), <<>>, Req1),
-                            {ok, Req2, Opts};
-                        {error, Reason} ->
-                            reply(Req1, Opts, 500, error_body(reason_string(Reason)))
-                    end;
-                {error, Reason} ->
-                    reply(Req1, Opts, 400, error_body(reason_string(Reason)))
-            end;
-        {ok, _, Req1} ->
-            reply(Req1, Opts, 400, error_body(<<"missing name/modelfile">>));
-        {error, Req1, Status} ->
-            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
-    end.
-
-%% Returns {ok, FromSpec, Overrides} where Overrides is a map with
-%% optional keys `system`, `template`, and `parameters` (itself a map
-%% of string -> json-encodable value).
-%%
-%% v0.1 supports FROM, PARAMETER, SYSTEM, and TEMPLATE. ADAPTER,
-%% MESSAGE, and LICENSE still return 400 modelfile_directive_not_supported.
 parse_modelfile(Modelfile) ->
     Lines = binary:split(Modelfile, [<<"\r\n">>, <<"\n">>], [global, trim]),
     case scan_modelfile(Lines, #{from => undefined, parameters => #{}}) of
@@ -450,7 +469,6 @@ unquote(<<"\"", _/binary>> = Bin) ->
 unquote(Bin) ->
     Bin.
 
-%% Parameter values: numbers stay numbers; everything else stays binary.
 decode_param_value(B) ->
     try binary_to_integer(B) of
         N -> N
@@ -469,170 +487,9 @@ strip_undef(M) ->
 strip_ws(B) ->
     string:trim(B).
 
-%% =============================================================================
-%% POST /api/search
-%% =============================================================================
-
-handle_search(Req0, Opts) ->
-    case read_json(Req0) of
-        {ok, #{<<"query">> := Query} = Body, Req1} ->
-            Limit = maps:get(<<"limit">>, Body, 20),
-            {ok, Hits} = barrel_inference_server_search:search(Query, #{limit => Limit}),
-            reply(Req1, Opts, 200, #{<<"hits">> => Hits});
-        {ok, _, Req1} ->
-            reply(Req1, Opts, 400, error_body(<<"missing query">>));
-        {error, Req1, Status} ->
-            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
-    end.
-
-%% =============================================================================
-%% POST /api/pull (NDJSON streaming)
-%% =============================================================================
-
-handle_pull(Req0, Opts) ->
-    case read_json(Req0) of
-        {ok, Body, Req1} ->
-            case maps:find(<<"name">>, Body) of
-                {ok, Name} ->
-                    Stream = maps:get(<<"stream">>, Body, true),
-                    TagOverride = maps:get(<<"tag">>, Body, undefined),
-                    dispatch_pull(Req1, Opts, Name, TagOverride, Stream);
-                error ->
-                    reply(Req1, Opts, 400, error_body(<<"missing name">>))
-            end;
-        {error, Req1, Status} ->
-            reply(Req1, Opts, Status, error_body(<<"bad_request">>))
-    end.
-
-dispatch_pull(Req0, Opts, Name, TagOverride, Stream) ->
-    case barrel_inference_server_models:resolve_spec(Name) of
-        {ok, Spec, DefName, DefTag} ->
-            Tag = pick_tag(TagOverride, DefTag),
-            case Stream of
-                true -> stream_pull(Req0, Spec, DefName, Tag);
-                _ -> blocking_pull(Req0, Opts, Spec, DefName, Tag)
-            end;
-        {error, Reason} ->
-            reply(Req0, Opts, 400, error_body(reason_string(Reason)))
-    end.
-
-pick_tag(undefined, Default) -> Default;
-pick_tag(<<>>, Default) -> Default;
-pick_tag(Tag, _) when is_binary(Tag) -> Tag.
-
-%% Non-streaming pull. Drive the same coordinator, but block on its
-%% outcome. On timeout we reply with an HTTP error yet leave the
-%% coordinator running, so the download still completes and the manifest
-%% still persists in the background.
-blocking_pull(Req0, Opts, Spec, Name, Tag) ->
-    case barrel_inference_server_pull_sup:start_pull(Spec, Name, Tag, #{}, [self()]) of
-        {ok, Coord} ->
-            Mon = monitor(process, Coord),
-            Timeout = application:get_env(
-                barrel_inference_server, pull_blocking_timeout_ms, 1800000
-            ),
-            await_blocking_pull(Req0, Opts, Coord, Mon, Timeout);
-        {error, Reason} ->
-            reply(Req0, Opts, 500, error_body(reason_string(Reason)))
-    end.
-
-await_blocking_pull(Req0, Opts, Coord, Mon, Timeout) ->
-    receive
-        {pull_event, Coord, {success, _Manifest}} ->
-            demonitor(Mon, [flush]),
-            reply(Req0, Opts, 200, #{<<"status">> => <<"success">>});
-        {pull_event, Coord, {error, Reason}} ->
-            demonitor(Mon, [flush]),
-            reply(Req0, Opts, 500, error_body(reason_string(Reason)));
-        {pull_event, Coord, _Other} ->
-            await_blocking_pull(Req0, Opts, Coord, Mon, Timeout);
-        {'DOWN', Mon, process, Coord, _Reason} ->
-            reply(Req0, Opts, 500, error_body(<<"pull failed">>))
-    after Timeout ->
-        demonitor(Mon, [flush]),
-        reply(
-            Req0,
-            Opts,
-            504,
-            error_body(<<"pull timed out; continuing in background">>)
-        )
-    end.
-
-stream_pull(Req0, Spec, Name, Tag) ->
-    Req1 = cowboy_req:stream_reply(
-        200, #{<<"content-type">> => <<"application/x-ndjson">>}, Req0
-    ),
-    ok = ndjson_line(Req1, #{<<"status">> => <<"pulling manifest">>}),
-    case barrel_inference_server_pull_sup:start_pull(Spec, Name, Tag, #{}, [self()]) of
-        {ok, Coord} ->
-            St = #pull{name = Name, tag = Tag, spec = Spec, coord = Coord},
-            {cowboy_loop, Req1, St, hibernate};
-        {error, Reason} ->
-            ok = ndjson_line(Req1, error_body(reason_string(Reason))),
-            cowboy_req:stream_body(<<>>, fin, Req1),
-            {ok, Req1, #pull{name = Name, tag = Tag, spec = Spec}}
-    end.
-
-ndjson_progress(Req, St, Bytes, Total) ->
-    ndjson_line(Req, #{
-        <<"status">> => digest_status(St),
-        <<"digest">> => St#pull.spec,
-        <<"total">> => or_null(Total),
-        <<"completed">> => Bytes
-    }).
-
-digest_status(#pull{spec = Spec}) ->
-    iolist_to_binary([<<"pulling ">>, Spec]).
-
-%% =============================================================================
-%% Utilities
-%% =============================================================================
-
-read_json(Req0) ->
-    {ok, Bin, Req1} = cowboy_req:read_body(Req0),
-    case Bin of
-        <<>> ->
-            {ok, #{}, Req1};
-        _ ->
-            try json:decode(Bin) of
-                M when is_map(M) -> {ok, M, Req1};
-                _ -> {error, Req1, 400}
-            catch
-                _:_ -> {error, Req1, 400}
-            end
-    end.
-
-reply(Req0, Opts, Status, BodyMap) ->
-    Req1 = cowboy_req:reply(Status, json_headers(), json_body(BodyMap), Req0),
-    {ok, Req1, Opts}.
-
-error_body(Msg) when is_binary(Msg) ->
-    #{<<"error">> => Msg}.
-
-json_headers() ->
-    #{<<"content-type">> => <<"application/json">>}.
-
-json_body(M) ->
-    iolist_to_binary(json:encode(M)).
-
-ndjson_line(Req, M) ->
-    Line = [json:encode(M), <<"\n">>],
-    cowboy_req:stream_body(Line, nofin, Req),
-    ok.
-
 split_name_tag(Bin) ->
     case binary:split(Bin, <<":">>) of
         [N] -> {N, <<"latest">>};
         [N, <<>>] -> {N, <<"latest">>};
         [N, T] -> {N, T}
     end.
-
-reason_string(B) when is_binary(B) ->
-    B;
-reason_string(A) when is_atom(A) ->
-    atom_to_binary(A, utf8);
-reason_string(T) ->
-    iolist_to_binary(io_lib:format("~p", [T])).
-
-or_null(undefined) -> null;
-or_null(V) -> V.

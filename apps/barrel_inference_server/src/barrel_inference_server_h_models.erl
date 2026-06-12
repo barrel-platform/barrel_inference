@@ -8,11 +8,7 @@
 %%% OpenAI clients can pick by alias and see what is available.
 
 -module(barrel_inference_server_h_models).
--behaviour(cowboy_handler).
 
--export([init/2]).
-
-%% livery entry points.
 -export([list/1, single/1]).
 
 list(_Req) ->
@@ -23,42 +19,6 @@ single(Req) ->
     ModelId = livery_req:binding(<<"model_id">>, Req),
     {Status, Body} = single_response(ModelId),
     livery_resp:json(Status, json:encode(Body)).
-
-init(Req0, Opts) ->
-    case cowboy_req:method(Req0) of
-        <<"GET">> ->
-            handle_get(Req0, Opts);
-        _ ->
-            {ok, cowboy_req:reply(405, #{}, <<>>, Req0), Opts}
-    end.
-
-handle_get(Req0, Opts) ->
-    case cowboy_req:binding(model_id, Req0) of
-        undefined ->
-            list(Req0, Opts);
-        ModelId ->
-            single(ModelId, Req0, Opts)
-    end.
-
-list(Req0, Opts) ->
-    {Status, Body} = list_response(),
-    Req1 = cowboy_req:reply(
-        Status,
-        #{<<"content-type">> => <<"application/json">>},
-        json:encode(Body),
-        Req0
-    ),
-    {ok, Req1, Opts}.
-
-single(ModelId, Req0, Opts) ->
-    {Status, Body} = single_response(ModelId),
-    Req1 = cowboy_req:reply(
-        Status,
-        #{<<"content-type">> => <<"application/json">>},
-        json:encode(Body),
-        Req0
-    ),
-    {ok, Req1, Opts}.
 
 %%====================================================================
 %% Internal
