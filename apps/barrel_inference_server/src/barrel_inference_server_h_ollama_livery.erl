@@ -191,12 +191,7 @@ dispatch_stream({pipeline, error, _Status, Reason}, S, Emit) ->
     _ = emit_line(Emit, json:encode(error_body(Reason))),
     S;
 dispatch_stream({barrel_inference_token, Ref, Tok}, S, Emit) ->
-    S1 = learn_ref(S, Ref),
-    Chunk = ollama_chunk(S1#st.op, Tok, S1#st.req_id, S1#st.model),
-    case emit_line(Emit, Chunk) of
-        ok -> stream_loop(S1#st{out_tokens = S1#st.out_tokens + 1}, Emit);
-        closed -> S1
-    end;
+    on_token(S, Ref, Tok, Emit);
 dispatch_stream({barrel_inference_reasoning_token, Ref, _Tok}, S, Emit) ->
     stream_loop(learn_ref(S, Ref), Emit);
 dispatch_stream({barrel_inference_done, Ref, Stats}, S, Emit) ->
@@ -204,13 +199,24 @@ dispatch_stream({barrel_inference_done, Ref, Stats}, S, Emit) ->
     _ = emit_line(Emit, final_chunk(S1, Stats)),
     S1;
 dispatch_stream({barrel_inference_error, Ref, Reason}, S, Emit) ->
-    S1 = learn_ref(S, Ref),
-    _ = emit_line(Emit, json:encode(error_body(Reason))),
-    S1;
+    on_engine_error(S, Ref, Reason, Emit);
 dispatch_stream({'DOWN', Mon, process, _Pid, _Reason}, S, Emit) when Mon =:= S#st.worker_mon ->
     stream_loop(S#st{worker = undefined, worker_mon = undefined}, Emit);
 dispatch_stream(_Other, S, Emit) ->
     stream_loop(S, Emit).
+
+on_token(S, Ref, Tok, Emit) ->
+    S1 = learn_ref(S, Ref),
+    Chunk = ollama_chunk(S1#st.op, Tok, S1#st.req_id, S1#st.model),
+    case emit_line(Emit, Chunk) of
+        ok -> stream_loop(S1#st{out_tokens = S1#st.out_tokens + 1}, Emit);
+        closed -> S1
+    end.
+
+on_engine_error(S, Ref, Reason, Emit) ->
+    S1 = learn_ref(S, Ref),
+    _ = emit_line(Emit, json:encode(error_body(Reason))),
+    S1.
 
 loading_line(S) ->
     json:encode(#{
@@ -248,21 +254,23 @@ dispatch_buffered({barrel_inference_token, Ref, Tok}, S) ->
 dispatch_buffered({barrel_inference_reasoning_token, Ref, _Tok}, S) ->
     buffered_loop(learn_ref(S, Ref));
 dispatch_buffered({barrel_inference_done, Ref, Stats}, S) ->
-    S1 = learn_ref(S, Ref),
-    Body = ollama_full_response(
-        S1#st.op,
-        iolist_to_binary(S1#st.buf),
-        Stats,
-        S1#st.model,
-        compute_timings(S1)
-    ),
-    livery_resp:json(200, Body);
+    finish_buffered(learn_ref(S, Ref), Stats);
 dispatch_buffered({barrel_inference_error, _Ref, Reason}, _S) ->
     livery_resp:json(error_status(Reason), json:encode(error_body(Reason)));
 dispatch_buffered({'DOWN', Mon, process, _Pid, _Reason}, S) when Mon =:= S#st.worker_mon ->
     buffered_loop(S#st{worker = undefined, worker_mon = undefined});
 dispatch_buffered(_Other, S) ->
     buffered_loop(S).
+
+finish_buffered(S, Stats) ->
+    Body = ollama_full_response(
+        S#st.op,
+        iolist_to_binary(S#st.buf),
+        Stats,
+        S#st.model,
+        compute_timings(S)
+    ),
+    livery_resp:json(200, Body).
 
 final_chunk(S, Stats) ->
     ollama_final_chunk(S#st.op, Stats, S#st.req_id, S#st.model, compute_timings(S)).
