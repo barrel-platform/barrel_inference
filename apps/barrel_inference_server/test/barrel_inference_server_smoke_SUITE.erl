@@ -904,7 +904,7 @@ livery_listener_returns_503_for_unmigrated_route(Cfg) ->
     %% Pick a route that's still on the not_yet_migrated stub. As γ
     %% PRs convert more handlers, swap this to any path still wired
     %% to the stub in barrel_inference_server_routes:livery_routes/0.
-    Url = ?config(livery_base, Cfg) ++ "/api/pull",
+    Url = ?config(livery_base, Cfg) ++ "/v1/messages",
     {ok, {{_, 503, _}, _, Body}} =
         httpc:request(post, {Url, [], "application/json", "{}"}, [], []),
     Decoded = json:decode(list_to_binary(Body)),

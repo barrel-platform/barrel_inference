@@ -7,6 +7,7 @@
 
 -export([tags/1, version/1, ps/1]).
 -export([show/1, delete/1, copy/1, edit/1, create/1, search/1]).
+-export([pull/1]).
 
 tags(_Req) ->
     Models = [tag_entry(M) || M <- barrel_inference_server_models:list()],
@@ -131,6 +132,140 @@ search(Req) ->
                 err(400, <<"missing query">>)
         end
     end).
+
+%%====================================================================
+%% POST /api/pull (NDJSON streaming)
+%%====================================================================
+
+pull(Req) ->
+    with_json_body(Req, fun pull_dispatch/1).
+
+pull_dispatch(Body) ->
+    case maps:find(<<"name">>, Body) of
+        {ok, Name} ->
+            Stream = maps:get(<<"stream">>, Body, true),
+            TagOverride = maps:get(<<"tag">>, Body, undefined),
+            pull_resolve(Name, TagOverride, Stream);
+        error ->
+            err(400, <<"missing name">>)
+    end.
+
+pull_resolve(Name, TagOverride, Stream) ->
+    case barrel_inference_server_models:resolve_spec(Name) of
+        {ok, Spec, DefName, DefTag} ->
+            Tag = pick_tag(TagOverride, DefTag),
+            case Stream of
+                true -> pull_stream(Spec, DefName, Tag);
+                _ -> pull_blocking(Spec, DefName, Tag)
+            end;
+        {error, Reason} ->
+            err(400, reason_string(Reason))
+    end.
+
+pick_tag(undefined, Default) -> Default;
+pick_tag(<<>>, Default) -> Default;
+pick_tag(Tag, _) when is_binary(Tag) -> Tag.
+
+pull_blocking(Spec, Name, Tag) ->
+    case barrel_inference_server_pull_sup:start_pull(Spec, Name, Tag, #{}, [self()]) of
+        {ok, Coord} ->
+            Mon = monitor(process, Coord),
+            Timeout = application:get_env(
+                barrel_inference_server, pull_blocking_timeout_ms, 1800000
+            ),
+            await_pull(Coord, Mon, Timeout);
+        {error, Reason} ->
+            err(500, reason_string(Reason))
+    end.
+
+await_pull(Coord, Mon, Timeout) ->
+    receive
+        {pull_event, Coord, {success, _Manifest}} ->
+            demonitor(Mon, [flush]),
+            livery_resp:json(200, json:encode(#{<<"status">> => <<"success">>}));
+        {pull_event, Coord, {error, Reason}} ->
+            demonitor(Mon, [flush]),
+            err(500, reason_string(Reason));
+        {pull_event, Coord, _Other} ->
+            await_pull(Coord, Mon, Timeout);
+        {'DOWN', Mon, process, Coord, _Reason} ->
+            err(500, <<"pull failed">>)
+    after Timeout ->
+        demonitor(Mon, [flush]),
+        err(504, <<"pull timed out; continuing in background">>)
+    end.
+
+pull_stream(Spec, Name, Tag) ->
+    livery_resp:stream(
+        200,
+        [{<<"content-type">>, <<"application/x-ndjson">>}],
+        fun(Emit) -> stream_pull_drive(Emit, Spec, Name, Tag) end
+    ).
+
+stream_pull_drive(Emit, Spec, Name, Tag) ->
+    _ = emit_line(Emit, #{<<"status">> => <<"pulling manifest">>}),
+    case barrel_inference_server_pull_sup:start_pull(Spec, Name, Tag, #{}, [self()]) of
+        {ok, Coord} ->
+            stream_pull_loop(Emit, Spec, Coord, 0);
+        {error, Reason} ->
+            _ = emit_line(Emit, #{<<"error">> => reason_string(Reason)}),
+            ok
+    end.
+
+stream_pull_loop(Emit, Spec, Coord, LastProgress) ->
+    receive
+        {pull_event, Coord, Event} ->
+            handle_pull_event(Event, Emit, Spec, Coord, LastProgress)
+    after pull_idle_timeout() ->
+        _ = emit_line(Emit, #{<<"error">> => <<"pull_idle_timeout">>}),
+        ok
+    end.
+
+pull_idle_timeout() ->
+    application:get_env(barrel_inference_server, pull_idle_timeout_ms, 1800000).
+
+handle_pull_event({progress, Bytes, Total}, Emit, Spec, Coord, LastProgress) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Now - LastProgress >= 100 of
+        true -> emit_progress_and_loop(Emit, Spec, Coord, Now, Bytes, Total);
+        false -> stream_pull_loop(Emit, Spec, Coord, LastProgress)
+    end;
+handle_pull_event({phase, Phase}, Emit, Spec, Coord, LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => atom_to_binary(Phase, utf8)}),
+    stream_pull_loop(Emit, Spec, Coord, LastProgress);
+handle_pull_event({status, Status}, Emit, Spec, Coord, LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => Status}),
+    stream_pull_loop(Emit, Spec, Coord, LastProgress);
+handle_pull_event({success, _Manifest}, Emit, _Spec, _Coord, _LastProgress) ->
+    _ = emit_line(Emit, #{<<"status">> => <<"success">>}),
+    ok;
+handle_pull_event({error, Reason}, Emit, _Spec, _Coord, _LastProgress) ->
+    _ = emit_line(Emit, #{<<"error">> => reason_string(Reason)}),
+    ok.
+
+emit_progress_and_loop(Emit, Spec, Coord, Now, Bytes, Total) ->
+    Line = #{
+        <<"status">> => digest_status(Spec),
+        <<"digest">> => Spec,
+        <<"total">> => or_null(Total),
+        <<"completed">> => Bytes
+    },
+    case emit_line(Emit, Line) of
+        ok -> stream_pull_loop(Emit, Spec, Coord, Now);
+        closed -> ok
+    end.
+
+digest_status(Spec) ->
+    iolist_to_binary([<<"pulling ">>, Spec]).
+
+or_null(undefined) -> null;
+or_null(V) -> V.
+
+emit_line(Emit, M) ->
+    case Emit([json:encode(M), <<"\n">>]) of
+        ok -> ok;
+        {error, _} -> closed
+    end.
 
 %%====================================================================
 %% POST helpers
