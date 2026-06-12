@@ -66,7 +66,7 @@ livery_routes() ->
         {<<"GET">>, <<"/v1/models/:model_id">>, {barrel_inference_server_h_models, single}},
         {<<"POST">>, <<"/v1/chat/completions">>, {barrel_inference_server_h_chat_livery, openai}},
         {<<"POST">>, <<"/v1/completions">>, {barrel_inference_server_h_chat_livery, legacy}},
-        {<<"POST">>, <<"/v1/responses">>, Stub},
+        {<<"POST">>, <<"/v1/responses">>, {barrel_inference_server_h_responses_livery, openai}},
         {<<"POST">>, <<"/v1/messages">>, Stub},
         {<<"POST">>, <<"/v1/messages/count_tokens">>, Stub},
         {<<"POST">>, <<"/v1/embeddings">>, {barrel_inference_server_h_embeddings, openai}},
