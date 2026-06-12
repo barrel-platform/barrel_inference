@@ -96,28 +96,7 @@ livery_run_embed(Real, Requested, Inputs, Started, Api) ->
     end.
 
 livery_build_response(Api, Vectors, PromptTokens, Requested, Started) ->
-    Now = erlang:monotonic_time(millisecond),
-    Timings = #{
-        total_duration_ns => (Now - Started) * 1_000_000,
-        load_duration_ns => 0
-    },
-    case Api of
-        ollama ->
-            barrel_inference_server_translate:internal_to_ollama_embed_response(
-                Requested, Vectors, PromptTokens, Timings
-            );
-        ollama_legacy ->
-            [Vec | _] = Vectors,
-            barrel_inference_server_translate:internal_to_ollama_embeddings_legacy_response(
-                Requested, Vec, Timings
-            );
-        _ ->
-            json:encode(
-                barrel_inference_server_translate:internal_to_openai_embedding_response(
-                    Vectors, PromptTokens, Requested
-                )
-            )
-    end.
+    build_embed_body(Api, Vectors, PromptTokens, Requested, Started).
 
 livery_error(Status, Reason, _Api) ->
     Body = openai_error(
@@ -234,12 +213,15 @@ run_embed(Real, Requested, Inputs, Started, Req0, Opts) ->
     end.
 
 build_response(Opts, Vectors, PromptTokens, Requested, Started) ->
+    build_embed_body(maps:get(api, Opts, openai), Vectors, PromptTokens, Requested, Started).
+
+build_embed_body(Api, Vectors, PromptTokens, Requested, Started) ->
     Now = erlang:monotonic_time(millisecond),
     Timings = #{
         total_duration_ns => (Now - Started) * 1_000_000,
         load_duration_ns => 0
     },
-    case maps:get(api, Opts, openai) of
+    case Api of
         ollama ->
             barrel_inference_server_translate:internal_to_ollama_embed_response(
                 Requested, Vectors, PromptTokens, Timings
