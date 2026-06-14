@@ -148,7 +148,11 @@ resolve_stream(R, Requested, Api) ->
     State1 = arm_total_timer(State),
     case pre_admit_loop(State1) of
         {admitted, State2} ->
-            {sse, 200, sse_headers(), fun(Emit) ->
+            %% `{stream, ...}' (raw chunked), not `{sse, ...}': our
+            %% existing Emit calls already include the full
+            %% `event: ...\ndata: ...\n\n' framing; the `{sse, _}'
+            %% decision would wrap each chunk in another `data: ' line.
+            {stream, 200, sse_headers(), fun(Emit) ->
                 drive_stream_post_admit(State2, Emit)
             end};
         {error, Status, Reason, State2} ->

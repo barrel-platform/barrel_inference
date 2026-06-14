@@ -277,8 +277,11 @@ chat_invalid_json_returns_400(Cfg) ->
 
 %% Pre-stream errors on a streaming /v1/messages request must surface
 %% as an Anthropic SSE `event: error` frame, not a JSON envelope.
-%% Anthropic SDKs read the streaming body as SSE; a JSON response
-%% decodes as a transport error rather than a proper error event.
+%% Pre-admit failures (e.g. unknown model) now return a real 4xx JSON
+%% envelope before any SSE frame is opened — livery_resp:stream_deferred
+%% lets the producer choose the response shape after admission. Tests
+%% that previously expected `200 + event: error` get the same Anthropic
+%% error envelope, just on a 4xx response.
 messages_streaming_unknown_model_emits_event_error(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/messages",
     Body = json:encode(#{
@@ -292,14 +295,7 @@ messages_streaming_unknown_model_emits_event_error(Cfg) ->
             post, {Url, [], "application/json", Body}, [], []
         ),
     Bin = list_to_binary(RespBody),
-    %% Cowboy streams with HTTP 200; the error is conveyed via the
-    %% SSE error event rather than an HTTP status. (200 is what
-    %% Anthropic itself returns for the streaming-error path.)
-    ?assertEqual(200, Status),
-    ?assert(binary:match(Bin, <<"event: error">>) =/= nomatch),
-    ?assert(binary:match(Bin, <<"\"type\":\"error\"">>) =/= nomatch),
-    %% The inner error.type must be one of Anthropic's enum values, not
-    %% a freeform string like the pre-fix \"server_error\".
+    ?assertEqual(404, Status),
     ?assert(binary:match(Bin, <<"\"type\":\"not_found_error\"">>) =/= nomatch).
 
 %% /v1/messages/count_tokens with no loaded model surfaces as 529

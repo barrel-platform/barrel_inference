@@ -133,7 +133,11 @@ resolve_stream(Op, R, KeepAlive) ->
     State = init_state(Op, R, KeepAlive, Worker, Mon),
     case pre_admit_loop(State) of
         {admitted, State1} ->
-            {ndjson, 200, [{<<"content-type">>, <<"application/x-ndjson">>}], fun(Emit) ->
+            %% Raw chunked, not `{ndjson, _}': our `emit_line/2'
+            %% already wraps each chunk as `<<JsonBin/binary, "\n">>',
+            %% so passing through livery's ndjson wrapper would
+            %% double-encode.
+            {stream, 200, [{<<"content-type">>, <<"application/x-ndjson">>}], fun(Emit) ->
                 drive_post_admit(State1, Emit)
             end};
         {error, Status, Reason, State1} ->

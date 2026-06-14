@@ -232,7 +232,10 @@ resolve_stream(R, Requested, ExtraHeaders) ->
     State = arm_total_timer(make_init(R, Requested, ExtraHeaders)),
     case pre_admit_loop(State) of
         {admitted, State1} ->
-            {sse, 200, sse_headers() ++ ExtraHeaders, fun(Emit) ->
+            %% Raw chunked: our Emit calls already produce full SSE
+            %% frames (event/data/blank line); `{sse,_}' would
+            %% double-wrap them.
+            {stream, 200, sse_headers() ++ ExtraHeaders, fun(Emit) ->
                 drive_stream_post_admit(State1, Emit)
             end};
         {error, Status0, Reason, State1} ->
@@ -250,11 +253,18 @@ make_init(R, Requested, ExtraHeaders) ->
     init_state(R, Requested, Worker, Mon, ExtraHeaders).
 
 drive_stream_post_admit(State, Emit) ->
+    %% In the cowboy-era flow `on_pipeline_stream({pipeline, admitted,
+    %% _, _})' was the spot where we first had both the Emit fun and
+    %% an admitted state, so it emitted `message_start' and armed the
+    %% per-generation ping timer. pre_admit_loop now consumes the
+    %% admit message before any Emit exists; the post-admit producer
+    %% takes over both responsibilities here.
+    State1 = arm_gen_ping(emit_message_start(State, Emit)),
     _ =
         try
-            stream_loop(State, Emit)
+            stream_loop(State1, Emit)
         after
-            cleanup(State)
+            cleanup(State1)
         end,
     ok.
 

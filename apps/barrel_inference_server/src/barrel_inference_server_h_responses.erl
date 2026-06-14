@@ -167,7 +167,8 @@ resolve_stream(R, Requested) ->
     State1 = arm_total_timer(State),
     case pre_admit_loop(State1) of
         {admitted, State2} ->
-            {sse, 200, sse_headers(), fun(Emit) ->
+            %% Raw chunked: handler emits full SSE frames itself.
+            {stream, 200, sse_headers(), fun(Emit) ->
                 drive_stream_post_admit(State2, Emit)
             end};
         {error, Status, Reason, State2} ->
@@ -177,11 +178,17 @@ resolve_stream(R, Requested) ->
     end.
 
 drive_stream_post_admit(State, Emit) ->
+    %% pre_admit_loop already consumed `{pipeline, admitted, _, _}',
+    %% so emit the response.created / message_added / content_added
+    %% trio here (the cowboy-era flow did it on admit).
+    State1 = emit_content_added(
+        emit_message_added(emit_response_created(State, Emit), Emit), Emit
+    ),
     _ =
         try
-            stream_loop(State, Emit)
+            stream_loop(State1, Emit)
         after
-            cleanup(State)
+            cleanup(State1)
         end,
     ok.
 
