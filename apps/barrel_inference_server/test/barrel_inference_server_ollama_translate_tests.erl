@@ -152,27 +152,21 @@ keep_alive_parser_test_() ->
 %% =============================================================================
 
 generate_chunk_shape_test() ->
-    Bin = iolist_to_binary(
-        barrel_inference_server_translate:internal_to_ollama_generate_chunk(
-            <<"Hello">>, <<"req-1">>, <<"llama3">>
-        )
+    M = barrel_inference_server_translate:internal_to_ollama_generate_chunk(
+        <<"Hello">>, <<"req-1">>, <<"llama3">>
     ),
-    M = json:decode(Bin),
     ?assertEqual(<<"llama3">>, maps:get(<<"model">>, M)),
     ?assertEqual(<<"Hello">>, maps:get(<<"response">>, M)),
     ?assertEqual(false, maps:get(<<"done">>, M)),
     ?assert(is_binary(maps:get(<<"created_at">>, M))).
 
 generate_final_shape_test() ->
-    Bin = iolist_to_binary(
-        barrel_inference_server_translate:internal_to_ollama_generate_final(
-            #{finish_reason => stop, prompt_tokens => 5, completion_tokens => 3},
-            <<"req-1">>,
-            <<"llama3">>,
-            #{total_duration_ns => 1000000, load_duration_ns => 500000}
-        )
+    M = barrel_inference_server_translate:internal_to_ollama_generate_final(
+        #{finish_reason => stop, prompt_tokens => 5, completion_tokens => 3},
+        <<"req-1">>,
+        <<"llama3">>,
+        #{total_duration_ns => 1000000, load_duration_ns => 500000}
     ),
-    M = json:decode(Bin),
     ?assertEqual(true, maps:get(<<"done">>, M)),
     ?assertEqual(<<"stop">>, maps:get(<<"done_reason">>, M)),
     ?assertEqual(1000000, maps:get(<<"total_duration">>, M)),

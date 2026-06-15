@@ -1385,29 +1385,29 @@ int_seconds(B) ->
 
 %% Streaming generate chunk: one JSON object per token. Caller writes
 %% it as a single NDJSON line.
--spec internal_to_ollama_generate_chunk(binary(), binary(), binary()) -> iodata().
+%% Returns the JSON-encodable map for one streaming NDJSON line; the
+%% caller (or livery's ndjson Emit) does the json:encode + newline.
+-spec internal_to_ollama_generate_chunk(binary(), binary(), binary()) -> map().
 internal_to_ollama_generate_chunk(Token, _ReqId, Model) ->
-    json:encode(#{
+    #{
         <<"model">> => Model,
         <<"created_at">> => iso8601_now(),
         <<"response">> => Token,
         <<"done">> => false
-    }).
+    }.
 
-%% Streaming generate final: emits the closing JSON with timing.
--spec internal_to_ollama_generate_final(map(), binary(), binary(), map()) -> iodata().
+%% Streaming generate final NDJSON map (timings + done).
+-spec internal_to_ollama_generate_final(map(), binary(), binary(), map()) -> map().
 internal_to_ollama_generate_final(Stats, _ReqId, Model, Timings) ->
-    json:encode(
-        maps:merge(
-            #{
-                <<"model">> => Model,
-                <<"created_at">> => iso8601_now(),
-                <<"response">> => <<>>,
-                <<"done">> => true,
-                <<"done_reason">> => done_reason_atom(Stats)
-            },
-            timing_fields(Stats, Timings)
-        )
+    maps:merge(
+        #{
+            <<"model">> => Model,
+            <<"created_at">> => iso8601_now(),
+            <<"response">> => <<>>,
+            <<"done">> => true,
+            <<"done_reason">> => done_reason_atom(Stats)
+        },
+        timing_fields(Stats, Timings)
     ).
 
 %% Non-streaming generate response.
@@ -1426,28 +1426,26 @@ internal_to_ollama_generate_response(Body, Stats, Model, Timings) ->
         )
     ).
 
--spec internal_to_ollama_chat_chunk(binary(), binary(), binary()) -> iodata().
+-spec internal_to_ollama_chat_chunk(binary(), binary(), binary()) -> map().
 internal_to_ollama_chat_chunk(Token, _ReqId, Model) ->
-    json:encode(#{
+    #{
         <<"model">> => Model,
         <<"created_at">> => iso8601_now(),
         <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => Token},
         <<"done">> => false
-    }).
+    }.
 
--spec internal_to_ollama_chat_final(map(), binary(), binary(), map()) -> iodata().
+-spec internal_to_ollama_chat_final(map(), binary(), binary(), map()) -> map().
 internal_to_ollama_chat_final(Stats, _ReqId, Model, Timings) ->
-    json:encode(
-        maps:merge(
-            #{
-                <<"model">> => Model,
-                <<"created_at">> => iso8601_now(),
-                <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => <<>>},
-                <<"done">> => true,
-                <<"done_reason">> => done_reason_atom(Stats)
-            },
-            timing_fields(Stats, Timings)
-        )
+    maps:merge(
+        #{
+            <<"model">> => Model,
+            <<"created_at">> => iso8601_now(),
+            <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => <<>>},
+            <<"done">> => true,
+            <<"done_reason">> => done_reason_atom(Stats)
+        },
+        timing_fields(Stats, Timings)
     ).
 
 -spec internal_to_ollama_chat_response(binary(), map(), binary(), map()) -> iodata().
