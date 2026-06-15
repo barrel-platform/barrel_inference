@@ -79,7 +79,7 @@ init_per_suite(Config) ->
     application:set_env(barrel_inference_server, keep_alive_default_ms, 300000),
 
     {ok, Started} = application:ensure_all_started(barrel_inference_server),
-    {ok, _} = application:ensure_all_started(inets),
+    {ok, _} = barrel_inference_server_http_test:ensure_started(),
     Base = "http://127.0.0.1:" ++ integer_to_list(Port),
     Escript = locate_escript(),
     [
@@ -354,7 +354,7 @@ file_spec(Cfg) ->
 
 post_json(Cfg, Path, Body) ->
     Url = ?config(base, Cfg) ++ Path,
-    httpc:request(post, {Url, [], "application/json", Body}, [], []).
+    barrel_inference_server_http_test:request(post, {Url, [], "application/json", Body}, [], []).
 
 ndjson_lines(Bin) ->
     Parts = binary:split(Bin, <<"\n">>, [global]),

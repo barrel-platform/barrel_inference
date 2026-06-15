@@ -60,8 +60,8 @@ init_per_suite(Config) ->
     ),
     application:set_env(barrel_inference_server, model_load_policy, preloaded),
     {ok, Started} = application:ensure_all_started(barrel_inference_server),
-    {ok, _} = application:ensure_all_started(inets),
-    httpc:set_options([
+    {ok, _} = barrel_inference_server_http_test:ensure_started(),
+    ok = barrel_inference_server_http_test:set_options([
         {max_sessions, 16},
         {max_keep_alive_length, 0},
         {pipeline_timeout, 0}
@@ -206,7 +206,9 @@ chat_non_streaming_returns_full_response(Cfg) ->
         <<"stream">> => false
     }),
     {ok, {{_, Code, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     ct:log("chat non-streaming code=~p body=~ts", [Code, RespBody]),
     ?assertEqual(200, Code),
     Decoded = json:decode(list_to_binary(RespBody)),
@@ -217,14 +219,81 @@ chat_non_streaming_returns_full_response(Cfg) ->
     Usage = maps:get(<<"usage">>, Decoded),
     ?assert(maps:get(<<"completion_tokens">>, Usage) >= 1).
 
-chat_busy_returns_429(_Cfg) ->
-    %% TODO: livery_resp:stream/3 picks the response status at the
-    %% time the stream opens, so a `stream: true' request that hits
-    %% pool_exhausted lands as a 200 + SSE `error' event rather
-    %% than the cowboy-era 429. Either gate the stream open on
-    %% admission success (deferred response status) or change the
-    %% wire contract; both are out of scope for the listener swap.
-    {skip, livery_streaming_status_deferred}.
+chat_busy_returns_429(Cfg) ->
+    %% concurrency=1 + depth=1: holder takes the slot, one waiter can
+    %% queue, anything else gets pool_exhausted (429). With the
+    %% livery 0.3.0 deferred-status producer fun the pre-admit
+    %% pool_exhausted now surfaces as HTTP 429 (instead of `200 OK'
+    %% + SSE error) and the retried R1+R2 burst observes it.
+    Url = ?config(base, Cfg) ++ "/v1/chat/completions",
+    HolderBody = make_busy_body(<<"busy-holder">>),
+    Parent = self(),
+    Holder = spawn(fun() ->
+        Resp = http_collect(Url, HolderBody),
+        Parent ! {holder_done, byte_size(Resp)}
+    end),
+    timer:sleep(150),
+    ok = busy_burst_until_pool_exhausted(Url, 30, 200),
+    exit(Holder, kill),
+    receive
+        {holder_done, _} -> ok
+    after 0 -> ok
+    end,
+    [barrel_inference:cancel(R) || {R, _} <- barrel_inference_inflight:all()],
+    ok.
+
+busy_burst_until_pool_exhausted(_Url, 0, _BackoffMs) ->
+    ct:fail("busy burst exhausted retries without seeing 429 or 504");
+busy_burst_until_pool_exhausted(Url, N, BackoffMs) ->
+    Parent = self(),
+    Tag = integer_to_binary(erlang:unique_integer([positive])),
+    BodyA = make_busy_body(<<"busy-a-", Tag/binary>>),
+    BodyB = make_busy_body(<<"busy-b-", Tag/binary>>),
+    spawn(fun() ->
+        Parent !
+            {a,
+                barrel_inference_server_http_test:request(
+                    post, {Url, [], "application/json", BodyA}, [{timeout, 2000}], []
+                )}
+    end),
+    spawn(fun() ->
+        Parent !
+            {b,
+                barrel_inference_server_http_test:request(
+                    post, {Url, [], "application/json", BodyB}, [{timeout, 2000}], []
+                )}
+    end),
+    A =
+        receive
+            {a, X} -> X
+        after 3000 -> {error, timeout}
+        end,
+    B =
+        receive
+            {b, Y} -> Y
+        after 3000 -> {error, timeout}
+        end,
+    Codes = [code_of(A), code_of(B)],
+    case lists:member(429, Codes) orelse lists:member(504, Codes) of
+        true ->
+            ok;
+        false ->
+            timer:sleep(BackoffMs),
+            busy_burst_until_pool_exhausted(Url, N - 1, BackoffMs)
+    end.
+
+code_of({ok, {{_, Code, _}, _, _}}) -> Code;
+code_of(_) -> 0.
+
+make_busy_body(Prompt) ->
+    iolist_to_binary(
+        json:encode(#{
+            <<"model">> => <<"e2e-stub">>,
+            <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => Prompt}],
+            <<"max_tokens">> => 50000,
+            <<"stream">> => true
+        })
+    ).
 
 chat_cancel_on_disconnect_releases_slot(Cfg) ->
     %% Open a streaming chat, read the first chunk, then drop the
@@ -303,7 +372,9 @@ chat_cancel_on_disconnect_releases_slot(Cfg) ->
 post_until_slot_free(_Url, _Body, 0, _BackoffMs) ->
     timeout;
 post_until_slot_free(Url, Body, N, BackoffMs) ->
-    case httpc:request(post, {Url, [], "application/json", Body}, [], []) of
+    case
+        barrel_inference_server_http_test:request(post, {Url, [], "application/json", Body}, [], [])
+    of
         {ok, {{_, 200, _}, _, _}} ->
             ct:log("post_until_slot_free: 200 after ~p retries", [N]),
             200;
@@ -353,7 +424,9 @@ embeddings_returns_vector(Cfg) ->
         <<"input">> => <<"hello">>
     }),
     {ok, {{_, 200, _}, _, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, [], []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, [], []
+        ),
     Decoded = json:decode(list_to_binary(RespBody)),
     [Entry] = maps:get(<<"data">>, Decoded),
     Vec = maps:get(<<"embedding">>, Entry),
@@ -375,5 +448,7 @@ http_collect(Url, Body) ->
     %% time out before we read the closing chunk.
     HttpOpts = [{timeout, 20000}, {connect_timeout, 5000}],
     {ok, {{_, 200, _}, _Headers, RespBody}} =
-        httpc:request(post, {Url, [], "application/json", Body}, HttpOpts, []),
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Body}, HttpOpts, []
+        ),
     list_to_binary(RespBody).

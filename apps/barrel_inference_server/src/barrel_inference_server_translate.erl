@@ -75,6 +75,7 @@
     internal_to_responses_function_call_done/4,
     internal_to_responses_failed/4,
     responses_event/2,
+    sse_iodata/1,
     %% helpers
     make_id/1,
     parse_keep_alive/1,
@@ -838,7 +839,7 @@ internal_to_responses_failed(ResponseId, Model, Code, Message) ->
     }.
 
 %% SSE renderer for /v1/responses events. Same wire shape as sse/2.
--spec responses_event(binary(), map()) -> iodata().
+-spec responses_event(binary(), map()) -> map().
 responses_event(EventName, Payload) ->
     sse(EventName, Payload).
 
@@ -953,7 +954,7 @@ cache_creation_ttl_split(Total, Stats) ->
 %% `event: <name>\ndata: <json>\n\n`.
 -spec internal_to_anthropic_event(
     anthropic_event_kind(), map(), binary(), binary()
-) -> iodata().
+) -> map().
 internal_to_anthropic_event({message_start, PromptTokens}, _Acc, ReqId, Model) when
     is_integer(PromptTokens)
 ->
@@ -1385,29 +1386,29 @@ int_seconds(B) ->
 
 %% Streaming generate chunk: one JSON object per token. Caller writes
 %% it as a single NDJSON line.
--spec internal_to_ollama_generate_chunk(binary(), binary(), binary()) -> iodata().
+%% Returns the JSON-encodable map for one streaming NDJSON line; the
+%% caller (or livery's ndjson Emit) does the json:encode + newline.
+-spec internal_to_ollama_generate_chunk(binary(), binary(), binary()) -> map().
 internal_to_ollama_generate_chunk(Token, _ReqId, Model) ->
-    json:encode(#{
+    #{
         <<"model">> => Model,
         <<"created_at">> => iso8601_now(),
         <<"response">> => Token,
         <<"done">> => false
-    }).
+    }.
 
-%% Streaming generate final: emits the closing JSON with timing.
--spec internal_to_ollama_generate_final(map(), binary(), binary(), map()) -> iodata().
+%% Streaming generate final NDJSON map (timings + done).
+-spec internal_to_ollama_generate_final(map(), binary(), binary(), map()) -> map().
 internal_to_ollama_generate_final(Stats, _ReqId, Model, Timings) ->
-    json:encode(
-        maps:merge(
-            #{
-                <<"model">> => Model,
-                <<"created_at">> => iso8601_now(),
-                <<"response">> => <<>>,
-                <<"done">> => true,
-                <<"done_reason">> => done_reason_atom(Stats)
-            },
-            timing_fields(Stats, Timings)
-        )
+    maps:merge(
+        #{
+            <<"model">> => Model,
+            <<"created_at">> => iso8601_now(),
+            <<"response">> => <<>>,
+            <<"done">> => true,
+            <<"done_reason">> => done_reason_atom(Stats)
+        },
+        timing_fields(Stats, Timings)
     ).
 
 %% Non-streaming generate response.
@@ -1426,28 +1427,26 @@ internal_to_ollama_generate_response(Body, Stats, Model, Timings) ->
         )
     ).
 
--spec internal_to_ollama_chat_chunk(binary(), binary(), binary()) -> iodata().
+-spec internal_to_ollama_chat_chunk(binary(), binary(), binary()) -> map().
 internal_to_ollama_chat_chunk(Token, _ReqId, Model) ->
-    json:encode(#{
+    #{
         <<"model">> => Model,
         <<"created_at">> => iso8601_now(),
         <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => Token},
         <<"done">> => false
-    }).
+    }.
 
--spec internal_to_ollama_chat_final(map(), binary(), binary(), map()) -> iodata().
+-spec internal_to_ollama_chat_final(map(), binary(), binary(), map()) -> map().
 internal_to_ollama_chat_final(Stats, _ReqId, Model, Timings) ->
-    json:encode(
-        maps:merge(
-            #{
-                <<"model">> => Model,
-                <<"created_at">> => iso8601_now(),
-                <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => <<>>},
-                <<"done">> => true,
-                <<"done_reason">> => done_reason_atom(Stats)
-            },
-            timing_fields(Stats, Timings)
-        )
+    maps:merge(
+        #{
+            <<"model">> => Model,
+            <<"created_at">> => iso8601_now(),
+            <<"message">> => #{<<"role">> => <<"assistant">>, <<"content">> => <<>>},
+            <<"done">> => true,
+            <<"done_reason">> => done_reason_atom(Stats)
+        },
+        timing_fields(Stats, Timings)
     ).
 
 -spec internal_to_ollama_chat_response(binary(), map(), binary(), map()) -> iodata().
@@ -2088,6 +2087,14 @@ index_zero(L) -> index_zero(L, 0).
 index_zero([], _) -> [];
 index_zero([H | T], I) -> [{I, H} | index_zero(T, I + 1)].
 
-%% Render an Anthropic SSE event (named event + data line).
+%% Build a livery sse-Emit-ready map: `#{event => Bin, data => Bin}'.
+%% Livery (`livery.erl:sse_frame/1') formats this as
+%% `event: <EventName>\ndata: <Json>\n\n', so handlers can pass the
+%% map straight to Emit/1 with no manual framing.
 sse(EventName, Payload) ->
-    [<<"event: ">>, EventName, <<"\ndata: ">>, json:encode(Payload), <<"\n\n">>].
+    #{event => EventName, data => json:encode(Payload)}.
+
+%% Render an sse event map as the same iodata `sse/2' used to return.
+%% Exposed for the translate test suite, which inspects the wire bytes.
+sse_iodata(#{event := EventName, data := Data}) ->
+    [<<"event: ">>, EventName, <<"\ndata: ">>, Data, <<"\n\n">>].

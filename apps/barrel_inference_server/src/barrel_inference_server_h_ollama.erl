@@ -115,28 +115,68 @@ ok_preload(Op, Model, KeepAlive, MonoStart) ->
     apply_keep_alive(Model, KeepAlive),
     livery_resp:json(200, Body).
 
-%% Streaming returns livery_resp:stream with the NDJSON producer fun;
-%% non-streaming buffers tokens and returns a one-shot json.
+%% Streaming uses livery_resp:stream_deferred so pool_exhausted /
+%% not_loaded / etc surface as a real 4xx/5xx JSON response instead
+%% of `200 OK` + an NDJSON error line; non-streaming buffers tokens.
 inference(Op, R, KeepAlive) ->
     case R#barrel_inference_request.stream of
         true ->
-            livery_resp:stream(
-                200,
-                [{<<"content-type">>, <<"application/x-ndjson">>}],
-                fun(Emit) -> drive(Op, R, KeepAlive, Emit) end
+            livery_resp:stream_deferred(
+                fun() -> resolve_stream(Op, R, KeepAlive) end
             );
         false ->
             drive_buffered(Op, R, KeepAlive)
     end.
 
-drive(Op, R, KeepAlive, Emit) ->
+resolve_stream(Op, R, KeepAlive) ->
     {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
     State = init_state(Op, R, KeepAlive, Worker, Mon),
+    case pre_admit_loop(State) of
+        {admitted, State1} ->
+            %% Native NDJSON: livery's Emit takes a JSON-encodable
+            %% term, json:encodes it, and appends `\n'. The handler's
+            %% line builders (ollama_chunk / final_chunk / error_body /
+            %% loading_line) now return maps directly.
+            {ndjson, 200, [], fun(Emit) -> drive_post_admit(State1, Emit) end};
+        {error, Status, Reason, State1} ->
+            cleanup(State1),
+            Body = json:encode(error_body(Reason)),
+            {full, Status, [{<<"content-type">>, <<"application/json">>}], Body}
+    end.
+
+drive_post_admit(State, Emit) ->
     try
         stream_loop(State, Emit)
     after
         cleanup(State)
     end.
+
+%% Selective receive — see h_chat for why no catch-all.
+pre_admit_loop(S) ->
+    receive
+        {pipeline, error, Status, Reason} ->
+            {error, Status, Reason, S};
+        {pipeline, loading, _M} ->
+            pre_admit_loop(S);
+        {pipeline, loaded} ->
+            ok = barrel_inference_server_keepalive:request_begin(S#st.model),
+            pre_admit_loop(S#st{phase = waiting_template, mono_loaded = mono_ms()});
+        {pipeline, templated, _Tokens, _ParamsRef} ->
+            pre_admit_loop(S#st{phase = waiting_queue});
+        {pipeline, queued} ->
+            pre_admit_loop(S#st{phase = waiting_admit});
+        {pipeline, admitted, Ref, Slot} ->
+            {admitted, on_admit(S, Ref, Slot)};
+        {'DOWN', Mon, process, _Pid, normal} when Mon =:= S#st.worker_mon ->
+            pre_admit_loop(S#st{worker = undefined, worker_mon = undefined});
+        {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.worker_mon ->
+            {error, 500, pipeline_crashed, S#st{worker = undefined, worker_mon = undefined}}
+    after pre_admit_timeout() ->
+        {error, 504, prefill_timeout, S}
+    end.
+
+pre_admit_timeout() ->
+    barrel_inference_server_config:prefill_ms().
 
 drive_buffered(Op, R, KeepAlive) ->
     {Worker, Mon} = barrel_inference_server_pipeline:start_link(self(), R),
@@ -185,7 +225,7 @@ dispatch_stream({barrel_inference_reasoning_token, Ref, _Tok}, S, Emit) ->
     stream_loop(learn_ref(S, Ref), Emit);
 dispatch_stream({barrel_inference_done, Ref, Stats}, S, Emit) ->
     S1 = learn_ref(S, Ref),
-    _ = emit_line(Emit, final_chunk(S1, Stats)),
+    _ = emit_term(Emit, final_chunk(S1, Stats)),
     S1;
 dispatch_stream({barrel_inference_error, Ref, Reason}, S, Emit) ->
     on_engine_error(S, Ref, Reason, Emit);
@@ -197,16 +237,17 @@ dispatch_stream(_Other, S, Emit) ->
 on_token(S, Ref, Tok, Emit) ->
     S1 = learn_ref(S, Ref),
     Chunk = ollama_chunk(S1#st.op, Tok, S1#st.req_id, S1#st.model),
-    case emit_line(Emit, Chunk) of
+    case emit_term(Emit, Chunk) of
         ok -> stream_loop(S1#st{out_tokens = S1#st.out_tokens + 1}, Emit);
         closed -> S1
     end.
 
+%% pre_admit_loop consumes loading/loaded/templated/queued/admitted
+%% BEFORE we have an Emit fun, so the pipeline-progress clauses below
+%% only fire on the unusual late-arrival case (re-load round during the
+%% agentic loop, etc).
 on_pipeline_stream({pipeline, loading, _Model}, S, Emit) ->
-    case emit_line(Emit, loading_line(S)) of
-        ok -> stream_loop(S, Emit);
-        closed -> S
-    end;
+    stream_loop(S, Emit);
 on_pipeline_stream({pipeline, loaded}, S, Emit) ->
     ok = barrel_inference_server_keepalive:request_begin(S#st.model),
     stream_loop(S#st{phase = waiting_template, mono_loaded = mono_ms()}, Emit);
@@ -217,21 +258,13 @@ on_pipeline_stream({pipeline, queued}, S, Emit) ->
 on_pipeline_stream({pipeline, admitted, Ref, Slot}, S, Emit) ->
     stream_loop(on_admit(S, Ref, Slot), Emit);
 on_pipeline_stream({pipeline, error, _Status, Reason}, S, Emit) ->
-    _ = emit_line(Emit, json:encode(error_body(Reason))),
+    _ = emit_term(Emit, error_body(Reason)),
     S.
 
 on_engine_error(S, Ref, Reason, Emit) ->
     S1 = learn_ref(S, Ref),
-    _ = emit_line(Emit, json:encode(error_body(Reason))),
+    _ = emit_term(Emit, error_body(Reason)),
     S1.
-
-loading_line(S) ->
-    json:encode(#{
-        <<"model">> => S#st.model,
-        <<"created_at">> => iso8601_now(),
-        <<"status">> => <<"loading">>,
-        <<"done">> => false
-    }).
 
 %% Buffered (non-stream) receive loop. Accumulates the token text and
 %% returns a single livery_resp:json on done.
@@ -290,8 +323,11 @@ on_admit(S = #st{ref = undefined}, Ref, Slot) ->
 on_admit(S, _Ref, Slot) ->
     S#st{slot = Slot}.
 
-emit_line(Emit, Body) ->
-    case Emit([Body, <<"\n">>]) of
+%% livery's ndjson Emit takes a JSON-encodable term and writes
+%% `<<json:encode(Term)/binary, "\n">>'. Wrap to surface the
+%% peer-disconnect signal the receive loop uses to short-circuit.
+emit_term(Emit, Term) ->
+    case Emit(Term) of
         ok -> ok;
         {error, _} -> closed
     end.
@@ -421,10 +457,3 @@ error_status(_) -> 500.
 
 mono_ms() ->
     erlang:monotonic_time(millisecond).
-
-iso8601_now() ->
-    Now = erlang:system_time(second),
-    {{Y, Mo, D}, {H, M, S}} = calendar:system_time_to_universal_time(Now, second),
-    list_to_binary(
-        io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ", [Y, Mo, D, H, M, S])
-    ).
