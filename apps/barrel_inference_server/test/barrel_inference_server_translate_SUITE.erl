@@ -1186,10 +1186,7 @@ anthropic_event_message_delta_emits_stop_sequence(_Cfg) ->
         finish_reason => stop,
         stop_sequence => <<"END">>
     },
-    Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
-        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
-    ),
-    Bin = iolist_to_binary(Iolist),
+    Bin = event_bin({message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Bin, <<"\"stop_reason\":\"stop_sequence\"">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"stop_sequence\":\"END\"">>) =/= nomatch).
 
@@ -1228,19 +1225,13 @@ anthropic_response_thinking_then_text_blocks(_Cfg) ->
     ?assertEqual(<<"answer">>, maps:get(<<"text">>, B2)).
 
 anthropic_event_message_start(_Cfg) ->
-    Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
-        {message_start, 42}, #{}, <<"msg_1">>, <<"claude">>
-    ),
-    Bin = iolist_to_binary(Iolist),
+    Bin = event_bin({message_start, 42}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Bin, <<"event: message_start">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"id\":\"msg_1\"">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"input_tokens\":42">>) =/= nomatch).
 
 anthropic_event_text_delta(_Cfg) ->
-    Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
-        {text_delta, <<"hello">>, 0}, #{}, <<"msg_1">>, <<"claude">>
-    ),
-    Bin = iolist_to_binary(Iolist),
+    Bin = event_bin({text_delta, <<"hello">>, 0}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Bin, <<"event: content_block_delta">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"text\":\"hello\"">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"index\":0">>) =/= nomatch).
@@ -1249,26 +1240,10 @@ anthropic_event_text_delta(_Cfg) ->
 %% so consecutive blocks must carry distinct indices. The emitter must
 %% honour whatever index the handler supplies.
 anthropic_event_content_block_index_threads_through(_Cfg) ->
-    Start = iolist_to_binary(
-        barrel_inference_server_translate:internal_to_anthropic_event(
-            {content_block_start_text, 3}, #{}, <<"msg_1">>, <<"claude">>
-        )
-    ),
-    Delta = iolist_to_binary(
-        barrel_inference_server_translate:internal_to_anthropic_event(
-            {text_delta, <<"t">>, 3}, #{}, <<"msg_1">>, <<"claude">>
-        )
-    ),
-    Thinking = iolist_to_binary(
-        barrel_inference_server_translate:internal_to_anthropic_event(
-            {thinking_delta, <<"r">>, 2}, #{}, <<"msg_1">>, <<"claude">>
-        )
-    ),
-    Stop = iolist_to_binary(
-        barrel_inference_server_translate:internal_to_anthropic_event(
-            {content_block_stop, 3}, #{}, <<"msg_1">>, <<"claude">>
-        )
-    ),
+    Start = event_bin({content_block_start_text, 3}, #{}, <<"msg_1">>, <<"claude">>),
+    Delta = event_bin({text_delta, <<"t">>, 3}, #{}, <<"msg_1">>, <<"claude">>),
+    Thinking = event_bin({thinking_delta, <<"r">>, 2}, #{}, <<"msg_1">>, <<"claude">>),
+    Stop = event_bin({content_block_stop, 3}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Start, <<"\"index\":3">>) =/= nomatch),
     ?assert(binary:match(Delta, <<"\"index\":3">>) =/= nomatch),
     ?assert(binary:match(Thinking, <<"\"index\":2">>) =/= nomatch),
@@ -1276,10 +1251,7 @@ anthropic_event_content_block_index_threads_through(_Cfg) ->
 
 anthropic_event_message_delta(_Cfg) ->
     Stats = #{completion_tokens => 4, finish_reason => length},
-    Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
-        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
-    ),
-    Bin = iolist_to_binary(Iolist),
+    Bin = event_bin({message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Bin, <<"event: message_delta">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"stop_reason\":\"max_tokens\"">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"output_tokens\":4">>) =/= nomatch).
@@ -1294,10 +1266,7 @@ anthropic_event_message_delta_emits_cache_read_on_exact_hit(_Cfg) ->
         cache_delta => #{read => 128, created => 0},
         finish_reason => stop
     },
-    Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
-        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
-    ),
-    Bin = iolist_to_binary(Iolist),
+    Bin = event_bin({message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Bin, <<"\"cache_read_input_tokens\":128">>) =/= nomatch),
     ?assertEqual(nomatch, binary:match(Bin, <<"\"cache_creation_input_tokens\"">>)).
 
@@ -1308,10 +1277,7 @@ anthropic_event_message_delta_emits_cache_creation_on_cold(_Cfg) ->
         cache_delta => #{read => 0, created => 128},
         finish_reason => stop
     },
-    Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
-        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
-    ),
-    Bin = iolist_to_binary(Iolist),
+    Bin = event_bin({message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Bin, <<"\"cache_creation_input_tokens\":128">>) =/= nomatch),
     ?assertEqual(nomatch, binary:match(Bin, <<"\"cache_read_input_tokens\"">>)).
 
@@ -1327,10 +1293,7 @@ anthropic_event_message_delta_emits_cache_creation_nested_5m(_Cfg) ->
         finish_reason => stop,
         cache_hints => [#{kind => system, hash => <<"h">>, ttl => <<"5m">>}]
     },
-    Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
-        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
-    ),
-    Bin = iolist_to_binary(Iolist),
+    Bin = event_bin({message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Bin, <<"\"ephemeral_5m_input_tokens\":64">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"ephemeral_1h_input_tokens\":0">>) =/= nomatch).
 
@@ -1342,10 +1305,7 @@ anthropic_event_message_delta_emits_cache_creation_nested_1h(_Cfg) ->
         finish_reason => stop,
         cache_hints => [#{kind => system, hash => <<"h">>, ttl => <<"1h">>}]
     },
-    Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
-        {message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>
-    ),
-    Bin = iolist_to_binary(Iolist),
+    Bin = event_bin({message_delta, Stats}, #{}, <<"msg_1">>, <<"claude">>),
     ?assert(binary:match(Bin, <<"\"ephemeral_5m_input_tokens\":0">>) =/= nomatch),
     ?assert(binary:match(Bin, <<"\"ephemeral_1h_input_tokens\":64">>) =/= nomatch).
 
@@ -1729,3 +1689,12 @@ base_chat() ->
 
 text_block(Text) ->
     #{<<"type">> => <<"text">>, <<"text">> => Text}.
+
+%% Anthropic event helper: render the SSE frame as a binary so the
+%% existing `binary:match' assertions still work after
+%% `internal_to_anthropic_event/4' moved to returning a map.
+event_bin(Kind, Acc, ReqId, Model) ->
+    Frame = barrel_inference_server_translate:internal_to_anthropic_event(
+        Kind, Acc, ReqId, Model
+    ),
+    iolist_to_binary(barrel_inference_server_translate:sse_iodata(Frame)).

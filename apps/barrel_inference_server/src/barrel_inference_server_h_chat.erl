@@ -4,8 +4,9 @@
 %%% livery migration. Mirrors the request/response shape exactly; only
 %%% the framework call surface differs.
 %%%
-%%% Uses `livery_resp:stream/3' with manual SSE framing for full
-%%% control over comments, multi-frame finishes, and `[DONE]'.
+%%% Uses livery's native `{sse, _}' decision: each Emit call takes a
+%%% `#{data => Iodata}' map (or `#{event => Bin, data => Iodata}') and
+%%% livery handles the wire framing.
 
 -module(barrel_inference_server_h_chat).
 
@@ -148,11 +149,7 @@ resolve_stream(R, Requested, Api) ->
     State1 = arm_total_timer(State),
     case pre_admit_loop(State1) of
         {admitted, State2} ->
-            %% `{stream, ...}' (raw chunked), not `{sse, ...}': our
-            %% existing Emit calls already include the full
-            %% `event: ...\ndata: ...\n\n' framing; the `{sse, _}'
-            %% decision would wrap each chunk in another `data: ' line.
-            {stream, 200, sse_headers(), fun(Emit) ->
+            {sse, 200, sse_extras(), fun(Emit) ->
                 drive_stream_post_admit(State2, Emit)
             end};
         {error, Status, Reason, State2} ->
@@ -320,10 +317,7 @@ dispatch_stream(_Other, S, Emit) ->
     stream_loop(S, Emit).
 
 on_pipeline_stream({pipeline, loading, _M}, S, Emit) ->
-    case emit_raw(Emit, [<<": loading\n\n">>]) of
-        ok -> stream_loop(S#st{stream_started = true}, Emit);
-        closed -> S
-    end;
+    stream_loop(S, Emit);
 on_pipeline_stream({pipeline, loaded}, S = #st{keepalive_begun = true}, Emit) ->
     stream_loop(S#st{phase = waiting_template}, Emit);
 on_pipeline_stream({pipeline, loaded}, S, Emit) ->
@@ -342,14 +336,14 @@ on_pipeline_stream({pipeline, admitted, Ref, Slot}, S, Emit) ->
 on_pipeline_stream({pipeline, error, Status, Reason}, S, Emit) ->
     record_metrics(S, Status),
     Err = json:encode(error_body(Reason, Status)),
-    _ = emit_raw(Emit, [<<"data: ">>, Err, <<"\n\n">>, <<"data: [DONE]\n\n">>]),
+    _ = emit_events(Emit, [#{data => Err}, done_frame()]),
     S.
 
 on_stream_token(S0, Ref, Tok, Emit) ->
     S = learn_ref(S0, Ref),
     case handle_token_stream(Tok, S) of
-        {emit, Out, S1} ->
-            case emit_raw(Emit, Out) of
+        {emit, Frame, S1} ->
+            case emit_event(Emit, Frame) of
                 ok -> stream_loop(rearm_idle(S1), Emit);
                 closed -> S1
             end;
@@ -382,14 +376,14 @@ stream_text_more(Tok, S) ->
     Iolist = barrel_inference_server_translate:internal_to_openai_chat_chunk(
         Tok, S#st.req_id, S#st.requested
     ),
-    {emit, [<<"data: ">>, Iolist, <<"\n\n">>], S#st{out_tokens = S#st.out_tokens + 1}}.
+    {emit, #{data => Iolist}, S#st{out_tokens = S#st.out_tokens + 1}}.
 
 on_stream_reasoning(S0, Ref, Tok, Emit) ->
     S = learn_ref(S0, Ref),
     Iolist = barrel_inference_server_translate:internal_to_openai_reasoning_chunk(
         Tok, S#st.req_id, S#st.requested
     ),
-    case emit_raw(Emit, [<<"data: ">>, Iolist, <<"\n\n">>]) of
+    case emit_event(Emit, #{data => Iolist}) of
         ok -> stream_loop(rearm_idle(S), Emit);
         closed -> S
     end.
@@ -434,14 +428,8 @@ finish_stream_ok(S = #st{mode = text}, Stats, Emit) ->
     Final = barrel_inference_server_translate:internal_to_openai_chat_final(
         Stats, S#st.req_id, S#st.requested
     ),
-    Frames = [
-        <<"data: ">>,
-        Final,
-        <<"\n\n">>,
-        usage_chunk(S, Stats),
-        <<"data: [DONE]\n\n">>
-    ],
-    _ = emit_raw(Emit, Frames),
+    Frames = [#{data => Final}] ++ usage_frames(S, Stats) ++ [done_frame()],
+    _ = emit_events(Emit, Frames),
     record_success(S, Stats),
     S;
 finish_stream_ok(S = #st{mode = tool_buffer}, Stats, Emit) ->
@@ -450,17 +438,9 @@ finish_stream_ok(S = #st{mode = tool_buffer}, Stats, Emit) ->
     Stop = barrel_inference_server_translate:internal_to_openai_chat_final(
         ToolStats, S#st.req_id, S#st.requested
     ),
-    Frames = [
-        <<"data: ">>,
-        First,
-        <<"\n\n">>,
-        <<"data: ">>,
-        Stop,
-        <<"\n\n">>,
-        usage_chunk(S, ToolStats),
-        <<"data: [DONE]\n\n">>
-    ],
-    _ = emit_raw(Emit, Frames),
+    Frames =
+        [#{data => First}, #{data => Stop}] ++ usage_frames(S, ToolStats) ++ [done_frame()],
+    _ = emit_events(Emit, Frames),
     record_success(S, Stats),
     S.
 
@@ -470,24 +450,16 @@ finish_with_tool_calls_stream(S, Calls, Emit) ->
     Stop = barrel_inference_server_translate:internal_to_openai_chat_final(
         ToolStats, S#st.req_id, S#st.requested
     ),
-    Frames = [
-        <<"data: ">>,
-        First,
-        <<"\n\n">>,
-        <<"data: ">>,
-        Stop,
-        <<"\n\n">>,
-        usage_chunk(S, ToolStats),
-        <<"data: [DONE]\n\n">>
-    ],
-    _ = emit_raw(Emit, Frames),
+    Frames =
+        [#{data => First}, #{data => Stop}] ++ usage_frames(S, ToolStats) ++ [done_frame()],
+    _ = emit_events(Emit, Frames),
     record_success(S, ToolStats),
     S.
 
 finish_stream_err(S, Reason, Emit) ->
     Status = http_status(Reason),
     Err = json:encode(error_body(Reason, Status)),
-    _ = emit_raw(Emit, [<<"data: ">>, Err, <<"\n\n">>, <<"data: [DONE]\n\n">>]),
+    _ = emit_events(Emit, [#{data => Err}, done_frame()]),
     record_error(S, Reason),
     S.
 
@@ -1049,13 +1021,15 @@ is_tool_first_byte(<<C, _/binary>>) when C =:= $\s; C =:= $\t; C =:= $\r; C =:= 
 is_tool_first_byte(<<${, _/binary>>) -> true;
 is_tool_first_byte(_) -> false.
 
-usage_chunk(#st{include_usage = false}, _Stats) ->
+usage_frames(#st{include_usage = false}, _Stats) ->
     [];
-usage_chunk(S = #st{include_usage = true}, Stats) ->
+usage_frames(S = #st{include_usage = true}, Stats) ->
     Chunk = barrel_inference_server_translate:internal_to_openai_usage_chunk(
         Stats, S#st.req_id, S#st.requested
     ),
-    [<<"data: ">>, Chunk, <<"\n\n">>].
+    [#{data => Chunk}].
+
+done_frame() -> #{data => <<"[DONE]">>}.
 
 %%====================================================================
 %% Metrics
@@ -1125,10 +1099,18 @@ cache_log_fields(Stats) ->
 %% Reply helpers
 %%====================================================================
 
-emit_raw(Emit, IoData) ->
-    case Emit(IoData) of
+emit_event(Emit, EventMap) ->
+    case Emit(EventMap) of
         ok -> ok;
         {error, _} -> closed
+    end.
+
+emit_events(_Emit, []) ->
+    ok;
+emit_events(Emit, [F | Rest]) ->
+    case emit_event(Emit, F) of
+        ok -> emit_events(Emit, Rest);
+        closed -> closed
     end.
 
 error_body({context_overflow, Tokens, Ctx}, _Status) ->
@@ -1177,12 +1159,8 @@ http_status({error, {decode_failed, _}}) -> 503;
 http_status({decode_failed, _}) -> 503;
 http_status(_) -> 500.
 
-sse_headers() ->
-    [
-        {<<"content-type">>, <<"text/event-stream">>},
-        {<<"cache-control">>, <<"no-cache">>},
-        {<<"x-accel-buffering">>, <<"no">>}
-    ].
+sse_extras() ->
+    [{<<"x-accel-buffering">>, <<"no">>}].
 
 decode(Body) ->
     try

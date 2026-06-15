@@ -75,6 +75,7 @@
     internal_to_responses_function_call_done/4,
     internal_to_responses_failed/4,
     responses_event/2,
+    sse_iodata/1,
     %% helpers
     make_id/1,
     parse_keep_alive/1,
@@ -838,7 +839,7 @@ internal_to_responses_failed(ResponseId, Model, Code, Message) ->
     }.
 
 %% SSE renderer for /v1/responses events. Same wire shape as sse/2.
--spec responses_event(binary(), map()) -> iodata().
+-spec responses_event(binary(), map()) -> map().
 responses_event(EventName, Payload) ->
     sse(EventName, Payload).
 
@@ -953,7 +954,7 @@ cache_creation_ttl_split(Total, Stats) ->
 %% `event: <name>\ndata: <json>\n\n`.
 -spec internal_to_anthropic_event(
     anthropic_event_kind(), map(), binary(), binary()
-) -> iodata().
+) -> map().
 internal_to_anthropic_event({message_start, PromptTokens}, _Acc, ReqId, Model) when
     is_integer(PromptTokens)
 ->
@@ -2086,6 +2087,14 @@ index_zero(L) -> index_zero(L, 0).
 index_zero([], _) -> [];
 index_zero([H | T], I) -> [{I, H} | index_zero(T, I + 1)].
 
-%% Render an Anthropic SSE event (named event + data line).
+%% Build a livery sse-Emit-ready map: `#{event => Bin, data => Bin}'.
+%% Livery (`livery.erl:sse_frame/1') formats this as
+%% `event: <EventName>\ndata: <Json>\n\n', so handlers can pass the
+%% map straight to Emit/1 with no manual framing.
 sse(EventName, Payload) ->
-    [<<"event: ">>, EventName, <<"\ndata: ">>, json:encode(Payload), <<"\n\n">>].
+    #{event => EventName, data => json:encode(Payload)}.
+
+%% Render an sse event map as the same iodata `sse/2' used to return.
+%% Exposed for the translate test suite, which inspects the wire bytes.
+sse_iodata(#{event := EventName, data := Data}) ->
+    [<<"event: ">>, EventName, <<"\ndata: ">>, Data, <<"\n\n">>].

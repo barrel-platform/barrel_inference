@@ -167,8 +167,10 @@ resolve_stream(R, Requested) ->
     State1 = arm_total_timer(State),
     case pre_admit_loop(State1) of
         {admitted, State2} ->
-            %% Raw chunked: handler emits full SSE frames itself.
-            {stream, 200, sse_headers(), fun(Emit) ->
+            %% Native SSE: livery wraps each Emit map into the wire
+            %% `event: ..\ndata: ..\n\n' frame; the handler stays in
+            %% the map shape end-to-end.
+            {sse, 200, sse_extras(), fun(Emit) ->
                 drive_stream_post_admit(State2, Emit)
             end};
         {error, Status, Reason, State2} ->
@@ -334,10 +336,12 @@ dispatch_stream(_Other, S, Emit) ->
     stream_loop(S, Emit).
 
 on_pipeline_stream({pipeline, loading, _M}, S, Emit) ->
-    case emit_raw(Emit, [<<": loading\n\n">>]) of
-        ok -> stream_loop(S, Emit);
-        closed -> S
-    end;
+    %% pre_admit_loop already consumes the initial loading messages
+    %% before the stream opens, so this clause only fires on a re-load
+    %% round inside the agentic loop. livery's sse_frame has no
+    %% comment shape; the silent re-load relies on the connection's
+    %% own keepalive (idle_timeout backstop).
+    stream_loop(S, Emit);
 on_pipeline_stream({pipeline, loaded}, S = #st{keepalive_begun = true}, Emit) ->
     stream_loop(S#st{phase = waiting_template}, Emit);
 on_pipeline_stream({pipeline, loaded}, S, Emit) ->
@@ -373,14 +377,14 @@ on_pipeline_stream({pipeline, error, Status, Reason}, S, Emit) ->
     Frame = barrel_inference_server_translate:responses_event(
         <<"response.failed">>, Payload
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     S.
 
 on_stream_token(S0, Ref, Tok, Emit) ->
     S = learn_ref(S0, Ref, Emit),
     case handle_token_stream(Tok, S) of
         {emit, Frame, S1} ->
-            case emit_raw(Emit, Frame) of
+            case emit_event(Emit, Frame) of
                 ok -> stream_loop(rearm_idle(S1), Emit);
                 closed -> S1
             end;
@@ -468,7 +472,7 @@ finish_stream_ok(S0 = #st{mode = text}, Stats, Emit) ->
     Frame = barrel_inference_server_translate:responses_event(
         <<"response.completed">>, CompletedPayload
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     record_success(S1, Stats),
     store_response(S1, Items),
     S1;
@@ -481,7 +485,7 @@ finish_stream_ok(S0 = #st{mode = tool_buffer}, Stats0, Emit) ->
     OutIdx = S1#st.out_index,
     ArgsBin = args_bin(Input),
     Frames = function_call_frames(OutIdx, FcId, CallId, Name, ArgsBin),
-    _ = emit_raw(Emit, Frames),
+    _ = emit_events(Emit, Frames),
     Stats = maps:put(finish_reason, tool_call, Stats0),
     Items = S1#st.fc_items ++ [fc_item_map(FcId, CallId, Name, ArgsBin)],
     CompletedPayload = barrel_inference_server_translate:internal_to_responses_completed(
@@ -490,7 +494,7 @@ finish_stream_ok(S0 = #st{mode = tool_buffer}, Stats0, Emit) ->
     DoneFrame = barrel_inference_server_translate:responses_event(
         <<"response.completed">>, CompletedPayload
     ),
-    _ = emit_raw(Emit, DoneFrame),
+    _ = emit_event(Emit, DoneFrame),
     record_success(S1, Stats),
     store_response(S1, Items),
     S1#st{out_index = OutIdx + 1}.
@@ -517,7 +521,7 @@ emit_function_item(S, Emit, #{id := FcId, name := Name, input := Input}) ->
     OutIdx = S#st.out_index,
     ArgsBin = iolist_to_binary(json:encode(Input)),
     Frames = function_call_frames(OutIdx, FcId, CallId, Name, ArgsBin),
-    _ = emit_raw(Emit, Frames),
+    _ = emit_events(Emit, Frames),
     {fc_item_map(FcId, CallId, Name, ArgsBin), S#st{out_index = OutIdx + 1}}.
 
 function_call_frames(OutIdx, FcId, CallId, Name, ArgsBin) ->
@@ -583,7 +587,7 @@ close_open_message_stream(S = #st{started_text_part = true}, Emit) ->
             <<"response.output_item.done">>, MsgDone
         )
     ],
-    _ = emit_raw(Emit, Frames),
+    _ = emit_events(Emit, Frames),
     S#st{
         started_text_part = false,
         out_index = S#st.out_index + 1,
@@ -616,7 +620,7 @@ emit_response_created(S, Emit) ->
     Frame = barrel_inference_server_translate:responses_event(
         <<"response.created">>, Payload
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     S#st{created_sent = true}.
 
 emit_message_added(S, Emit) ->
@@ -626,7 +630,7 @@ emit_message_added(S, Emit) ->
     Frame = barrel_inference_server_translate:responses_event(
         <<"response.output_item.added">>, Payload
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     S.
 
 emit_content_added(S, Emit) ->
@@ -636,7 +640,7 @@ emit_content_added(S, Emit) ->
     Frame = barrel_inference_server_translate:responses_event(
         <<"response.content_part.added">>, Payload
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     S#st{started_text_part = true}.
 
 finish_stream_err(S, Reason, Emit) ->
@@ -649,7 +653,7 @@ finish_stream_err(S, Reason, Emit) ->
     Frame = barrel_inference_server_translate:responses_event(
         <<"response.failed">>, Payload
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     record_error(S, Reason),
     S.
 
@@ -756,7 +760,7 @@ emit_server_tool_call(S, Emit, CallId, Name) ->
     Frame = barrel_inference_server_translate:responses_event(
         <<"response.output_item.added">>, Payload
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     S.
 
 emit_server_tool_done(S, Emit, CallId, Name, _ResultJson) ->
@@ -768,7 +772,7 @@ emit_server_tool_done(S, Emit, CallId, Name, _ResultJson) ->
     Frame = barrel_inference_server_translate:responses_event(
         <<"response.output_item.done">>, Payload
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     S#st{out_index = OutIdx + 1}.
 
 server_tool_item(CallId, Name, Status) ->
@@ -1350,10 +1354,19 @@ cache_log_fields(Stats) ->
 %% Reply helpers
 %%====================================================================
 
-emit_raw(Emit, IoData) ->
-    case Emit(IoData) of
+%% Emit one livery sse event map (`#{event => _, data => _}').
+emit_event(Emit, EventMap) ->
+    case Emit(EventMap) of
         ok -> ok;
         {error, _} -> closed
+    end.
+
+emit_events(_Emit, []) ->
+    ok;
+emit_events(Emit, [F | Rest]) ->
+    case emit_event(Emit, F) of
+        ok -> emit_events(Emit, Rest);
+        closed -> closed
     end.
 
 error_body({context_overflow, Tokens, Ctx}, _Status) ->
@@ -1425,12 +1438,10 @@ http_status({error, {decode_failed, _}}) -> 503;
 http_status({decode_failed, _}) -> 503;
 http_status(_) -> 500.
 
-sse_headers() ->
-    [
-        {<<"content-type">>, <<"text/event-stream">>},
-        {<<"cache-control">>, <<"no-cache">>},
-        {<<"x-accel-buffering">>, <<"no">>}
-    ].
+%% livery's `{sse, _}' decision already adds content-type +
+%% cache-control; we only need the nginx hint.
+sse_extras() ->
+    [{<<"x-accel-buffering">>, <<"no">>}].
 
 decode(Body) ->
     try json:decode(Body) of

@@ -232,10 +232,9 @@ resolve_stream(R, Requested, ExtraHeaders) ->
     State = arm_total_timer(make_init(R, Requested, ExtraHeaders)),
     case pre_admit_loop(State) of
         {admitted, State1} ->
-            %% Raw chunked: our Emit calls already produce full SSE
-            %% frames (event/data/blank line); `{sse,_}' would
-            %% double-wrap them.
-            {stream, 200, sse_headers() ++ ExtraHeaders, fun(Emit) ->
+            %% Native SSE: each Emit receives a `#{event, data}' map
+            %% and livery's sse_frame wraps it into the wire form.
+            {sse, 200, sse_extras() ++ ExtraHeaders, fun(Emit) ->
                 drive_stream_post_admit(State1, Emit)
             end};
         {error, Status0, Reason, State1} ->
@@ -413,7 +412,7 @@ dispatch_stream({idle_timeout, Ref}, S, Emit) when S#st.ref =:= Ref ->
     barrel_inference:cancel(Ref),
     finish_stream_err(S, generation_idle_timeout, Emit);
 dispatch_stream({gen_ping, Ref}, S, Emit) when S#st.ref =:= Ref ->
-    _ = emit_raw(Emit, anthropic_ping_frame()),
+    _ = emit_event(Emit, anthropic_ping_frame()),
     stream_loop(arm_gen_ping(S), Emit);
 dispatch_stream(total_request_timeout, S, Emit) ->
     on_total_timeout(S, Emit);
@@ -421,7 +420,7 @@ dispatch_stream(_Other, S, Emit) ->
     stream_loop(S, Emit).
 
 on_pipeline_stream({pipeline, loading, _M}, S, Emit) ->
-    _ = emit_raw(Emit, anthropic_ping_frame()),
+    _ = emit_event(Emit, anthropic_ping_frame()),
     stream_loop(S, Emit);
 on_pipeline_stream({pipeline, loaded}, S = #st{keepalive_begun = true}, Emit) ->
     stream_loop(S#st{phase = waiting_template}, Emit);
@@ -449,7 +448,7 @@ on_pipeline_stream({pipeline, admitted, Ref, Slot}, S, Emit) ->
 on_pipeline_stream({pipeline, error, Status, Reason}, S, Emit) ->
     record_metrics(S, Status),
     Err = anthropic_error_body(Status, Reason, S),
-    _ = emit_raw(Emit, anthropic_event_frame(<<"error">>, Err)),
+    _ = emit_event(Emit, anthropic_event_frame(<<"error">>, Err)),
     S.
 
 on_text_token(S0, Ref, Tok, Emit) ->
@@ -493,7 +492,7 @@ stream_text_emit(Tok, S, Emit) ->
         S1#st.req_id,
         S1#st.requested
     ),
-    case emit_raw(Emit, Frame) of
+    case emit_event(Emit, Frame) of
         ok ->
             stream_loop(rearm_idle(S1#st{out_tokens = S1#st.out_tokens + 1}), Emit);
         closed ->
@@ -514,7 +513,7 @@ on_thinking_token(S0, Ref, Tok, Emit) ->
         S1#st.req_id,
         S1#st.requested
     ),
-    case emit_raw(Emit, Frame) of
+    case emit_event(Emit, Frame) of
         ok -> stream_loop(rearm_idle(S1), Emit);
         closed -> S1
     end.
@@ -543,11 +542,7 @@ handle_thinking_end_visible(S = #st{thinking_block_started = Idx}, Sig, Emit) wh
                     <<"signature">> => base64:encode(Sig)
                 }
             },
-            _ = emit_raw(Emit, [
-                <<"event: content_block_delta\ndata: ">>,
-                json:encode(Delta),
-                <<"\n\n">>
-            ])
+            _ = emit_event(Emit, anthropic_event_frame(<<"content_block_delta">>, Delta))
     end,
     S1 = maybe_close_thinking(S, Emit),
     stream_loop(rearm_idle(S1#st{thinking_signature = Sig}), Emit);
@@ -607,7 +602,7 @@ finish_stream_ok(S0 = #st{mode = text}, Stats0, Emit) ->
     Stop = barrel_inference_server_translate:internal_to_anthropic_event(
         message_stop, #{}, S1#st.req_id, S1#st.requested
     ),
-    _ = emit_raw(Emit, [Delta, Stop]),
+    _ = emit_events(Emit, [Delta, Stop]),
     record_success(S1, Stats),
     S1;
 finish_stream_ok(S0 = #st{mode = tool_buffer}, Stats0, Emit) ->
@@ -627,7 +622,7 @@ finish_stream_ok(S0 = #st{mode = tool_buffer}, Stats0, Emit) ->
     MsgStop = barrel_inference_server_translate:internal_to_anthropic_event(
         message_stop, #{}, S#st.req_id, S#st.requested
     ),
-    _ = emit_raw(Emit, [Frames, MsgDelta, MsgStop]),
+    _ = emit_events(Emit, Frames ++ [MsgDelta, MsgStop]),
     record_success(S, StatsToolCall),
     S.
 
@@ -645,7 +640,7 @@ finish_with_tool_uses_stream(S0, Calls, Emit) ->
     MsgStop = barrel_inference_server_translate:internal_to_anthropic_event(
         message_stop, #{}, S#st.req_id, S#st.requested
     ),
-    _ = emit_raw(Emit, [Frames, MsgDelta, MsgStop]),
+    _ = emit_events(Emit, Frames ++ [MsgDelta, MsgStop]),
     record_success(S, StatsTC),
     S.
 
@@ -672,12 +667,8 @@ tool_use_block_frames(S, Idx, ToolId, Name, Input) ->
         {content_block_stop, Idx}, #{}, S#st.req_id, S#st.requested
     ),
     [
-        <<"event: content_block_start\ndata: ">>,
-        json:encode(Start),
-        <<"\n\n">>,
-        <<"event: content_block_delta\ndata: ">>,
-        json:encode(DeltaInput),
-        <<"\n\n">>,
+        anthropic_event_frame(<<"content_block_start">>, Start),
+        anthropic_event_frame(<<"content_block_delta">>, DeltaInput),
         Stop
     ].
 
@@ -701,7 +692,7 @@ close_open_blocks(S0, Emit) ->
             Stop = barrel_inference_server_translate:internal_to_anthropic_event(
                 {content_block_stop, TIdx}, #{}, S1#st.req_id, S1#st.requested
             ),
-            _ = emit_raw(Emit, Stop),
+            _ = emit_event(Emit, Stop),
             S1#st{text_block_started = undefined}
     end.
 
@@ -711,7 +702,7 @@ emit_message_start(S, Emit) ->
     Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
         {message_start, S#st.prompt_tokens}, #{}, S#st.req_id, S#st.requested
     ),
-    _ = emit_raw(Emit, Iolist),
+    _ = emit_event(Emit, Iolist),
     S#st{message_started = true}.
 
 ensure_text_block_started(S = #st{text_block_started = I}, _Emit) when
@@ -724,7 +715,7 @@ ensure_text_block_started(S0, Emit) ->
     Iolist = barrel_inference_server_translate:internal_to_anthropic_event(
         {content_block_start_text, Idx}, #{}, S1#st.req_id, S1#st.requested
     ),
-    _ = emit_raw(Emit, Iolist),
+    _ = emit_event(Emit, Iolist),
     S1#st{text_block_started = Idx}.
 
 ensure_thinking_block_started(S = #st{thinking_block_started = I}, _Emit) when
@@ -740,11 +731,7 @@ ensure_thinking_block_started(S, Emit) ->
             <<"type">> => <<"thinking">>, <<"thinking">> => <<>>
         }
     },
-    _ = emit_raw(Emit, [
-        <<"event: content_block_start\ndata: ">>,
-        json:encode(Payload),
-        <<"\n\n">>
-    ]),
+    _ = emit_event(Emit, anthropic_event_frame(<<"content_block_start">>, Payload)),
     S#st{thinking_block_started = Idx}.
 
 maybe_close_thinking(S = #st{thinking_block_started = undefined}, _Emit) ->
@@ -753,7 +740,7 @@ maybe_close_thinking(S = #st{thinking_block_started = Idx}, Emit) ->
     Frame = barrel_inference_server_translate:internal_to_anthropic_event(
         {content_block_stop, Idx}, #{}, S#st.req_id, S#st.requested
     ),
-    _ = emit_raw(Emit, Frame),
+    _ = emit_event(Emit, Frame),
     S#st{thinking_block_started = undefined}.
 
 next_block_index(#st{text_block_started = T, thinking_block_started = K}) ->
@@ -774,7 +761,7 @@ maybe_set_tool_call_finish_reason(_, Stats) ->
 finish_stream_err(S, Reason, Emit) ->
     Status = http_status(Reason),
     Err = anthropic_error_body(Status, Reason, S),
-    _ = emit_raw(Emit, anthropic_event_frame(<<"error">>, Err)),
+    _ = emit_event(Emit, anthropic_event_frame(<<"error">>, Err)),
     record_error(S, Reason),
     S.
 
@@ -1428,24 +1415,28 @@ cache_log_fields(Stats) ->
 %% Reply helpers
 %%====================================================================
 
-emit_raw(Emit, IoData) ->
-    case Emit(IoData) of
+%% Emit one livery sse event map (`#{event => _, data => _}'); the
+%% decision-fun's `{sse, ...}' wrapper handles the wire framing.
+emit_event(Emit, EventMap) ->
+    case Emit(EventMap) of
         ok -> ok;
         {error, _} -> closed
+    end.
+
+%% Emit a list of event maps, short-circuiting on peer disconnect.
+emit_events(_Emit, []) ->
+    ok;
+emit_events(Emit, [F | Rest]) ->
+    case emit_event(Emit, F) of
+        ok -> emit_events(Emit, Rest);
+        closed -> closed
     end.
 
 anthropic_ping_frame() ->
     anthropic_event_frame(<<"ping">>, #{<<"type">> => <<"ping">>}).
 
 anthropic_event_frame(EventName, JsonMap) ->
-    [
-        <<"event: ">>,
-        EventName,
-        <<"\n">>,
-        <<"data: ">>,
-        json:encode(JsonMap),
-        <<"\n\n">>
-    ].
+    #{event => EventName, data => json:encode(JsonMap)}.
 
 %% Base response headers built at request translate time: anthropic-version
 %% echo + request-id mirror (literal "request-id" alongside the
@@ -1555,12 +1546,10 @@ http_status({error, {decode_failed, _}}) -> 503;
 http_status({decode_failed, _}) -> 503;
 http_status(_) -> 500.
 
-sse_headers() ->
-    [
-        {<<"content-type">>, <<"text/event-stream">>},
-        {<<"cache-control">>, <<"no-cache">>},
-        {<<"x-accel-buffering">>, <<"no">>}
-    ].
+%% livery's `{sse, _}' decision already adds content-type +
+%% cache-control defaults; we only need the nginx hint.
+sse_extras() ->
+    [{<<"x-accel-buffering">>, <<"no">>}].
 
 decode(Body) ->
     try json:decode(Body) of
