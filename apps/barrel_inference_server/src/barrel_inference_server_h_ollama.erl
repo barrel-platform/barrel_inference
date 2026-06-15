@@ -153,6 +153,7 @@ drive_post_admit(State, Emit) ->
         cleanup(State)
     end.
 
+%% Selective receive — see h_chat for why no catch-all.
 pre_admit_loop(S) ->
     receive
         {pipeline, error, Status, Reason} ->
@@ -171,9 +172,7 @@ pre_admit_loop(S) ->
         {'DOWN', Mon, process, _Pid, normal} when Mon =:= S#st.worker_mon ->
             pre_admit_loop(S#st{worker = undefined, worker_mon = undefined});
         {'DOWN', Mon, process, _Pid, _Reason} when Mon =:= S#st.worker_mon ->
-            {error, 500, pipeline_crashed, S#st{worker = undefined, worker_mon = undefined}};
-        _Other ->
-            pre_admit_loop(S)
+            {error, 500, pipeline_crashed, S#st{worker = undefined, worker_mon = undefined}}
     after pre_admit_timeout() ->
         {error, 504, prefill_timeout, S}
     end.

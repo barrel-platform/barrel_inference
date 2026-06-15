@@ -28,8 +28,8 @@ request(Url) ->
 request(get, {Url, Headers}) ->
     do(get, to_bin(Url), normalise_req_headers(Headers), <<>>, []).
 
-request(get, {Url, Headers}, HttpOpts, _Opts) ->
-    do(get, to_bin(Url), normalise_req_headers(Headers), <<>>, hackney_opts(HttpOpts));
+request(Method, {Url, Headers}, HttpOpts, _Opts) ->
+    do(Method, to_bin(Url), normalise_req_headers(Headers), <<>>, hackney_opts(HttpOpts));
 request(Method, {Url, Headers, ContentType, Body}, HttpOpts, _Opts) ->
     AllHeaders = [
         {<<"content-type">>, to_bin(ContentType)}
