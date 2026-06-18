@@ -3,6 +3,12 @@
 
 -export([start/2, stop/1, prep_stop/1]).
 
+%% livery_service's public listener_opts type spec does not yet expose
+%% `max_body' (livery_h1's listen_opts does, and maps:merge forwards
+%% it). Dialyzer flags the start_service call as no-return until livery
+%% widens the spec.
+-dialyzer({nowarn_function, [start_listener/0]}).
+
 start(_StartType, _StartArgs) ->
     ok = barrel_inference_server_metrics:init(),
     ok = ensure_model_default_opts(),
