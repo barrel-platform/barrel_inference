@@ -367,14 +367,14 @@ accepts_body_above_one_mb(Cfg) ->
 %% `read_body/1' across multiple `{more, _, _}' chunks instead of
 %% treating the first non-final chunk as 413. A 10 MB body is enough
 %% to force at least two reads even on a fast localhost socket.
-accepts_body_above_cowboy_default_length(_Cfg) ->
-    %% TODO: livery 0.3.2 / h1 0.6.2 race on multi-MiB POST.
-    %% Server returns 413/400 but the response wire-send lands on a
-    %% h1 connection process that's already gone (noproc), and
-    %% hackney sees socket_closed before reading the response.
-    %% Needs upstream livery to guard the emit on the h1 process
-    %% still being alive (or hackney recv-during-send).
-    {skip, livery_h1_response_after_lingering_close}.
+accepts_body_above_cowboy_default_length(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Big = binary:copy(<<"x">>, 9 * 1024 * 1024),
+    {ok, {{_, Status, _}, _, _}} =
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Big}, [], []
+        ),
+    ?assertEqual(400, Status).
 
 %% Anthropic SDKs read `request-id` (no x- prefix) into
 %% message._request_id; the existing middleware stamps `x-request-id`.
@@ -520,9 +520,19 @@ messages_error_body_carries_request_id(Cfg) ->
 %% 413 response must carry Anthropic's `request_too_large` error type,
 %% not the catch-all `api_error`. SDKs match on the type to decide
 %% retry behaviour.
-messages_413_returns_request_too_large_type(_Cfg) ->
-    %% TODO: same livery/h1 race as accepts_body_above_cowboy_default_length.
-    {skip, livery_h1_response_after_lingering_close}.
+messages_413_returns_request_too_large_type(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/messages",
+    Oversized = binary:copy(<<"x">>, 13 * 1024 * 1024),
+    {ok, {{_, Status, _}, _, RespBody}} =
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Oversized}, [], []
+        ),
+    ?assertEqual(413, Status),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(
+        #{<<"error">> := #{<<"type">> := <<"request_too_large">>}},
+        Decoded
+    ).
 
 chat_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
@@ -682,9 +692,16 @@ responses_streaming_unknown_model_emits_event_error(Cfg) ->
             ?assert(is_binary(Bin))
     end.
 
-responses_413_returns_request_too_large_type(_Cfg) ->
-    %% TODO: same livery/h1 race as accepts_body_above_cowboy_default_length.
-    {skip, livery_h1_response_after_lingering_close}.
+responses_413_returns_request_too_large_type(Cfg) ->
+    Url = ?config(base, Cfg) ++ "/v1/responses",
+    Oversized = binary:copy(<<"x">>, 13 * 1024 * 1024),
+    {ok, {{_, Status, _}, _, RespBody}} =
+        barrel_inference_server_http_test:request(
+            post, {Url, [], "application/json", Oversized}, [], []
+        ),
+    ?assertEqual(413, Status),
+    Decoded = json:decode(list_to_binary(RespBody)),
+    ?assertMatch(#{<<"error">> := #{<<"code">> := <<"request_too_large">>}}, Decoded).
 
 %% Codex sends the Responses request as an `input` array of message
 %% items (content as `input_text` parts) plus a top-level
