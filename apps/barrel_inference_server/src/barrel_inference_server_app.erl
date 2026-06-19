@@ -27,10 +27,6 @@ start_listener() ->
     Routes = barrel_inference_server_routes:routes(),
     Router = livery_router:compile(Routes),
     Stack = middleware_stack(),
-    MaxBody = barrel_inference_server_config:max_request_body_bytes(),
-    io:format(user, "~n[DEBUG] start_listener max_body=~p env=~p~n", [
-        MaxBody, application:get_env(barrel_inference_server, max_request_body_bytes)
-    ]),
     HttpOpts = #{
         port => Port,
         ip => application:get_env(barrel_inference_server, ip, {0, 0, 0, 0}),
@@ -40,7 +36,7 @@ start_listener() ->
         %% over-cap uploads trip livery's `abort_body' (which keeps the
         %% stream alive for h1's early-response drain) instead of being
         %% caught later in the handler by `livery_body:read_all/3' Max.
-        max_body => MaxBody
+        max_body => barrel_inference_server_config:max_request_body_bytes()
     },
     Config = #{http => HttpOpts, router => Router, middleware => Stack},
     {ok, ServicePid} = livery:start_service(Config),
