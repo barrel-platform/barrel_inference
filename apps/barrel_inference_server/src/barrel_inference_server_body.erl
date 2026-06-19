@@ -15,24 +15,20 @@
 read(Req) ->
     read(Req, barrel_inference_server_config:max_request_body_bytes()).
 
+dbg_body(Max, {ok, B, _}) ->
+    io:format(user, "[DEBUG body] Max=~p ok bytes=~p~n", [Max, byte_size(B)]);
+dbg_body(Max, {error, E, _}) ->
+    io:format(user, "[DEBUG body] Max=~p err=~p~n", [Max, E]).
+
 read(Req, Max) ->
     case livery_req:body(Req) of
         {stream, Reader} ->
             R = livery_body:read_all(Reader, 30000, Max + 1),
-            io:format(user, "[DEBUG body] Max=~p result=~p~n", [
-                Max,
-                case R of
-                    {ok, B, _} -> {ok, byte_size(B)};
-                    {error, E, _} -> {error, E}
-                end
-            ]),
+            dbg_body(Max, R),
             case R of
-                {ok, Body, _Reader1} when byte_size(Body) > Max ->
-                    {too_large, Req};
-                {ok, Body, _Reader1} ->
-                    {ok, Body, Req};
-                {error, _Reason, _Reader1} ->
-                    {too_large, Req}
+                {ok, Body, _R1} when byte_size(Body) > Max -> {too_large, Req};
+                {ok, Body, _R1} -> {ok, Body, Req};
+                {error, _R, _R1} -> {too_large, Req}
             end;
         {buffered, Body} when is_binary(Body), byte_size(Body) > Max ->
             {too_large, Req};
