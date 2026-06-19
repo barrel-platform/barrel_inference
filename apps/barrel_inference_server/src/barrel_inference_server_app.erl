@@ -28,7 +28,9 @@ start_listener() ->
     Router = livery_router:compile(Routes),
     Stack = middleware_stack(),
     MaxBody = barrel_inference_server_config:max_request_body_bytes(),
-    logger:notice("barrel_inference_server: start_listener max_body=~p", [MaxBody]),
+    io:format(user, "~n[DEBUG] start_listener max_body=~p env=~p~n", [
+        MaxBody, application:get_env(barrel_inference_server, max_request_body_bytes)
+    ]),
     HttpOpts = #{
         port => Port,
         ip => application:get_env(barrel_inference_server, ip, {0, 0, 0, 0}),
