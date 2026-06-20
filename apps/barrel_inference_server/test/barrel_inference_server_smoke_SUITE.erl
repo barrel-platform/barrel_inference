@@ -368,13 +368,13 @@ accepts_body_above_one_mb(Cfg) ->
 %% treating the first non-final chunk as 413. A 10 MB body is enough
 %% to force at least two reads even on a fast localhost socket.
 accepts_body_above_cowboy_default_length(_Cfg) ->
-    %% TODO: livery 0.3.2 / h1 0.6.2 race on multi-MiB POST.
-    %% Server returns 413/400 but the response wire-send lands on a
-    %% h1 connection process that's already gone (noproc), and
-    %% hackney sees socket_closed before reading the response.
-    %% Needs upstream livery to guard the emit on the h1 process
-    %% still being alive (or hackney recv-during-send).
-    {skip, livery_h1_response_after_lingering_close}.
+    %% TODO: livery 0.4.x does not forward `max_body_size' to h1's
+    %% parser, which caps at 8 MiB (?H1_MAX_BODY_SIZE). Anything over
+    %% 8 MiB triggers a parser-level `client_reset' before livery's
+    %% own cap / drain logic runs, so hackney sees `{error, closed}'.
+    %% Re-skip until livery exposes `max_body_size' through its
+    %% listener opts.
+    {skip, livery_h1_max_body_size_not_forwarded}.
 
 %% Anthropic SDKs read `request-id` (no x- prefix) into
 %% message._request_id; the existing middleware stamps `x-request-id`.
@@ -521,8 +521,7 @@ messages_error_body_carries_request_id(Cfg) ->
 %% not the catch-all `api_error`. SDKs match on the type to decide
 %% retry behaviour.
 messages_413_returns_request_too_large_type(_Cfg) ->
-    %% TODO: same livery/h1 race as accepts_body_above_cowboy_default_length.
-    {skip, livery_h1_response_after_lingering_close}.
+    {skip, livery_h1_max_body_size_not_forwarded}.
 
 chat_missing_model_returns_400(Cfg) ->
     Url = ?config(base, Cfg) ++ "/v1/chat/completions",
@@ -683,8 +682,7 @@ responses_streaming_unknown_model_emits_event_error(Cfg) ->
     end.
 
 responses_413_returns_request_too_large_type(_Cfg) ->
-    %% TODO: same livery/h1 race as accepts_body_above_cowboy_default_length.
-    {skip, livery_h1_response_after_lingering_close}.
+    {skip, livery_h1_max_body_size_not_forwarded}.
 
 %% Codex sends the Responses request as an `input` array of message
 %% items (content as `input_text` parts) plus a top-level

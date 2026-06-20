@@ -3,6 +3,12 @@
 
 -export([start/2, stop/1, prep_stop/1]).
 
+%% livery_service's public listener_opts type spec does not yet expose
+%% `max_body' (livery_h1's listen_opts does, and maps:merge forwards
+%% it). Dialyzer flags the start_service call as no-return until livery
+%% widens the spec.
+-dialyzer({nowarn_function, [start_listener/0]}).
+
 start(_StartType, _StartArgs) ->
     ok = barrel_inference_server_metrics:init(),
     ok = ensure_model_default_opts(),
@@ -25,7 +31,12 @@ start_listener() ->
         port => Port,
         ip => application:get_env(barrel_inference_server, ip, {0, 0, 0, 0}),
         acceptors =>
-            application:get_env(barrel_inference_server, num_acceptors, 100)
+            application:get_env(barrel_inference_server, num_acceptors, 100),
+        %% Push our configured body cap down to livery's listener so
+        %% over-cap uploads trip livery's `abort_body' (which keeps the
+        %% stream alive for h1's early-response drain) instead of being
+        %% caught later in the handler by `livery_body:read_all/3' Max.
+        max_body => barrel_inference_server_config:max_request_body_bytes()
     },
     Config = #{http => HttpOpts, router => Router, middleware => Stack},
     {ok, ServicePid} = livery:start_service(Config),
